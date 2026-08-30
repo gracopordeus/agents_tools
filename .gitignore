@@ -3,6 +3,7 @@
 /source-assets/
 /generation/sprite-lab/work/
 /generation/sprite-lab/artifacts/
+/generation/artifacts/
 /generation/**/__pycache__/
 /generation/sprite-lab/state/*.json
 /generation/sprite-lab/state/*_jobs.json
