@@ -1,0 +1,45 @@
+# Large local asset stores and generated outputs
+/d2r-assets/
+/source-assets/
+/generation/sprite-lab/work/
+/generation/sprite-lab/artifacts/
+/generation/**/__pycache__/
+/generation/sprite-lab/state/*.json
+/generation/sprite-lab/state/*_jobs.json
+/d2r-casc/build/
+/d2r-casc/CascLib/listfile/listfile.txt
+/d2r-casc/CascLib/listfile/listfile-archive.zip
+
+# Nested repositories keep their own history and remotes
+/pixel-asset-gen/
+/pixelmaker-godot-plugin/
+/d2r-casc/CascLib/
+
+# Local visual experiments and generated previews
+/*.png
+/*.jpeg
+/concepts/
+/ss_test1_gifs/
+/ss_test2_ai_poc/
+/ss_test2_gifs/
+/ss_test3.jpeg
+/ss_test1.jpeg
+/ss_test2.jpeg
+/first_test_pipeline.png
+/upscaled-2x.png
+
+# Local environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+node_modules/
+
+# Generated logs and temporary files
+*.log
+*.tmp
+*.bak
+.DS_Store

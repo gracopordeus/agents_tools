@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sprite Lab · Catálogo semântico</title>
+  <link rel="stylesheet" href="/web/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <div class="brand">Sprite Lab <span>semantic catalog</span></div>
+      <div class="subtitle">Análise semântica, composição 3D e sprites</div>
+    </div>
+    <div class="topbar-actions">
+      <button id="app-settings-toggle" class="settings-menu-toggle" type="button" aria-label="Abrir configurações" aria-controls="app-settings-menu" aria-expanded="false">⋮</button>
+      <div id="app-settings-menu" class="settings-menu" hidden>
+        <div class="settings-menu-head"><div><h2>Configurações</h2><p>Credenciais locais do Sprite Lab</p></div><button id="close-app-settings" class="settings-menu-close" type="button" aria-label="Fechar configurações">×</button></div>
+        <div class="field"><label for="gemini-api-key">Chave da API Gemini</label><div class="secret-input"><input id="gemini-api-key" type="password" autocomplete="off" placeholder="Cole sua chave aqui"><button id="toggle-gemini-api-key" type="button">Mostrar</button></div></div>
+        <div id="gemini-api-key-status" class="settings-status">Verificando configuração…</div>
+        <div class="actions settings-actions"><button id="save-gemini-api-key" class="primary" type="button">Salvar chave</button><button id="clear-gemini-api-key" type="button">Remover salva</button></div>
+        <div class="field"><label for="huggingface-api-key">Token da API Hugging Face</label><div class="secret-input"><input id="huggingface-api-key" type="password" autocomplete="off" placeholder="Cole seu token hf_... aqui"><button id="toggle-huggingface-api-key" type="button">Mostrar</button></div></div>
+        <div id="huggingface-api-key-status" class="settings-status">Verificando configuração…</div>
+        <div class="actions settings-actions"><button id="save-huggingface-api-key" class="primary" type="button">Salvar token</button><button id="clear-huggingface-api-key" type="button">Remover salvo</button></div>
+        <p class="settings-note">O token é armazenado somente neste computador, em um arquivo local protegido, e serve para baixar e cachear modelos. A inferência continua localmente em CPU.</p>
+      </div>
+    </div>
+  </header>
+
+  <div class="studio-layout">
+    <aside class="studio-sidebar" aria-label="Navegação do Sprite Lab">
+      <div class="studio-sidebar-head">
+        <div class="sidebar-mark">SL</div>
+        <button id="sidebar-toggle" class="sidebar-toggle" type="button" aria-label="Recolher navegação" aria-expanded="true">‹</button>
+      </div>
+      <div class="sidebar-section-title">Workspace</div>
+      <nav class="sidebar-nav" aria-label="Seções do Sprite Lab">
+        <button class="page-tab sidebar-tab active" data-page="catalog-page" type="button"><span class="sidebar-icon">◇</span><span class="sidebar-label">Catálogo</span></button>
+        <button class="page-tab sidebar-tab" data-page="composition-page" type="button"><span class="sidebar-icon">✦</span><span class="sidebar-label">Composições</span></button>
+        <button class="page-tab sidebar-tab" data-page="sprite-page" type="button"><span class="sidebar-icon">▦</span><span class="sidebar-label">Sprites</span></button>
+      </nav>
+      <div class="sidebar-divider"></div>
+      <div class="sidebar-section-title">Pipeline</div>
+      <nav class="sidebar-nav" aria-label="Etapas generativas">
+        <button class="page-tab sidebar-tab" data-page="gemini-page" type="button"><span class="sidebar-icon">✧</span><span class="sidebar-label">Gemini Render</span></button>
+        <button class="page-tab sidebar-tab" data-page="postprocess-page" type="button"><span class="sidebar-icon">◈</span><span class="sidebar-label">Pós-processamento</span></button>
+      </nav>
+      <div class="sidebar-note"><span class="status-dot"></span><span class="sidebar-label">Local · offline</span></div>
+      <div class="sidebar-spacer"></div>
+      <div class="sidebar-footer"><span class="sidebar-label">Sprite Lab</span><small>semantic workspace</small></div>
+    </aside>
+    <div class="studio-main">
+  <main id="catalog-page" class="workspace page">
+    <div class="workspace-left">
+      <section class="panel browser">
+        <div class="panel-head">
+          <div>
+            <h1>Catálogo</h1>
+          </div>
+          <button id="btn-reindex">Atualizar índice</button>
+        </div>
+        <div class="filters">
+          <input id="query" placeholder="buscar personagem, espada…">
+          <select id="kind">
+            <option value="">Tipos</option>
+            <option value="character">Personagens</option>
+            <option value="weapon">Armas</option>
+            <option value="model">Modelos</option>
+            <option value="texture">Texturas</option>
+          </select>
+        </div>
+        <section id="semantic-panel" class="semantic-column">
+          <button id="close-semantic-panel" class="semantic-panel-close" type="button" aria-label="Fechar edição semântica">×</button>
+          <div id="semantic-empty" class="empty">
+            <div class="empty-icon">✦</div>
+            <h2>Semântica do asset</h2>
+            <p>Selecione um item para editar nome, família, tags e notas.</p>
+          </div>
+          <div id="asset-detail" hidden></div>
+        </section>
+        <div id="asset-list" class="asset-list"></div>
+      </section>
+    </div>
+
+    <section class="panel viewport-column">
+      <button id="open-bug-popup" class="bug-floating-button" type="button">Bug</button>
+      <div id="viewport-empty" class="empty">
+        <div class="empty-icon">◇</div>
+        <h2>Selecione um asset</h2>
+        <p>O viewport 3D aparecerá aqui quando você selecionar um modelo compatível.</p>
+      </div>
+      <div id="viewport-detail" hidden></div>
+    </section>
+    <div id="bug-popup" class="bug-popup" hidden>
+      <div class="bug-popup-card" role="dialog" aria-modal="true" aria-labelledby="bug-popup-title">
+        <div class="bug-popup-head"><h2 id="bug-popup-title">Relatar bug</h2><button id="close-bug-popup" class="bug-popup-close" type="button" aria-label="Fechar relato de bug">×</button></div>
+        <div id="bug-report-form" class="bug-report-form">
+          <div class="field"><label for="bug-type">Tipo</label><select id="bug-type"><option value="">Selecione</option><option value="render_failure">Falha em renderizar</option><option value="cannot_identify">Não consigo identificar</option><option value="other">Outros</option></select></div>
+          <div class="field" id="bug-description-field" hidden><label for="bug-description">Descrição</label><textarea id="bug-description" placeholder="Descreva o que aconteceu…"></textarea></div>
+          <output id="bug-report-summary" class="bug-report-summary">Selecione um tipo</output>
+          <div class="actions"><button id="submit-bug-report" class="primary" type="button">Enviar relato</button><button id="cancel-bug-report" type="button">Cancelar</button></div>
+        </div>
+      </div>
+    </div>
+
+  </main>
+  <section id="composition-page" class="page" hidden>
+    <div class="page-workspace composition-workspace">
+      <aside class="panel composition-library">
+        <div class="panel-head">
+          <div><h1>Composições</h1></div>
+        </div>
+        <div class="composition-filter"><input id="composition-query" placeholder="buscar composição, personagem, Action…"></div>
+        <div id="composition-source-filter" class="field composition-source-filter"></div>
+        <div class="composition-form">
+          <div class="panel-head"><div><h2 id="composition-form-title">Nova composição</h2></div></div>
+          <div class="form-grid composition-fields">
+            <div class="field full"><label for="composition-character">Mesh principal</label><select id="composition-character"><option value="">Selecione</option></select></div>
+            <div class="field full"><label for="composition-animation">Action</label><select id="composition-animation"><option value="">Selecione</option></select></div>
+            <div class="field full composition-components-field">
+              <button id="add-composition-component" class="open-components-button" type="button">Adicionar componentes</button>
+            </div>
+            <div class="field full"><label for="composition-name">Nome da composição</label><input id="composition-name" placeholder="homem com espada"></div>
+            <div class="field full"><label for="composition-tags">Tags</label><input id="composition-tags" placeholder="player, melee, heavy"></div>
+            <div class="field full"><label for="composition-notes">Notas</label><textarea id="composition-notes" placeholder="Contexto e uso da composição…"></textarea></div>
+          </div>
+          <div class="composition-form-actions">
+            <button id="delete-composition" class="danger-button" type="button" disabled>Deletar</button>
+            <div class="composition-actions-right">
+              <button id="new-composition-record" type="button">Nova</button>
+              <button id="new-composition" class="success" type="button">Gerar</button>
+              <button id="save-composition" class="primary" type="button">Salvar</button>
+            </div>
+          </div>
+        </div>
+        <div id="composition-list" class="composition-list"></div>
+      </aside>
+      <section class="panel composition-stage">
+        <div id="composition-empty" class="empty">
+          <div class="empty-icon">◇</div>
+          <h2>Monte uma composição</h2>
+          <p>Escolha um mesh, uma Action e adicione quantos componentes a composição precisar.</p>
+        </div>
+        <div id="composition-viewer-detail" hidden></div>
+      </section>
+    </div>
+  </section>
+  <aside id="composition-components-popup" class="composition-components-popup panel" aria-label="Configuração dos componentes" hidden>
+    <div id="composition-components-drag-handle" class="composition-components-drag-handle">
+      <span aria-hidden="true">⠿</span>
+      <span>Arraste</span>
+      <div class="composition-components-popup-actions">
+        <button id="append-composition-component" type="button">Adicionar outro</button>
+        <button id="close-composition-components" type="button" aria-label="Fechar componentes">×</button>
+      </div>
+    </div>
+    <div class="composition-components-popup-body">
+      <div id="composition-transform-controls" class="composition-transform-controls">
+        <div class="composition-transform-head"><strong>Manipular componente</strong><span id="composition-component-selection">Selecione um componente no preview</span></div>
+        <div class="composition-transform-modes">
+          <button type="button" data-viewer-mode="translate" class="active">Mover</button>
+          <button type="button" data-viewer-mode="rotate">Rotacionar</button>
+          <button type="button" data-viewer-mode="scale">Escalar</button>
+        </div>
+        <p class="composition-transform-help">Clique em uma arma ou prop no preview e arraste o gizmo.</p>
+      </div>
+      <div id="composition-components" class="composition-components"></div>
+      <div id="composition-components-empty" class="composition-components-empty">Nenhum componente adicionado.</div>
+    </div>
+  </aside>
+  <div id="delete-composition-popup" class="confirm-popup" hidden>
+    <div class="confirm-popup-card" role="dialog" aria-modal="true" aria-labelledby="delete-composition-title">
+      <div class="confirm-popup-head"><h2 id="delete-composition-title">Deletar composição?</h2><button id="close-delete-composition" class="confirm-popup-close" type="button" aria-label="Fechar confirmação">×</button></div>
+      <p id="delete-composition-message">Essa composição será removida da lista.</p>
+      <div class="confirm-popup-actions"><button id="cancel-delete-composition" type="button">Cancelar</button><button id="confirm-delete-composition" class="danger-button" type="button">Deletar</button></div>
+    </div>
+  </div>
+  <section id="sprite-page" class="page" hidden>
+    <div class="page-workspace sprite-workspace">
+      <aside class="panel sprite-library">
+        <div id="sprite-job-list" class="sprite-job-list"></div>
+        <div class="sprite-form">
+          <div class="panel-head"><div><h2>Renderizar sprites</h2></div></div>
+          <div class="form-grid sprite-fields">
+            <div class="field full"><label for="sprite-composition">Composição</label><select id="sprite-composition"><option value="">Selecione uma composição</option></select></div>
+            <div class="field full sprite-internal-field"><label for="sprite-render-profile">Enquadramento travado</label><select id="sprite-render-profile"><option value="">Selecione um manifesto</option></select></div>
+            <div class="field full"><label for="sprite-output-mode">Saída</label><select id="sprite-output-mode"><option value="runtime" selected>Runtime · 8 direções / 8 fases</option><option value="ai_base">Base IA · 5 direções / 9 fases</option></select></div>
+            <div class="field sprite-internal-field"><label for="sprite-profile">Perfil</label><select id="sprite-profile"><option value="8x8">8×8 · 8 direções / 8 fases</option><option value="8x12">8×12 · 8 direções / 12 fases</option><option value="8x16">8×16 · 8 direções / 16 fases</option><option value="5x9">5×9 · Base IA</option></select></div>
+            <div class="field sprite-internal-field"><label for="sprite-resolution">Resolução da célula</label><select id="sprite-resolution"><option value="128">128 × 128</option><option value="256" selected>256 × 256</option><option value="512">512 × 512</option><option value="672">672 × 672</option><option value="1024">1024 × 1024</option></select></div>
+            <div class="field sprite-internal-field"><label for="sprite-fps">FPS</label><input id="sprite-fps" type="number" min="1" max="60" value="10"></div>
+            <div class="field sprite-internal-field"><label for="sprite-elevation">Elevação da câmera</label><input id="sprite-elevation" type="number" step="0.001" value="35.264"></div>
+            <div class="field sprite-internal-field"><label for="sprite-azimuth">Azimute da câmera</label><input id="sprite-azimuth" type="number" step="0.001" value="45"></div>
+            <div class="field full"><label for="sprite-camera-preset">Câmera</label><select id="sprite-camera-preset"><option value="isometric" selected>Isométrico</option><option value="platform">Plataforma</option><option value="frontal">Frontal</option><option value="three_quarter">3/4</option><option value="diagonal">Diagonal 45°</option><option value="top_down">Top-down</option></select></div>
+            <div class="field full sprite-scale-option"><label for="sprite-scale-mode">Scale</label><select id="sprite-scale-mode"><option value="dynamic">Dinâmico</option><option value="default" selected>Padrão</option></select></div>
+          </div>
+          <div class="actions sprite-form-actions"><button id="render-sprites" class="primary" type="button">Renderizar sprites</button></div>
+        </div>
+      </aside>
+      <section class="panel sprite-stage">
+        <div id="sprite-empty" class="empty">
+          <div class="empty-icon">▦</div>
+          <h2>Renderize uma composição</h2>
+          <p>Escolha um perfil para gerar as células e o spritesheet automaticamente.</p>
+        </div>
+        <div id="sprite-render-detail" hidden></div>
+      </section>
+    </div>
+  </section>
+  <section id="gemini-page" class="page" hidden>
+    <div class="page-workspace pipeline-workspace">
+      <aside class="panel pipeline-form-panel">
+        <div class="panel-head"><div><h1>Gemini Render</h1><p>Gere o spritesheet 2D a partir da referência e dos canais estruturais.</p></div></div>
+        <div class="pipeline-form">
+          <div class="field"><label for="gemini-source">Render estrutural</label><select id="gemini-source"><option value="">Carregando beauty, bones e lineart…</option></select><small>Os três canais são enviados junto com a referência de identidade.</small></div>
+          <div id="gemini-source-preview" class="pipeline-upload-preview structural-preview" hidden><button id="gemini-source-preview-trigger" class="sprite-media-trigger" type="button" data-media-open><img id="gemini-source-image" alt="Pré-visualização do render estrutural"></button><span id="gemini-source-preview-label">Clique para ampliar</span></div>
+          <div class="field"><label for="gemini-reference-cache">Referência em cache</label><select id="gemini-reference-cache"><option value="">Selecione uma referência salva</option></select><small>As imagens ficam salvas localmente para reutilização.</small></div>
+          <div class="field"><label for="gemini-reference">Nova imagem de referência</label><input id="gemini-reference" type="file" accept="image/png,image/jpeg,image/webp"><small id="gemini-reference-name">Nenhuma imagem selecionada.</small></div>
+          <div class="actions"><button id="gemini-cache-reference" type="button">Salvar no cache</button></div>
+          <div id="gemini-reference-preview" class="pipeline-upload-preview" hidden><img id="gemini-reference-image" alt="Pré-visualização da referência"></div>
+          <div class="field"><label for="gemini-model">Modelo</label><input id="gemini-model" value="gemini-3-pro-image" spellcheck="false"></div>
+          <div class="field gemini-prompt-field"><div class="field-head"><label for="gemini-prompt">Prompt padrão</label><span><button id="gemini-prompt-expand" type="button">Expandir editor</button><button id="gemini-prompt-save" type="button" hidden>Salvar Prompt</button></span></div><textarea id="gemini-prompt" class="code-editor" rows="11" placeholder="Descreva o tratamento 2D desejado…"></textarea><small>Editor de texto: Tab insere indentação; Ctrl/Cmd+Enter executa o render.</small></div>
+          <div class="actions"><button id="gemini-render" class="primary" type="button">Gerar com Gemini</button></div>
+        </div>
+      </aside>
+      <section class="panel pipeline-stage">
+        <div id="gemini-empty" class="empty"><div class="empty-icon">✧</div><h2>Envie uma referência</h2><p>Escolha os canais estruturais e gere um output para aprovação.</p></div>
+        <div id="gemini-detail" hidden></div>
+      </section>
+      <aside class="panel pipeline-history"><div class="panel-head"><div><h2>Histórico Gemini</h2><p>Outputs ficam disponíveis para aprovação e pós-processamento.</p></div></div><div id="gemini-job-list" class="pipeline-job-list"></div></aside>
+    </div>
+  </section>
+  <section id="postprocess-page" class="page" hidden>
+    <div class="page-workspace pipeline-workspace postprocess-workspace">
+      <aside class="panel pipeline-form-panel">
+        <div class="panel-head"><div><h1>Pós-processamento</h1><p>Converta um output Gemini aprovado em sprites de produção.</p></div></div>
+        <div class="pipeline-form">
+          <div class="field"><label for="postprocess-gemini-job">Output Gemini aprovado</label><select id="postprocess-gemini-job"><option value="">Nenhum output concluído</option></select><small>Somente outputs concluídos aparecem aqui; a aprovação visual é feita antes de iniciar.</small></div>
+          <div id="postprocess-gemini-preview" class="postprocess-gemini-preview" hidden><img id="postprocess-gemini-image" alt="Output Gemini selecionado"><span id="postprocess-gemini-preview-label"></span></div>
+          <div class="pipeline-steps"><strong>Pipeline</strong><span>Alinhamento estrutural</span><span>Anime 6B → máscara binária + nearest</span><span>Pré-limpeza antes do upscale final</span><span>Modelo selecionado → 2× em CPU</span><span>4 variantes finais</span></div>
+          <div class="variant-list"><div><span class="variant-dot original"></span><span>Original (padrão)</span></div><div><span class="variant-dot frame"></span><span>Ajuste de frame</span></div><div><span class="variant-dot palette"></span><span>Coesão de cores · 256</span></div><div><span class="variant-dot palette-low"></span><span>Coesão de cores · 128</span></div></div>
+          <div class="field"><label for="postprocess-fps">FPS</label><input id="postprocess-fps" type="number" min="1" max="60" value="10"></div>
+          <div class="field"><label for="postprocess-model-profile">Upscale final</label><select id="postprocess-model-profile"><option value="anime_x4plus_6b" selected>Anime 6B · neural</option><option value="bicubic">Bicubic 2× · conservador</option></select><small>O passe da máscara usa o Anime 6B. Escolha entre reconstrução neural e Bicubic, que prioriza fidelidade à imagem original sem reconstrução generativa.</small></div>
+          <div class="actions"><button id="run-postprocess" class="primary" type="button">Executar pós-processamento</button></div>
+        </div>
+      </aside>
+      <section class="panel pipeline-stage">
+        <div id="postprocess-empty" class="empty"><div class="empty-icon">◈</div><h2>Selecione um output Gemini</h2><p>O resultado publicado terá spritesheet, GIFs direcionais e quatro variantes.</p></div>
+        <div id="postprocess-detail" hidden></div>
+      </section>
+      <aside class="panel pipeline-history"><div class="panel-head"><div><h2>Histórico de processamento</h2><p>Execuções locais e seus artefatos.</p></div></div><div id="postprocess-job-list" class="pipeline-job-list"></div></aside>
+    </div>
+  </section>
+    </div>
+  </div>
+  <div id="sprite-media-popup" class="sprite-media-popup" hidden>
+    <div class="sprite-media-backdrop" data-media-close></div>
+    <section class="sprite-media-dialog" role="dialog" aria-modal="true" aria-labelledby="sprite-media-title">
+      <div class="sprite-media-head">
+        <h2 id="sprite-media-title">Visualização</h2>
+        <div class="sprite-media-tools"><button type="button" data-media-zoom-out aria-label="Reduzir zoom">−</button><button type="button" data-media-zoom-reset>100%</button><button type="button" data-media-zoom-in aria-label="Aumentar zoom">+</button><button id="close-sprite-media" class="sprite-media-close" type="button" aria-label="Fechar visualização">×</button></div>
+      </div>
+      <div class="sprite-media-body" title="Roda do mouse para zoom; arraste para navegar"><img id="sprite-media-image" alt="Visualização do output"></div>
+    </section>
+  </div>
+  <div id="toast" class="toast" hidden></div>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/"
+      }
+    }
+  </script>
+  <script src="/web/app.js"></script>
+  <script type="module" src="/web/viewer.js"></script>
+</body>
+</html>

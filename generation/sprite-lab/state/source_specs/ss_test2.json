@@ -1,0 +1,39 @@
+{
+  "id": "ss_test2",
+  "category": "character_animation",
+  "generator": "sprite_lab.ai_page_gif_import",
+  "generator_version": "v1-local",
+  "seed": 0,
+  "source": "/home/ggnp/tools/ss_test2_ai_poc",
+  "base_resolution": [512, 512],
+  "scale": 1,
+  "palette": "source_image",
+  "animations": {
+    "r1": {"frames": 8, "fps": 10, "loop": true},
+    "r2": {"frames": 8, "fps": 10, "loop": true},
+    "r3": {"frames": 8, "fps": 10, "loop": true},
+    "r4": {"frames": 8, "fps": 10, "loop": true},
+    "r5": {"frames": 8, "fps": 10, "loop": true},
+    "r6": {"frames": 8, "fps": 10, "loop": true},
+    "r7": {"frames": 8, "fps": 10, "loop": true},
+    "r8": {"frames": 8, "fps": 10, "loop": true}
+  },
+  "orientation": "eight_direction_rows",
+  "pivot": [64, 127],
+  "output": "work/sprite-renders/ss_test2",
+  "acceptance": {
+    "source_pages": 5,
+    "rgba_cells": true,
+    "allow_partial_alpha": false,
+    "integer_scale": true,
+    "expected_direction_gifs": 8
+  },
+  "generator_options": {
+    "background_removal": "magenta_border_flood_fill",
+    "mirrors": {"r3": "r1", "r4": "r2", "r8": "r6"}
+  },
+  "limitations": [
+    "Three directions are horizontal mirrors defined by the Sprite Lab contract.",
+    "GIF output uses binary transparency; PNG cells retain RGBA."
+  ]
+}

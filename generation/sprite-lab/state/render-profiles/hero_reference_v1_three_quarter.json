@@ -1,0 +1,20 @@
+{
+  "schema": "sprite_lab.render_profile/v1",
+  "id": "hero_reference_v1_three_quarter",
+  "cell_size": [256, 256],
+  "cell_size_mode": "fixed",
+  "ortho_scale_mode": "fixed",
+  "cell_size_quantum": 16,
+  "ortho_scale": 2.5102688002871325,
+  "dynamic_x": true,
+  "horizontal_margin_px": 2.0,
+  "dynamic_y": true,
+  "vertical_margin_px": 2.0,
+  "foot_anchor": [128, 220],
+  "camera_elevation": 20.0,
+  "camera_azimuth": 45.0,
+  "directions": 8,
+  "phases": 8,
+  "ground_z": 0.0,
+  "camera_preset": "three_quarter"
+}

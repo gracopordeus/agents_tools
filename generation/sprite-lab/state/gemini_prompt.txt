@@ -1,0 +1,42 @@
+Use the uploaded 8x8 beauty spritesheet as the exact composition and layout source.
+
+Transform the character in every cell to match the character design, proportions, clothing, materials, colors and visual identity shown in the reference image concept.jpeg.
+
+Use the bones spritesheet only to preserve the exact pose, joint positions, limb articulation and animation phase of each cell.
+
+Use the lineart spritesheet only to preserve the visible mesh contour, silhouette, weapon contour and separation between body parts.
+
+The final result must be a single 8x8 spritesheet with exactly 64 cells, preserving:
+- the original 8 rows and 8 columns;
+- the original camera angle and isometric perspective;
+- the original direction of each row;
+- the original animation phase of each column;
+- the original cell size, framing, foot position and spacing;
+- one complete character per cell;
+- the head of each pose must follow the same order: spritesheetContract > direction > id.
+
+IMPORTANT: background chromakey green-lemon pure #00FF00 perfectly uniform on all empty spaces.
+
+spritesheetContract:
+{
+  "content": {
+    "directions": {
+      "count": 8,
+      "rows": [
+        { "row": 1, "id": "north", "vector": [-1, 0] }, # PAY ATTENTION IN THIS ROW, ALL POSES ARE TO NORTH, REVIEW IT BEFORE DELIVERY!
+        { "row": 2, "id": "north_west", "vector": [-1, 1] },
+        { "row": 3, "id": "west", "vector": [1, 0] },
+        { "row": 4, "id": "south_west", "vector": [1, 1] },
+        { "row": 5, "id": "south", "vector": [0, 1] }, 
+        { "row": 6, "id": "south_east", "vector": [-1, -1] },
+        { "row": 7, "id": "east", "vector": [0, -1] },
+        { "row": 8, "id": "noth_east", "vector": [1, -1] }
+      ]
+    },
+    "camera": { "type": "orthographic", "preset": "isometric", "shadow": false },
+    "character": { "description": a viking warrior with an axe in the right hand" },
+    "action": "roll",
+    "background": "#00FF00",
+    "pixel_ratio": "2048x2048"
+  }
+}

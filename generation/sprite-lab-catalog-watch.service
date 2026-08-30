@@ -1,0 +1,14 @@
+[Unit]
+Description=Sprite Lab automatic source catalog
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ggnp
+Environment=SPRITE_LAB_NOTIFY=1
+ExecStart=/usr/bin/python3 /home/ggnp/tools/generation/catalog_sources.py watch --registry /home/ggnp/tools/source-assets/catalog/sources.json --output /home/ggnp/tools/source-assets/catalog/assets.json --report /home/ggnp/tools/source-assets/catalog/index_report.json --interval 2 --debounce 3
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
