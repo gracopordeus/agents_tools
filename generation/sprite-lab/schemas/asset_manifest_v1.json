@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sprite-lab.local/schemas/asset_manifest_v1.json",
+  "title": "Sprite Lab asset manifest",
+  "type": "object",
+  "required": [
+    "schema",
+    "asset",
+    "contract",
+    "source",
+    "generation",
+    "layout",
+    "animation",
+    "placement",
+    "gameplay",
+    "runtime",
+    "artifacts",
+    "validation",
+    "provenance"
+  ],
+  "properties": {
+    "schema": { "const": "sprite_lab.asset_manifest/v1" },
+    "asset": {
+      "type": "object",
+      "required": ["id", "name", "type", "representation", "capabilities"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1 },
+        "type": {
+          "enum": ["actor", "prop_static", "prop_animated", "tile", "vfx"]
+        },
+        "representation": {
+          "enum": [
+            "directional_sprite_atlas",
+            "sprite_atlas",
+            "tile_atlas",
+            "frame_sequence"
+          ]
+        },
+        "capabilities": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "animated",
+              "agent",
+              "blocks_navigation",
+              "destructible",
+              "has_collision",
+              "interactable",
+              "occluder",
+              "walkable"
+            ]
+          },
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["role", "path"],
+        "properties": {
+          "role": { "type": "string", "minLength": 1 },
+          "path": { "type": "string", "minLength": 1 },
+          "bytes": { "type": "integer", "minimum": 0 },
+          "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "additionalProperties": true
+}

@@ -20,63 +20,447 @@ const state = {
   spriteJobs: [],
   renderProfiles: [],
   cameraPresets: [],
+  assetContract: { asset_types: [], representations: [], capabilities: [] },
   selectedSpriteJob: null,
   geminiSources: [],
   geminiJobs: [],
   geminiConfig: { configured: false, source: null, updated_at: null },
+  openaiConfig: { configured: false, source: null, updated_at: null },
+  qwenConfig: { configured: false, source: null, updated_at: null },
   huggingfaceConfig: { configured: false, source: null, updated_at: null },
   postprocessJobs: [],
   selectedGeminiJob: null,
   selectedPostprocessJob: null,
   geminiReferences: [],
   geminiPrompt: null,
+  aiRenderSpecDefaults: null,
+  aiRenderSpec: null,
+  aiRenderActiveRow: 0,
+  aiRenderCompileTimer: null,
+  aiRenderCompileRequest: 0,
   selectedPostprocessVariantByJob: {},
 };
 
-const DEFAULT_GEMINI_PROMPT = `Use the uploaded 8x8 beauty spritesheet as the exact composition and layout source.
+const IMAGE_PROVIDER_DEFAULT_MODELS = Object.freeze({
+  google: "gemini-3.1-flash-image",
+  openai: "gpt-image-2",
+  qwen: "qwen-image-3.0-pro",
+});
+const IMAGE_PROVIDER_DEFAULT_BACKGROUNDS = Object.freeze({
+  google: "#00FF00",
+  openai: "transparent",
+  qwen: "transparent",
+});
+const AI_RENDER_REFERENCE_CHANNELS = Object.freeze(["beauty", "bones", "lineart", "frame_control"]);
+const DEFAULT_GEMINI_TEMPERATURE = 1;
+const DEFAULT_GEMINI_TOP_K = 64;
 
-Transform the character in every cell to match the character design, proportions, clothing, materials, colors and visual identity shown in the reference image concept.jpeg.
+function selectedImageProvider() {
+  const provider = $("#gemini-provider")?.value;
+  return ["google", "openai", "qwen"].includes(provider) ? provider : "google";
+}
 
-Use the bones spritesheet only to preserve the exact pose, joint positions, limb articulation and animation phase of each cell.
+function selectedImageBackground(provider = selectedImageProvider()) {
+  return IMAGE_PROVIDER_DEFAULT_BACKGROUNDS[provider] || "transparent";
+}
 
-Use the lineart spritesheet only to preserve the visible mesh contour, silhouette, weapon contour and separation between body parts.
+function imageProviderLabel(provider) {
+  if (provider === "qwen") return "Qwen Image";
+  if (provider === "openai") return "OpenAI";
+  return "Gemini";
+}
 
-The final result must be a single 8x8 spritesheet with exactly 64 cells, preserving:
-- the original 8 rows and 8 columns;
-- the original camera angle and isometric perspective;
-- the original direction of each row;
-- the original animation phase of each column;
-- the original cell size, framing, foot position and spacing;
-- one complete character per cell;
-- the head of each pose must follow the same order: spritesheetContract > direction > id.
-
-IMPORTANT: background chromakey green-lemon pure #00FF00 perfectly uniform on all empty spaces.
-
-spritesheetContract:
-{
-  "content": {
-    "directions": {
-      "count": 8,
-      "rows": [
-        { "row": 1, "id": "south", "vector": [0, -1] },
-        { "row": 2, "id": "south_east", "vector": [1, -1] },
-        { "row": 3, "id": "east", "vector": [1, 0] },
-        { "row": 4, "id": "north_east", "vector": [1, 1] },
-        { "row": 5, "id": "north", "vector": [0, 1] },
-        { "row": 6, "id": "north_west", "vector": [-1, 1] },
-        { "row": 7, "id": "west", "vector": [-1, 0] },
-        { "row": 8, "id": "south_west", "vector": [-1, -1] }
-      ]
-    },
-    "camera": { "type": "orthographic", "preset": "isometric", "shadow": false },
-    "action": "idle",
-    "background": "#00FF00",
-    "pixel_ratio": "2048x2048"
+function imageProviderErrorMessage(error, provider) {
+  const message = String(error || "Erro desconhecido");
+  if (provider === "qwen" && /InvalidApiKey|Invalid API-key/i.test(message)) {
+    return `${message} Verifique a chave Token API em Configurações > Chave da API Qwen Cloud e confirme que ela pertence ao Token Plan.`;
   }
-}`;
+  return message;
+}
+
+function selectedReferenceChannels() {
+  return [...document.querySelectorAll("#gemini-channel-options input[type=checkbox]:checked")]
+    .map((input) => input.value)
+    .filter((value) => AI_RENDER_REFERENCE_CHANNELS.includes(value));
+}
+
+function selectedIdentityReferenceName() {
+  const file = $("#gemini-reference")?.files?.[0];
+  if (file?.name) return file.name;
+  const referenceId = $("#gemini-reference-cache")?.value || "";
+  return state.geminiReferences.find((reference) => reference.id === referenceId)?.name
+    || "identity reference";
+}
+
+function isLegacyFixedAiPrompt(value) {
+  const prompt = String(value || "");
+  return /spritesheetContract:|Use the uploaded 8x8|Blender row contract|\bR1\s*=|\bROW\s*1\s*=/i.test(prompt);
+}
+
+function updateReferenceChannelControls() {
+  const assetMode = $("#gemini-asset-mode")?.value || "character_animation";
+  const bonesInput = $("#gemini-channel-options input[value='bones']");
+  const bonesCard = bonesInput?.closest("label");
+  const bonesAvailable = ["character_animation", "custom"].includes(assetMode);
+  if (bonesInput) {
+    bonesInput.disabled = !bonesAvailable;
+    if (!bonesAvailable) bonesInput.checked = false;
+  }
+  if (bonesCard) {
+    bonesCard.classList.toggle("unavailable", !bonesAvailable);
+    bonesCard.title = bonesAvailable ? "Pose, articulação e movimento" : "Indisponível para este tipo de asset";
+  }
+  const selected = selectedReferenceChannels();
+  const provider = selectedImageProvider();
+  const count = $("#gemini-channel-count");
+  const help = $("#gemini-channel-help");
+  if (count) count.textContent = `${selected.length}/${provider === "qwen" ? 2 : 4} selecionadas`;
+  if (help) {
+    help.textContent = provider === "qwen"
+      ? "Qwen: a identidade ocupa uma entrada; selecione até duas referências estruturais, incluindo opcionalmente Frame Control."
+      : "Selecione as referências estruturais que o provider deve receber junto com a identidade. Frame Control delimita cada box de 256×256 e não aparece no output.";
+  }
+  updateAiRenderSummary();
+}
+
+function updateAiRenderSummary() {
+  const summary = $("#ai-render-summary");
+  if (!summary) return;
+  const issues = [];
+  if (!$("#gemini-render-name")?.value.trim()) issues.push("nome do render");
+  if (!$("#gemini-source")?.value) issues.push("render estrutural");
+  if (!$("#gemini-reference")?.files?.length && !$("#gemini-reference-cache")?.value) issues.push("referência de identidade");
+  const channels = selectedReferenceChannels();
+  if (!channels.length) issues.push("referência estrutural");
+  if (selectedImageProvider() === "qwen" && channels.length > 2) issues.push("limite de 2 referências do Qwen");
+  summary.classList.toggle("error", issues.length > 0);
+  summary.textContent = issues.length
+    ? `${issues.length} ${issues.length === 1 ? "item precisa" : "itens precisam"} de atenção: ${issues.join(", ")}.`
+    : `${channels.length + 1} referências · 64 células · ${imageProviderLabel(selectedImageProvider())}`;
+}
+
+function updateImageProviderControls() {
+  const provider = selectedImageProvider();
+  const model = $("#gemini-model");
+  const button = $("#gemini-render");
+  const seedField = $("#qwen-seed-field");
+  const temperatureField = $("#gemini-temperature-field");
+  const topKField = $("#gemini-top-k-field");
+  const background = $("#gemini-background");
+  const backgroundHelp = $("#gemini-background-help");
+  if (seedField) seedField.hidden = provider !== "qwen";
+  if (temperatureField) temperatureField.hidden = provider !== "google";
+  if (topKField) topKField.hidden = provider !== "google";
+  if (model && (!model.value.trim() || Object.values(IMAGE_PROVIDER_DEFAULT_MODELS).includes(model.value.trim()))) {
+    model.value = IMAGE_PROVIDER_DEFAULT_MODELS[provider];
+  }
+  if (background) {
+    background.value = selectedImageBackground(provider);
+    background.disabled = true;
+    background.title = provider === "google"
+      ? "Gemini usa fundo verde-limão (#00FF00)."
+      : "OpenAI/Qwen usam fundo desativado, representado como transparência.";
+  }
+  if (backgroundHelp) {
+    backgroundHelp.textContent = provider === "google"
+      ? "Gemini: verde-limão puro #00FF00, aplicado automaticamente pelo provider."
+      : "Background off: áreas vazias transparentes, aplicado automaticamente pelo provider.";
+  }
+  if (button && !button.disabled) button.textContent = "Gerar spritesheet";
+  updateReferenceChannelControls();
+}
+
+const AI_RENDER_ROW_TYPES = [
+  ["character", "character"],
+  ["prop", "prop"],
+  ["building", "building"],
+  ["environment", "environment"],
+  ["asset", "asset"],
+];
+const AI_RENDER_COLUMN_MODES = [
+  ["animation_frames", "animation_frames"],
+  ["variants", "variants"],
+  ["states", "states"],
+  ["rotations", "rotations"],
+  ["damage_states", "damage_states"],
+  ["construction_stages", "construction_stages"],
+  ["season_variants", "season_variants"],
+  ["custom", "custom"],
+];
+
+function cloneValue(value) {
+  return value == null ? value : JSON.parse(JSON.stringify(value));
+}
+
+function aiRenderDefaultSpec() {
+  return cloneValue(state.aiRenderSpecDefaults?.spec) || {
+    version: "2.0",
+    output: { width: 2048, height: 2048, grid: { rows: 8, columns: 8 }, background: "transparent", draw_grid: false },
+    asset: { mode: "character_animation", name: "", global_description: "", style: { preset: "", description: "" } },
+    camera: { projection: "orthographic", preset: "isometric", elevation_deg: 35.264, azimuth_deg: 45 },
+    framing: { anchor: "bottom_center", scale_policy: "normalize_per_row", safe_area: 0.9, allow_crop: false, allow_cross_cell_overlap: false },
+    references: {},
+    prompt_options: { include_rows: false, include_cells: false },
+    rows: Array.from({ length: 8 }, (_, index) => ({
+      index: index + 1,
+      id: `row_${index + 1}`,
+      type: "asset",
+      name: `Asset ${index + 1}`,
+      description: "",
+      must_have: "",
+      must_not_have: "",
+      scale: { policy: "inherit_global", occupancy: null },
+      anchor: "inherit_global",
+      columns: { mode: "variants", description: "", cells: [] },
+      include_in_prompt: true,
+    })),
+  };
+}
+
+function aiRenderSpecFormValues(spec) {
+  const asset = spec.asset || {};
+  const style = asset.style || {};
+  const camera = spec.camera || {};
+  const framing = spec.framing || {};
+  const set = (id, value) => {
+    const field = $(`#${id}`);
+    if (field && value != null) field.value = value;
+  };
+  set("gemini-asset-mode", asset.mode || "character_animation");
+  set("gemini-asset-name", asset.name || "");
+  set("gemini-global-description", asset.global_description || "");
+  set("gemini-style-preset", style.preset || "");
+  set("gemini-style-description", style.description || "");
+  set("gemini-background", selectedImageBackground());
+  set("gemini-camera-projection", camera.projection || "orthographic");
+  set("gemini-camera-preset", camera.preset || "isometric");
+  set("gemini-camera-elevation", camera.elevation_deg ?? 35.264);
+  set("gemini-camera-azimuth", camera.azimuth_deg ?? 45);
+  set("gemini-framing-anchor", framing.anchor || "bottom_center");
+  set("gemini-scale-policy", framing.scale_policy || "normalize_per_row");
+  set("gemini-safe-area", framing.safe_area ?? 0.9);
+  const crop = $("#gemini-allow-crop");
+  const overlap = $("#gemini-allow-overlap");
+  if (crop) crop.checked = Boolean(framing.allow_crop);
+  if (overlap) overlap.checked = Boolean(framing.allow_cross_cell_overlap);
+  const promptOptions = spec.prompt_options || {};
+  const includeRowsCells = $("#gemini-include-rows-cells");
+  if (includeRowsCells) includeRowsCells.checked = promptOptions.include_rows === true;
+  const semantics = state.aiRenderSpecDefaults || {};
+  const rowMeaning = semantics.row_semantics?.[asset.mode] || "defined by row specification";
+  const columnMeaning = semantics.column_semantics?.[asset.mode] || "defined by column specification";
+  const semanticsLabel = $("#gemini-grid-semantics");
+  if (semanticsLabel) semanticsLabel.textContent = `Rows: ${rowMeaning} · Columns: ${columnMeaning}`;
+}
+
+function optionMarkup(options, selected) {
+  return options.map(([value, label]) => `<option value="${esc(value)}"${value === selected ? " selected" : ""}>${esc(label)}</option>`).join("");
+}
+
+function renderAiRenderRows() {
+  const list = $("#gemini-row-list");
+  if (!list || !state.aiRenderSpec) return;
+  const rows = state.aiRenderSpec.rows || [];
+  const activeIndex = Math.max(0, Math.min(Number(state.aiRenderActiveRow) || 0, rows.length - 1));
+  state.aiRenderActiveRow = activeIndex;
+  const statusFor = (row) => row.description?.trim() ? "✓" : "○";
+  const matrix = rows.map((row, rowIndex) => {
+    const vector = Array.isArray(row.vector) ? ` [${row.vector.join(", ")}]` : "";
+    return `<div class="ai-render-row-entry"><button type="button" class="ai-render-row-item ${rowIndex === activeIndex ? "active" : ""}" data-ai-row-select="${rowIndex}" aria-label="Editar row ${row.index || rowIndex + 1}" aria-pressed="${rowIndex === activeIndex}">
+      <span class="ai-render-row-number">${row.index || rowIndex + 1}</span>
+      <span class="ai-render-row-name"><b>${esc(row.name || row.id || `Asset ${rowIndex + 1}`)}</b><small>${esc(row.id || "")}${esc(vector)}</small></span>
+      <span class="ai-render-row-mode">${esc(row.columns?.mode || "variants")}</span>
+      <span class="ai-render-row-status">${statusFor(row)}</span>
+    </button><label class="ai-render-row-prompt"><input type="checkbox" data-ai-row-include data-ai-row-index="${rowIndex}" ${row.include_in_prompt !== false ? "checked" : ""}> Incluir</label></div>`;
+  }).join("");
+  const row = rows[activeIndex] || {};
+  const cells = Array.from({ length: 8 }, (_, cellIndex) => {
+    const column = cellIndex + 1;
+    const cell = (row.columns?.cells || []).find((item) => Number(item.column) === column);
+    return `<label class="ai-render-cell-field"><span><input type="checkbox" data-ai-cell-include data-ai-cell-column="${column}" ${cell?.include_in_prompt !== false ? "checked" : ""}> C${column}</span><textarea data-ai-cell="${column}" rows="2" placeholder="Observação opcional">${esc(cell?.description || "")}</textarea></label>`;
+  }).join("");
+  const inspector = `<div id="ai-render-row-inspector" class="ai-render-row-inspector" data-ai-row="${activeIndex}">
+    <div class="ai-render-row-inspector-head"><div><span class="eyebrow">ROW ${activeIndex + 1}</span><h4>${esc(row.name || row.id || `Asset ${activeIndex + 1}`)}</h4></div><span class="status-chip neutral">Edite somente a row selecionada</span></div>
+    <input type="hidden" data-ai-row-field="id" value="${esc(row.id || `row_${activeIndex + 1}`)}">
+    <div class="form-grid">
+      <div class="field"><label>Nome da row</label><input data-ai-row-field="name" value="${esc(row.name || "")}" placeholder="Nome curto"></div>
+      <div class="field"><label>Tipo</label><select data-ai-row-field="type">${optionMarkup(AI_RENDER_ROW_TYPES, row.type || "asset")}</select></div>
+      <div class="field full"><label>Descrição</label><textarea data-ai-row-field="description" rows="2" placeholder="O que deve existir nesta row?">${esc(row.description || "")}</textarea></div>
+      <div class="field full"><label>Required features</label><textarea data-ai-row-field="must_have" rows="2" placeholder="Elementos obrigatórios">${esc(row.must_have || "")}</textarea></div>
+      <div class="field full"><label>Forbidden features</label><textarea data-ai-row-field="must_not_have" rows="2" placeholder="Elementos proibidos">${esc(row.must_not_have || "")}</textarea></div>
+      <div class="field"><label>Column mode</label><select data-ai-row-field="column_mode">${optionMarkup(AI_RENDER_COLUMN_MODES, row.columns?.mode || "variants")}</select></div>
+      <div class="field full"><label>Descrição das colunas</label><textarea data-ai-row-field="column_description" rows="2" placeholder="Como as 8 colunas variam?">${esc(row.columns?.description || "")}</textarea></div>
+    </div>
+    <details class="ai-render-advanced-row"><summary>Opções avançadas da row</summary><div class="form-grid">
+      <div class="field"><label>Anchor</label><input data-ai-row-field="anchor" value="${esc(row.anchor || "inherit_global")}" spellcheck="false"></div>
+      <div class="field"><label>Scale policy</label><input data-ai-row-field="scale_policy" value="${esc(row.scale?.policy || "inherit_global")}" spellcheck="false"></div>
+      <div class="field"><label>Ocupação (0–1)</label><input data-ai-row-field="occupancy" type="number" min="0.1" max="1" step="0.01" value="${row.scale?.occupancy ?? ""}"></div>
+    </div><details class="ai-render-cell-editor"><summary>Configurar as 8 células</summary><div class="ai-render-cell-grid">${cells}</div></details></details>
+  </div>`;
+  list.innerHTML = `<div class="ai-render-row-matrix" role="list">${matrix}</div>${inspector}`;
+}
+
+function readAiRenderSpecFromForm() {
+  const spec = cloneValue(state.aiRenderSpec || aiRenderDefaultSpec());
+  const value = (id, fallback = "") => $(`#${id}`)?.value ?? fallback;
+  const numberValue = (id, fallback) => {
+    const parsed = Number(value(id, fallback));
+    return Number.isFinite(parsed) ? parsed : fallback;
+  };
+  spec.version = "2.0";
+  spec.output.background = selectedImageBackground();
+  spec.output.draw_grid = false;
+  spec.asset.mode = value("gemini-asset-mode", "character_animation");
+  spec.asset.name = value("gemini-asset-name").trim();
+  spec.asset.global_description = value("gemini-global-description").trim();
+  spec.asset.style = {
+    preset: value("gemini-style-preset", "").trim(),
+    description: value("gemini-style-description").trim(),
+  };
+  spec.camera = {
+    projection: value("gemini-camera-projection", "orthographic"),
+    preset: value("gemini-camera-preset", "isometric").trim(),
+    elevation_deg: numberValue("gemini-camera-elevation", 35.264),
+    azimuth_deg: numberValue("gemini-camera-azimuth", 45),
+  };
+  spec.framing = {
+    anchor: value("gemini-framing-anchor", "bottom_center"),
+    scale_policy: value("gemini-scale-policy", "normalize_per_row"),
+    safe_area: Math.max(0.1, Math.min(1, numberValue("gemini-safe-area", 0.9))),
+    allow_crop: Boolean($("#gemini-allow-crop")?.checked),
+    allow_cross_cell_overlap: Boolean($("#gemini-allow-overlap")?.checked),
+  };
+  spec.references = {
+    ...(spec.references || {}),
+    identity: { ...(spec.references?.identity || {}), enabled: true },
+    beauty: { ...(spec.references?.beauty || {}), enabled: selectedReferenceChannels().includes("beauty") },
+    bones: { ...(spec.references?.bones || {}), enabled: selectedReferenceChannels().includes("bones") },
+    lineart: { ...(spec.references?.lineart || {}), enabled: selectedReferenceChannels().includes("lineart") },
+    frame_control: { ...(spec.references?.frame_control || {}), enabled: selectedReferenceChannels().includes("frame_control") },
+  };
+  spec.prompt_options = {
+    ...(spec.prompt_options || {}),
+    include_rows: $("#gemini-include-rows-cells")?.checked ?? false,
+    include_cells: $("#gemini-include-rows-cells")?.checked ?? false,
+  };
+  [...document.querySelectorAll("[data-ai-row-include][data-ai-row-index]")].forEach((toggle) => {
+    const rowIndex = Number(toggle.dataset.aiRowIndex);
+    if (spec.rows?.[rowIndex]) spec.rows[rowIndex].include_in_prompt = toggle.checked;
+  });
+  const activeIndex = Math.max(0, Math.min(Number(state.aiRenderActiveRow) || 0, (spec.rows || []).length - 1));
+  const node = $("#ai-render-row-inspector");
+  if (node && spec.rows?.[activeIndex]) {
+    const field = (name, fallback = "") => node.querySelector(`[data-ai-row-field="${name}"]`)?.value ?? fallback;
+    const occupancyRaw = field("occupancy", "").trim();
+    const occupancy = Number(occupancyRaw);
+    const previous = spec.rows[activeIndex];
+    spec.rows[activeIndex] = {
+      ...previous,
+      index: activeIndex + 1,
+      id: field("id", previous.id || `row_${activeIndex + 1}`).trim(),
+      include_in_prompt: spec.rows[activeIndex].include_in_prompt !== false,
+      type: field("type", previous.type || "asset"),
+      name: field("name", previous.name || "").trim(),
+      description: field("description").trim(),
+      must_have: field("must_have").trim(),
+      must_not_have: field("must_not_have").trim(),
+      anchor: field("anchor", "inherit_global").trim(),
+      scale: {
+        ...(previous.scale || {}),
+        policy: field("scale_policy", "inherit_global").trim(),
+        occupancy: Number.isFinite(occupancy) && occupancyRaw ? occupancy : null,
+      },
+      columns: {
+        ...(previous.columns || {}),
+        mode: field("column_mode", "variants"),
+        description: field("column_description").trim(),
+        cells: [...node.querySelectorAll("[data-ai-cell]")]
+          .map((cell) => ({
+            column: Number(cell.dataset.aiCell),
+            description: cell.value.trim(),
+            include_in_prompt: Boolean(
+              node.querySelector(`[data-ai-cell-include][data-ai-cell-column="${cell.dataset.aiCell}"]`)?.checked
+            ),
+          }))
+          .filter((cell) => cell.description),
+      },
+    };
+  }
+  return spec;
+}
+
+function scheduleCompiledPromptRefresh() {
+  if (state.aiRenderCompileTimer) window.clearTimeout(state.aiRenderCompileTimer);
+  state.aiRenderCompileTimer = window.setTimeout(refreshCompiledPrompt, 250);
+}
+
+async function refreshCompiledPrompt() {
+  const preview = $("#gemini-compiled-prompt");
+  if (!preview) return;
+  const requestId = ++state.aiRenderCompileRequest;
+  const spec = readAiRenderSpecFromForm();
+  state.aiRenderSpec = spec;
+  try {
+    const result = await api("/api/ai-render-spec/compile", {
+      method: "POST",
+      body: {
+        source_id: $("#gemini-source")?.value || "",
+        render_name: $("#gemini-render-name")?.value.trim() || "",
+        render_spec: spec,
+        provider: selectedImageProvider(),
+        reference_name: selectedIdentityReferenceName(),
+        reference_channels: selectedReferenceChannels(),
+        blender_channels: selectedReferenceChannels().filter((channel) => channel !== "frame_control"),
+        additional_instructions: $("#gemini-prompt")?.value.trim() || "",
+      },
+    });
+    if (requestId === state.aiRenderCompileRequest) preview.value = result.compiled_prompt || "";
+  } catch (error) {
+    if (requestId === state.aiRenderCompileRequest) preview.value = `Não foi possível compilar o prompt: ${error.message}`;
+  }
+}
+
+function initializeAiRenderSpec() {
+  if (!$("#gemini-row-list")) return;
+  state.aiRenderSpec = aiRenderDefaultSpec();
+  aiRenderSpecFormValues(state.aiRenderSpec);
+  renderAiRenderRows();
+  const rowList = $("#gemini-row-list");
+  rowList?.addEventListener("click", (event) => {
+    const target = event.target.closest("[data-ai-row-select]");
+    if (!target) return;
+    state.aiRenderSpec = readAiRenderSpecFromForm();
+    state.aiRenderActiveRow = Number(target.dataset.aiRowSelect) || 0;
+    renderAiRenderRows();
+    scheduleCompiledPromptRefresh();
+  });
+  const panel = $("#gemini-row-list")?.closest(".ai-render-spec-panel");
+  panel?.addEventListener("input", () => {
+    state.aiRenderSpec = readAiRenderSpecFromForm();
+    scheduleCompiledPromptRefresh();
+  });
+  panel?.addEventListener("change", (event) => {
+    state.aiRenderSpec = readAiRenderSpecFromForm();
+    if (event.target?.id === "gemini-asset-mode") {
+      aiRenderSpecFormValues(state.aiRenderSpec);
+      renderAiRenderRows();
+    }
+    updateReferenceChannelControls();
+    scheduleCompiledPromptRefresh();
+  });
+  aiRenderSpecFormValues(state.aiRenderSpec);
+  renderAiRenderRows();
+}
 
 const SEMANTIC_FAMILY_OPTIONS = [
   "character", "weapon", "model", "environment", "nature", "architecture", "prop", "animation",
+];
+const FALLBACK_ASSET_TYPES = [
+  { id: "actor", representation: "directional_sprite_atlas", capabilities: ["animated", "agent"], available_in_composition_render: true },
+  { id: "prop_static", representation: "sprite_atlas", capabilities: [], available_in_composition_render: false },
+  { id: "prop_animated", representation: "sprite_atlas", capabilities: ["animated"], available_in_composition_render: true },
+  { id: "tile", representation: "tile_atlas", capabilities: [], available_in_composition_render: false },
+  { id: "vfx", representation: "frame_sequence", capabilities: ["animated"], available_in_composition_render: false },
 ];
 const SEMANTIC_TAG_OPTIONS = [
   "arma", "weapon", "player", "enemy", "npc", "humanoid", "fantasy", "medieval", "melee", "ranged",
@@ -158,6 +542,7 @@ const PAGE_ROUTES = Object.freeze({
   "catalog-page": "/catalog",
   "composition-page": "/composition",
   "sprite-page": "/sprites",
+  "env-atlas-page": "/env-atlas",
   "gemini-page": "/gemini",
   "postprocess-page": "/postprocess",
 });
@@ -338,8 +723,10 @@ function toast(message, error = false) {
 function closeSettingsMenu() {
   const menu = $("#app-settings-menu");
   const toggle = $("#app-settings-toggle");
+  const backdrop = $("#app-settings-backdrop");
   if (!menu || !toggle) return;
   menu.hidden = true;
+  if (backdrop) backdrop.hidden = true;
   toggle.setAttribute("aria-expanded", "false");
 }
 
@@ -359,6 +746,38 @@ function renderSettingsStatus() {
     status.className = "settings-status missing";
   }
   if (clear) clear.disabled = config.source !== "local";
+  const openaiStatus = $("#openai-api-key-status");
+  const openaiClear = $("#clear-openai-api-key");
+  const openai = state.openaiConfig || {};
+  if (openaiStatus) {
+    if (openai.source === "local") {
+      openaiStatus.textContent = "Chave OpenAI salva localmente e pronta para os jobs GPT Image.";
+      openaiStatus.className = "settings-status configured";
+    } else if (openai.source === "environment") {
+      openaiStatus.textContent = "Chave OpenAI disponível pela variável de ambiente.";
+      openaiStatus.className = "settings-status configured";
+    } else {
+      openaiStatus.textContent = "Nenhuma chave OpenAI configurada. O render GPT Image não poderá iniciar.";
+      openaiStatus.className = "settings-status missing";
+    }
+  }
+  if (openaiClear) openaiClear.disabled = openai.source !== "local";
+  const qwenStatus = $("#qwen-api-key-status");
+  const qwenClear = $("#clear-qwen-api-key");
+  const qwen = state.qwenConfig || {};
+  if (qwenStatus) {
+    if (qwen.source === "local") {
+      qwenStatus.textContent = "Chave Qwen Cloud salva localmente; a validade será verificada no render.";
+      qwenStatus.className = "settings-status configured";
+    } else if (qwen.source === "environment") {
+      qwenStatus.textContent = "Chave Qwen Cloud disponível pela variável de ambiente.";
+      qwenStatus.className = "settings-status configured";
+    } else {
+      qwenStatus.textContent = "Nenhuma chave configurada. Selecione Gemini ou configure a API Qwen Cloud.";
+      qwenStatus.className = "settings-status missing";
+    }
+  }
+  if (qwenClear) qwenClear.disabled = qwen.source !== "local";
   const huggingfaceStatus = $("#huggingface-api-key-status");
   const huggingfaceClear = $("#clear-huggingface-api-key");
   const huggingface = state.huggingfaceConfig || {};
@@ -445,21 +864,122 @@ async function clearSavedGeminiApiKey() {
   }
 }
 
+async function saveOpenAIApiKey() {
+  const input = $("#openai-api-key");
+  const button = $("#save-openai-api-key");
+  const value = input?.value.trim() || "";
+  if (!value) {
+    toast("Cole uma chave da API OpenAI", true);
+    input?.focus();
+    return;
+  }
+  if (button) {
+    button.disabled = true;
+    button.textContent = "Salvando…";
+  }
+  try {
+    const result = await api("/api/config/openai", { method: "POST", body: { api_key: value } });
+    state.openaiConfig = result.config || state.openaiConfig;
+    if (input) input.value = "";
+    renderSettingsStatus();
+    closeSettingsMenu();
+    toast("Chave OpenAI salva localmente");
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = "Salvar chave";
+    }
+  }
+}
+
+async function clearSavedOpenAIApiKey() {
+  const button = $("#clear-openai-api-key");
+  if (!state.openaiConfig || state.openaiConfig.source !== "local") return;
+  if (!window.confirm("Remover a chave OpenAI salva neste computador?")) return;
+  if (button) button.disabled = true;
+  try {
+    const result = await api("/api/config/openai", { method: "POST", body: { api_key: "" } });
+    state.openaiConfig = result.config || { configured: false, source: null };
+    renderSettingsStatus();
+    toast("Chave OpenAI local removida");
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+async function saveQwenApiKey() {
+  const input = $("#qwen-api-key");
+  const button = $("#save-qwen-api-key");
+  const value = input?.value.trim() || "";
+  if (!value) {
+    toast("Cole uma chave da API Qwen Cloud", true);
+    input?.focus();
+    return;
+  }
+  if (button) {
+    button.disabled = true;
+    button.textContent = "Salvando…";
+  }
+  try {
+    const result = await api("/api/config/qwen", { method: "POST", body: { api_key: value } });
+    state.qwenConfig = result.config || state.qwenConfig;
+    if (input) input.value = "";
+    renderSettingsStatus();
+    closeSettingsMenu();
+    toast("Chave Qwen Cloud salva localmente");
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = "Salvar chave";
+    }
+  }
+}
+
+async function clearSavedQwenApiKey() {
+  const button = $("#clear-qwen-api-key");
+  if (!state.qwenConfig || state.qwenConfig.source !== "local") return;
+  if (!window.confirm("Remover a chave Qwen Cloud salva neste computador?")) return;
+  if (button) button.disabled = true;
+  try {
+    const result = await api("/api/config/qwen", { method: "POST", body: { api_key: "" } });
+    state.qwenConfig = result.config || { configured: false, source: null };
+    renderSettingsStatus();
+    toast("Chave Qwen Cloud local removida");
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
 function initializeSettings() {
   const toggle = $("#app-settings-toggle");
   const menu = $("#app-settings-menu");
+  const backdrop = $("#app-settings-backdrop");
   if (!toggle || !menu) return;
   renderSettingsStatus();
   toggle.onclick = (event) => {
     event.stopPropagation();
     menu.hidden = !menu.hidden;
+    if (backdrop) backdrop.hidden = menu.hidden;
     toggle.setAttribute("aria-expanded", String(!menu.hidden));
     if (!menu.hidden) $("#gemini-api-key")?.focus();
   };
   menu.onclick = (event) => event.stopPropagation();
+  if (backdrop) backdrop.onclick = closeSettingsMenu;
   $("#close-app-settings").onclick = closeSettingsMenu;
   $("#save-gemini-api-key").onclick = saveGeminiApiKey;
   $("#clear-gemini-api-key").onclick = clearSavedGeminiApiKey;
+  $("#save-openai-api-key").onclick = saveOpenAIApiKey;
+  $("#clear-openai-api-key").onclick = clearSavedOpenAIApiKey;
+  $("#save-qwen-api-key").onclick = saveQwenApiKey;
+  $("#clear-qwen-api-key").onclick = clearSavedQwenApiKey;
   $("#save-huggingface-api-key").onclick = saveHuggingFaceApiKey;
   $("#clear-huggingface-api-key").onclick = clearSavedHuggingFaceApiKey;
   $("#toggle-gemini-api-key").onclick = () => {
@@ -469,8 +989,20 @@ function initializeSettings() {
     input.type = input.type === "password" ? "text" : "password";
     button.textContent = input.type === "password" ? "Mostrar" : "Ocultar";
   };
+  $("#toggle-openai-api-key").onclick = () => {
+    const input = $("#openai-api-key"); const button = $("#toggle-openai-api-key");
+    if (!input || !button) return;
+    input.type = input.type === "password" ? "text" : "password";
+    button.textContent = input.type === "password" ? "Mostrar" : "Ocultar";
+  };
   $("#toggle-huggingface-api-key").onclick = () => {
     const input = $("#huggingface-api-key"); const button = $("#toggle-huggingface-api-key");
+    if (!input || !button) return;
+    input.type = input.type === "password" ? "text" : "password";
+    button.textContent = input.type === "password" ? "Mostrar" : "Ocultar";
+  };
+  $("#toggle-qwen-api-key").onclick = () => {
+    const input = $("#qwen-api-key"); const button = $("#toggle-qwen-api-key");
     if (!input || !button) return;
     input.type = input.type === "password" ? "text" : "password";
     button.textContent = input.type === "password" ? "Mostrar" : "Ocultar";
@@ -485,9 +1017,9 @@ function initializeSettings() {
 
 async function load() {
   try {
-    const [catalog, animations, relationships, spriteJobs, geminiSources, geminiReferences, geminiJobs, geminiConfig, huggingfaceConfig, postprocessJobs, geminiPrompt] = await Promise.all([
+    const [catalog, animations, relationships, spriteJobs, geminiSources, aiRenderSpecDefaults, geminiReferences, geminiJobs, geminiConfig, openaiConfig, qwenConfig, huggingfaceConfig, postprocessJobs, geminiPrompt] = await Promise.all([
       api("/api/catalog"), api("/api/animations"), api("/api/relationships"), api("/api/sprite-jobs"),
-      api("/api/gemini/sources"), api("/api/gemini/references"), api("/api/gemini-jobs"), api("/api/config/gemini"), api("/api/config/huggingface"), api("/api/postprocess-jobs"), api("/api/config/gemini-prompt"),
+      api("/api/gemini/sources"), api("/api/ai-render-spec/defaults"), api("/api/gemini/references"), api("/api/gemini-jobs"), api("/api/config/gemini"), api("/api/config/openai"), api("/api/config/qwen"), api("/api/config/huggingface"), api("/api/postprocess-jobs"), api("/api/config/gemini-prompt"),
     ]);
     // A listagem principal não pode desaparecer se um servidor antigo ainda
     // não tiver o endpoint opcional de perfis de enquadramento.
@@ -503,24 +1035,35 @@ async function load() {
     } catch (error) {
       console.warn("Pré-configurações de câmera indisponíveis:", error);
     }
+    let assetContract = { asset_types: [], representations: [], capabilities: [] };
+    try {
+      assetContract = await api("/api/asset-contract");
+    } catch (error) {
+      console.warn("Contrato de assets indisponível:", error);
+    }
     state.assets = catalog.assets || [];
     state.animations = animations.animations || [];
     state.relationships = relationships.relationships || [];
     state.spriteJobs = spriteJobs.jobs || [];
     state.geminiSources = geminiSources.sources || [];
+    state.aiRenderSpecDefaults = aiRenderSpecDefaults || null;
     state.geminiReferences = geminiReferences.references || [];
     state.geminiPrompt = geminiPrompt.prompt || null;
     state.geminiJobs = geminiJobs.jobs || [];
     state.geminiConfig = geminiConfig.config || state.geminiConfig;
+    state.openaiConfig = openaiConfig.config || state.openaiConfig;
+    state.qwenConfig = qwenConfig.config || state.qwenConfig;
     state.huggingfaceConfig = huggingfaceConfig.config || state.huggingfaceConfig;
     state.postprocessJobs = postprocessJobs.jobs || [];
     state.renderProfiles = renderProfiles.render_profiles || [];
     state.cameraPresets = cameraPresets.camera_presets || [];
+    state.assetContract = assetContract;
     renderAssets();
     const firstRenderable = state.assets.find(isRenderableAsset);
     if (firstRenderable) selectAsset(firstRenderable.id);
     initializeCompositions();
     initializeSprites();
+    initializeEnvAtlas();
     initializeGemini();
     initializePostprocess();
     initializeSettings();
@@ -581,7 +1124,15 @@ function relationshipLabel(relationship) {
   const components = componentsFromRelationship(relationship)
     .map((component) => assetLabel(component.asset_id))
     .filter(Boolean);
-  return `${character} · ${action}${components.length ? ` + ${components.join(" + ")}` : ""}`;
+  const animationSuffix = action ? ` · ${action}` : " · estática";
+  return `${character}${animationSuffix}${components.length ? ` + ${components.join(" + ")}` : ""}`;
+}
+
+function relationshipSubtitle(relationship) {
+  const values = [assetLabel(relationship.character_asset_id)];
+  const action = animationLabel(relationship.animation_id);
+  values.push(action || "Composição estática");
+  return values.join(" · ");
 }
 
 function positionSemanticPanel() {
@@ -612,6 +1163,7 @@ function switchPage(pageId, { updateHistory = true } = {}) {
     const active = tab.dataset.page === nextPageId;
     tab.classList.toggle("active", active);
     tab.setAttribute("aria-selected", String(active));
+    tab.setAttribute("aria-current", active ? "page" : "false");
   });
   if (nextPageId === "composition-page") {
     renderCompositions();
@@ -629,6 +1181,9 @@ function switchPage(pageId, { updateHistory = true } = {}) {
     renderGeminiSources();
     renderGeminiJobs();
     if (state.selectedGeminiJob) renderGeminiJob(state.selectedGeminiJob);
+  }
+  if (nextPageId === "env-atlas-page") {
+    renderEnvAtlasAssets();
   }
   if (nextPageId === "postprocess-page") {
     populatePostprocessGeminiJobs();
@@ -1070,7 +1625,7 @@ function populateCompositionOptions() {
   );
   const animations = state.animations.filter((animation) => matchesCompositionSource(animation, selectedSources));
   $("#composition-character").innerHTML = `<option value="">Selecione</option>${options(characters, selectedCharacter, (row) => row.annotation?.semantic_name || row.name)}`;
-  $("#composition-animation").innerHTML = `<option value="">Selecione</option>${options(animations, selectedAnimation, (row) => `${row.clip_name || row.action_name} · ${row.category}`)}`;
+  $("#composition-animation").innerHTML = `<option value="">Sem animação (asset estático)</option>${options(animations, selectedAnimation, (row) => `${row.clip_name || row.action_name} · ${row.category}`)}`;
   renderCompositionComponents();
 }
 
@@ -1103,7 +1658,7 @@ function renderCompositions() {
   list.innerHTML = relationships.map((relationship) => `
     <div class="composition-card ${state.editingCompositionId === relationship.id ? "selected" : ""}" data-composition-id="${esc(relationship.id)}">
       <div class="composition-card-head"><b>${esc(relationshipLabel(relationship))}</b><button type="button" data-edit-composition="${esc(relationship.id)}">Editar</button></div>
-      <div class="composition-card-sub">${esc(assetLabel(relationship.character_asset_id))} · ${esc(animationLabel(relationship.animation_id))}</div>
+      <div class="composition-card-sub">${esc(relationshipSubtitle(relationship))}</div>
       ${componentsFromRelationship(relationship).length ? `<div class="composition-card-sub">Componentes: ${esc(componentsFromRelationship(relationship).map((component) => assetLabel(component.asset_id)).join(" · "))}</div>` : ""}
       <div class="badges">${(relationship.tags || []).slice(0, 3).map((tag) => `<span class="badge">${esc(tag)}</span>`).join("")}</div>
       ${relationship.export?.ready ? `<div class="composition-card-export"><a class="button-link" data-export-composition href="${esc(relationship.export.url)}" download="${esc(relationship.export.filename)}">Exportar GLB</a></div>` : ""}
@@ -1190,9 +1745,8 @@ function openCompositionForAnimation(animationId) {
 
 function generateCompositionPreview() {
   const characterId = $("#composition-character")?.value || "";
-  const animationId = $("#composition-animation")?.value || "";
-  if (!characterId || !animationId) {
-    toast("Selecione mesh base e Action para gerar o preview", true);
+  if (!characterId) {
+    toast("Selecione o mesh principal para gerar o preview", true);
     return;
   }
   state.compositionPreviewRequested = true;
@@ -1201,8 +1755,7 @@ function generateCompositionPreview() {
 
 function refreshCompositionPreviewWhenReady() {
   const characterId = $("#composition-character")?.value || "";
-  const animationId = $("#composition-animation")?.value || "";
-  if (!characterId || !animationId) return;
+  if (!characterId) return;
   state.compositionPreviewRequested = true;
   refreshCompositionViewer();
 }
@@ -1495,6 +2048,37 @@ function populateCameraPresets() {
   select.innerHTML = selectOptions(options, selected);
 }
 
+function populateAssetContract() {
+  const typeField = $("#sprite-asset-type");
+  const representationField = $("#sprite-representation");
+  if (!typeField || !representationField) return;
+  const types = state.assetContract.asset_types?.length
+    ? state.assetContract.asset_types
+    : FALLBACK_ASSET_TYPES;
+  const representations = state.assetContract.representations?.length
+    ? state.assetContract.representations
+    : ["directional_sprite_atlas", "sprite_atlas", "tile_atlas", "frame_sequence"];
+  const currentType = typeField.value || "actor";
+  typeField.innerHTML = types.map((item) => `<option value="${esc(item.id)}"${item.available_in_composition_render === false ? " disabled" : ""}>${esc(item.id)}${item.available_in_composition_render === false ? " · worker pendente" : ""}</option>`).join("");
+  typeField.value = types.some((item) => item.id === currentType) ? currentType : (types[0]?.id || "actor");
+  representationField.innerHTML = representations
+    .map((item) => `<option value="${esc(item)}">${esc(item)}</option>`).join("");
+  syncAssetTypeContract();
+}
+
+function syncAssetTypeContract() {
+  const type = $("#sprite-asset-type")?.value || "actor";
+  const types = state.assetContract.asset_types?.length
+    ? state.assetContract.asset_types
+    : FALLBACK_ASSET_TYPES;
+  const defaults = types.find((item) => item.id === type);
+  if (!defaults) return;
+  const representation = $("#sprite-representation");
+  const capabilities = $("#sprite-capabilities");
+  if (representation && defaults.representation) representation.value = defaults.representation;
+  if (capabilities) capabilities.value = (defaults.capabilities || []).join(", ");
+}
+
 function cameraPresetConfig(presetId) {
   return state.cameraPresets.find((item) => item.id === presetId)
     || CAMERA_PRESET_DEFAULTS[presetId]
@@ -1544,6 +2128,29 @@ function syncCameraRenderProfile() {
   }
 }
 
+function replaceJobInCollection(collection, job) {
+  // Polling must not move the active job to the top or recreate the list.
+  const index = collection.findIndex((item) => item.id === job.id);
+  if (index < 0) return [...collection, job];
+  const next = [...collection];
+  next[index] = job;
+  return next;
+}
+
+function patchJobCardStatus(listSelector, attribute, datasetKey, job, label) {
+  const list = $(listSelector);
+  if (!list) return false;
+  const card = [...list.querySelectorAll(`[${attribute}]`)].find(
+    (item) => item.dataset[datasetKey] === String(job.id),
+  );
+  if (!card) return false;
+  const status = card.querySelector(".job-status");
+  if (!status) return false;
+  status.className = `job-status ${String(job.status || "unknown")}`;
+  status.textContent = label;
+  return true;
+}
+
 function renderSpriteJobs() {
   const list = $("#sprite-job-list");
   if (!list) return;
@@ -1551,9 +2158,10 @@ function renderSpriteJobs() {
     const relationship = state.relationships.find((row) => row.id === job.payload?.relationship_id);
     const name = relationship ? relationshipLabel(relationship) : job.payload?.relationship_id || job.id;
     const mode = job.payload?.render_mode === "ai_base" ? "Base IA · 5×9" : (job.payload?.profile || "8×8");
+    const assetType = job.payload?.asset_type || "actor";
     return `<div class="sprite-job-card ${state.selectedSpriteJob?.id === job.id ? "selected" : ""}" data-sprite-job-id="${esc(job.id)}">
       <div class="sprite-job-head"><b>${esc(name)}</b><span class="job-status ${esc(job.status)}">${esc(job.status)}</span></div>
-      <div class="sprite-job-sub">${esc(mode)} · ${esc(job.payload?.resolution || 256)}px · ${esc(job.id)}</div>
+      <div class="sprite-job-sub">${esc(assetType)} · ${esc(mode)} · ${esc(job.payload?.resolution || 256)}px · ${esc(job.id)}</div>
     </div>`;
   }).join("") || `<p class="muted">Nenhuma renderização iniciada.</p>`;
   document.querySelectorAll("[data-sprite-job-id]").forEach((card) => card.addEventListener("click", () => selectSpriteJob(card.dataset.spriteJobId)));
@@ -1602,7 +2210,7 @@ function renderSpriteJob(job) {
         const source = spriteOutputUrl(entry.relative);
         return `<figure class="sprite-gif-card"><button class="sprite-media-trigger" type="button" data-media-open data-media-src="${esc(source)}" data-media-title="GIF · direção ${entry.label}" data-media-alt="GIF da direção ${entry.label}"><span class="sprite-direction-label">${entry.label}</span><img src="${esc(source)}" alt="GIF da direção ${entry.label}"></button></figure>`;
       }).join("") || `<p class="muted">Este job não possui GIFs disponíveis.</p>`}</div></section>
-      <div class="sprite-output-actions"><a class="button-link" href="/api/sprite-jobs/${encodeURIComponent(job.id)}/download" download="sprites_${esc(job.id)}.zip">Download</a></div>`;
+      <div class="sprite-output-actions"><a class="button-link" href="/api/sprite-jobs/${encodeURIComponent(job.id)}/download" download="sprites_${esc(job.id)}.zip">Download</a>${job.outputs.asset_manifest ? `<a class="button-link" href="${esc(spriteOutputUrl(job.outputs.asset_manifest))}" target="_blank" rel="noopener">Manifesto JSON</a>` : ""}</div>`;
     mountSpriteCompositionPreview(job);
     return;
   }
@@ -1633,15 +2241,24 @@ async function pollSpriteJob(id) {
   for (let index = 0; index < 1800; index += 1) {
     await new Promise((resolve) => setTimeout(resolve, 1200));
     const job = await api(`/api/sprite-jobs/${encodeURIComponent(id)}`);
-    state.spriteJobs = [...state.spriteJobs.filter((row) => row.id !== id), job];
-    renderSpriteJobs();
-    renderSpriteJob(job);
+    state.spriteJobs = replaceJobInCollection(state.spriteJobs, job);
+    if (!patchJobCardStatus("#sprite-job-list", "data-sprite-job-id", "spriteJobId", job, job.status)) {
+      renderSpriteJobs();
+    }
+    if (state.selectedSpriteJob?.id === id) renderSpriteJob(job);
     if (job.status === "done" || job.status === "error") {
-      await loadSpriteJobs();
+      const result = await api("/api/sprite-jobs");
+      state.spriteJobs = result.jobs || [];
+      if (!patchJobCardStatus("#sprite-job-list", "data-sprite-job-id", "spriteJobId", job, job.status)) {
+        renderSpriteJobs();
+      }
+      const current = state.spriteJobs.find((row) => row.id === id);
+      if (current && state.selectedSpriteJob?.id === id) renderSpriteJob(current);
       toast(job.status === "done" ? "Sprites renderizados" : "Renderização de sprites falhou", job.status === "error");
-      return;
+      return job;
     }
   }
+  return null;
 }
 
 async function renderSprites() {
@@ -1657,6 +2274,10 @@ async function renderSprites() {
   }
   const payload = {
     relationship_id: relationshipId,
+    asset_type: $("#sprite-asset-type")?.value || "actor",
+    representation: $("#sprite-representation")?.value || "directional_sprite_atlas",
+    capabilities: String($("#sprite-capabilities")?.value || "")
+      .split(",").map((value) => value.trim()).filter(Boolean),
     render_profile_id: renderProfileId,
     render_mode: $("#sprite-output-mode")?.value || "runtime",
     profile: $("#sprite-profile").value,
@@ -1681,17 +2302,19 @@ async function renderSprites() {
 
 function initializeSprites() {
   populateSpriteCompositions();
+  populateAssetContract();
   populateRenderProfiles();
   populateCameraPresets();
   syncCameraRenderProfile();
   syncSpriteOutputMode();
-  ["sprite-render-profile", "sprite-output-mode", "sprite-profile", "sprite-resolution", "sprite-fps", "sprite-elevation", "sprite-azimuth", "sprite-camera-preset", "sprite-scale-mode"].forEach((id) => {
+  ["sprite-render-profile", "sprite-output-mode", "sprite-profile", "sprite-resolution", "sprite-fps", "sprite-elevation", "sprite-azimuth", "sprite-camera-preset", "sprite-scale-mode", "sprite-asset-type", "sprite-representation", "sprite-capabilities"].forEach((id) => {
     const field = $("#" + id);
     if (!field) return;
     $("#" + id).onchange = () => {
       if (id === "sprite-render-profile") syncLockedRenderProfile(true);
       if (id === "sprite-output-mode") syncSpriteOutputMode();
       if (id === "sprite-camera-preset") syncCameraRenderProfile();
+      if (id === "sprite-asset-type") syncAssetTypeContract();
       if (["sprite-render-profile", "sprite-camera-preset"].includes(id)) syncSpriteOutputMode();
       if ((id === "sprite-render-profile" || id === "sprite-camera-preset") && state.selectedSpriteJob?.status === "done") {
         mountSpriteCompositionPreview(state.selectedSpriteJob);
@@ -1793,6 +2416,14 @@ function postprocessOutputUrl(relative) {
   return pipelineOutputUrl("/postprocess-outputs", relative);
 }
 
+function aiRenderDisplayName(job) {
+  return job?.payload?.render_name
+    || job?.payload?.ai_render_name
+    || job?.payload?.reference_name
+    || job?.id
+    || "AI Render";
+}
+
 function renderGeminiSources() {
   const select = $("#gemini-source");
   if (!select) return;
@@ -1825,7 +2456,11 @@ function renderGeminiSourcePreview() {
   trigger.dataset.mediaSrc = spriteOutputUrl(beauty);
   trigger.dataset.mediaTitle = `Render estrutural · ${source.label}`;
   trigger.dataset.mediaAlt = image.alt;
-  if (label) label.textContent = `Beauty enviado ao Google · ${source.label} · clique para ampliar`;
+  if (label) {
+    const inherited = source.inherited || {};
+    const facts = [inherited.action, ...(inherited.components || [])].filter(Boolean);
+    label.textContent = `Preview do render estrutural · ${source.label}${facts.length ? ` · Herdado: ${facts.join(" · ")}` : ""} · clique para ampliar`;
+  }
   preview.hidden = false;
 }
 
@@ -1834,12 +2469,13 @@ function renderGeminiJobs() {
   if (!list) return;
   list.innerHTML = state.geminiJobs.slice().reverse().map((job) => {
     const source = state.geminiSources.find((item) => item.id === job.payload?.source_id);
-    const name = job.payload?.reference_name || "Referência sem nome";
+    const name = job.payload?.render_name || job.payload?.reference_name || job.id;
+    const provider = imageProviderLabel(job.payload?.provider);
     return `<div class="pipeline-job-card ${state.selectedGeminiJob?.id === job.id ? "selected" : ""}" data-gemini-job-id="${esc(job.id)}">
-      <div class="pipeline-job-head"><b>${esc(name)}</b><span class="job-status ${esc(job.status)}">${esc(pipelineStatusLabel(job.status))}</span></div>
+      <div class="pipeline-job-head"><b>${esc(name)} · ${esc(provider)}</b><span class="job-status ${esc(job.status)}">${esc(pipelineStatusLabel(job.status))}</span></div>
       <div class="pipeline-job-sub">${esc(source?.label || job.payload?.source_id || "Fonte estrutural")} · ${esc(job.id)}</div>
     </div>`;
-  }).join("") || `<p class="muted">Nenhum render Gemini iniciado.</p>`;
+  }).join("") || `<p class="muted">Nenhum render iniciado.</p>`;
   list.querySelectorAll("[data-gemini-job-id]").forEach((card) => {
     card.addEventListener("click", () => selectGeminiJob(card.dataset.geminiJobId));
   });
@@ -1850,22 +2486,29 @@ function renderGeminiJob(job) {
   const detail = $("#gemini-detail");
   if (!empty || !detail || !job) return;
   state.selectedGeminiJob = job;
+  const provider = imageProviderLabel(job.payload?.provider);
+  const renderName = job.payload?.render_name || job.payload?.reference_name || job.id;
   if (job.status === "done" && job.outputs?.image) {
     const image = geminiOutputUrl(job.outputs.image);
+    const validationImage = job.outputs?.validation ? geminiOutputUrl(job.outputs.validation) : "";
+    const previewImage = validationImage || image;
     const source = state.geminiSources.find((item) => item.id === job.payload?.source_id);
     empty.hidden = true;
     detail.hidden = false;
     detail.innerHTML = `
-      <div class="pipeline-output-head"><div><h2>Output Gemini</h2><p>${esc(source?.label || job.payload?.source_id || "Fonte estrutural")} · 2048×2048</p></div><span class="job-status done">${esc(pipelineStatusLabel(job.status))}</span></div>
-      <figure class="pipeline-main-preview"><button class="sprite-media-trigger pipeline-zoom-trigger" type="button" data-media-open data-media-src="${esc(image)}" data-media-title="Output Gemini · 2048×2048" data-media-alt="Spritesheet gerado pelo Gemini"><img src="${esc(image)}" alt="Spritesheet gerado pelo Gemini"></button><figcaption>Clique para ampliar · roda do mouse para zoom · arraste para navegar</figcaption></figure>
-      <div class="pipeline-output-actions"><a class="button-link" href="${esc(image)}" download="${esc(job.id)}_gemini_2048.png">Baixar PNG 2048×2048</a><button type="button" class="primary" data-open-postprocess="${esc(job.id)}">Abrir pós-processamento</button></div>
-      <div class="pipeline-metadata"><span>64 frames</span><span>8 direções × 8 fases</span><span>Referência: ${esc(job.payload?.reference_name || "não informada")}</span></div>`;
+      <div class="pipeline-output-head"><div><h2>${esc(renderName)}</h2><p>Output ${esc(provider)} · ${esc(source?.label || job.payload?.source_id || "Fonte estrutural")} · 2048×2048</p></div><span class="job-status done">${esc(pipelineStatusLabel(job.status))}</span></div>
+      <figure class="pipeline-main-preview"><div class="ai-render-grid-preview"><button class="sprite-media-trigger pipeline-zoom-trigger" type="button" data-media-open data-media-src="${esc(previewImage)}" data-media-title="Output ${esc(provider)} · 2048×2048" data-media-alt="Spritesheet gerado pelo ${esc(provider)} com grade de validação"><img src="${esc(previewImage)}" alt="Spritesheet gerado pelo ${esc(provider)} com grade de validação"></button></div><figcaption>${validationImage ? "Grade e alertas persistidos apenas para inspeção do AI Render. O PNG original permanece intacto para o restante da pipeline." : "Output original; a validação visual ainda não está disponível para este job."}</figcaption></figure>
+      <div class="pipeline-output-actions"><a class="button-link" href="${esc(image)}" download="${esc(job.id)}_${esc(job.payload?.provider || "openai")}_original_2048.png">Baixar original 2048×2048</a>${validationImage ? `<a class="button-link" href="${esc(validationImage)}" download="${esc(job.id)}_${esc(job.payload?.provider || "openai")}_validation_2048.png">Baixar validação</a>` : ""}<button type="button" class="button-link" data-duplicate-ai-render>Duplicar configuração</button><button type="button" class="primary" data-open-postprocess="${esc(job.id)}">Abrir pós-processamento</button></div>
+      <div class="pipeline-metadata"><span>Nome: ${esc(job.payload?.render_name || job.payload?.reference_name || job.id)}</span><span>64 frames</span><span>8 direções × 8 fases</span><span>Referência: ${esc(job.payload?.reference_name || "não informada")}</span><span>Validated: ${job.validated ? "true" : "false"}</span></div>`;
+    detail.querySelector("[data-duplicate-ai-render]")?.addEventListener("click", () => duplicateAiRenderJob(job));
     detail.querySelector("[data-open-postprocess]")?.addEventListener("click", () => {
       switchPage("postprocess-page");
       const select = $("#postprocess-gemini-job");
       if (select) {
-        select.value = job.id;
-        renderPostprocessGeminiPreview(job.id);
+        select.querySelectorAll('input[type="checkbox"]').forEach((input) => {
+          input.checked = input.value === job.id;
+        });
+        renderPostprocessGeminiPreview(postprocessSelectedGeminiJobIds());
       }
     });
     return;
@@ -1873,7 +2516,99 @@ function renderGeminiJob(job) {
   empty.hidden = false;
   detail.hidden = true;
   const failed = job.status === "error";
-  empty.innerHTML = `<div class="empty-icon">${failed ? "!" : "◌"}</div><h2>${failed ? "Falha no Gemini Render" : "Gerando spritesheet…"}</h2><p>${failed ? esc(job.error || "Erro desconhecido") : `Status: ${esc(pipelineStatusLabel(job.status))}. O output será validado como PNG 2048×2048.`}</p>${failed ? "" : pipelineProgressMarkup(job)}`;
+  empty.innerHTML = `<div class="empty-icon">${failed ? "!" : "◌"}</div><h2>${failed ? `Falha no ${esc(provider)} Render` : "Gerando spritesheet…"}</h2><p>${failed ? esc(imageProviderErrorMessage(job.error, job.payload?.provider)) : `Status: ${esc(pipelineStatusLabel(job.status))}. O output será validado como PNG 2048×2048.`}</p>${failed ? "" : pipelineProgressMarkup(job)}<button type="button" class="button-link" data-duplicate-ai-render>Duplicar configuração</button>`;
+  empty.querySelector("[data-duplicate-ai-render]")?.addEventListener("click", () => duplicateAiRenderJob(job));
+}
+
+function uniqueAiRenderName(originalName) {
+  const base = String(originalName || "ai_render")
+    .replace(/[^A-Za-z0-9._/-]+/g, "_")
+    .replace(/[\/]+/g, "_")
+    .replace(/^[_\.]+|[_\.]+$/g, "")
+    .slice(0, 145) || "ai_render";
+  const usedNames = new Set(
+    state.geminiJobs.map((job) => String(job.payload?.render_name || "").trim().toLocaleLowerCase()),
+  );
+  let candidate = `${base}_copy`;
+  let suffix = 2;
+  while (usedNames.has(candidate.toLocaleLowerCase())) {
+    candidate = `${base}_copy_${suffix}`;
+    suffix += 1;
+  }
+  return candidate.slice(0, 160);
+}
+
+function duplicateAiRenderJob(job) {
+  const payload = job?.payload || {};
+  state.selectedGeminiJob = null;
+  switchPage("gemini-page");
+
+  const empty = $("#gemini-empty");
+  const detail = $("#gemini-detail");
+  if (empty && detail) {
+    empty.hidden = false;
+    detail.hidden = true;
+  }
+
+  state.aiRenderSpec = cloneValue(payload.render_spec) || aiRenderDefaultSpec();
+  state.aiRenderActiveRow = 0;
+  aiRenderSpecFormValues(state.aiRenderSpec);
+  renderAiRenderRows();
+
+  renderGeminiSources();
+  const source = $("#gemini-source");
+  if (source && payload.source_id && [...source.options].some((option) => option.value === payload.source_id)) {
+    source.value = payload.source_id;
+    renderGeminiSourcePreview();
+  }
+
+  const provider = $("#gemini-provider");
+  if (provider && ["google", "openai", "qwen"].includes(payload.provider)) {
+    provider.value = payload.provider;
+  }
+  updateImageProviderControls();
+  const model = $("#gemini-model");
+  if (model && payload.model) model.value = payload.model;
+  const seed = $("#qwen-seed");
+  if (seed) seed.value = payload.qwen_seed ?? "";
+  const temperature = $("#gemini-temperature");
+  if (temperature) temperature.value = payload.gemini_temperature ?? DEFAULT_GEMINI_TEMPERATURE;
+  const topK = $("#gemini-top-k");
+  if (topK) topK.value = payload.gemini_top_k ?? DEFAULT_GEMINI_TOP_K;
+
+  const legacyChannels = Array.isArray(payload.blender_channels) ? payload.blender_channels : [];
+  const selectedChannels = new Set(Array.isArray(payload.reference_channels) ? payload.reference_channels : legacyChannels);
+  if (!Array.isArray(payload.reference_channels) && (payload.frame_control || job.outputs?.frame_control)) {
+    selectedChannels.add("frame_control");
+  }
+  document.querySelectorAll("#gemini-channel-options input[type=checkbox]").forEach((input) => {
+    input.checked = selectedChannels.has(input.value);
+  });
+  updateReferenceChannelControls();
+
+  const referenceId = payload.reference_id || payload.reference?.cached_id || "";
+  renderGeminiReferences();
+  const referenceSelect = $("#gemini-reference-cache");
+  if (referenceSelect && referenceId && [...referenceSelect.options].some((option) => option.value === referenceId)) {
+    referenceSelect.value = referenceId;
+    referenceSelect.dispatchEvent(new Event("change"));
+  }
+  const referenceFile = $("#gemini-reference");
+  if (referenceFile) referenceFile.value = "";
+
+  const prompt = $("#gemini-prompt");
+  if (prompt) {
+    const savedPrompt = String(payload.additional_instructions ?? payload.prompt ?? "");
+    prompt.value = isLegacyFixedAiPrompt(savedPrompt) ? "" : savedPrompt;
+  }
+  const renderName = $("#gemini-render-name");
+  if (renderName) {
+    renderName.value = uniqueAiRenderName(payload.render_name || job.id);
+    renderName.focus();
+  }
+  scheduleCompiledPromptRefresh();
+  updateAiRenderSummary();
+  toast("Configuração duplicada. Revise a descrição e gere um novo AI Render.");
 }
 
 function selectGeminiJob(id) {
@@ -1887,16 +2622,22 @@ async function pollGeminiJob(id) {
   for (let index = 0; index < 1800; index += 1) {
     await new Promise((resolve) => setTimeout(resolve, 1500));
     const job = await api(`/api/gemini-jobs/${encodeURIComponent(id)}`);
-    state.geminiJobs = [...state.geminiJobs.filter((row) => row.id !== id), job];
-    renderGeminiJobs();
-    renderGeminiJob(job);
+    state.geminiJobs = replaceJobInCollection(state.geminiJobs, job);
+    if (!patchJobCardStatus("#gemini-job-list", "data-gemini-job-id", "geminiJobId", job, pipelineStatusLabel(job.status))) {
+      renderGeminiJobs();
+    }
+    if (state.selectedGeminiJob?.id === id) renderGeminiJob(job);
     if (job.status === "done" || job.status === "error") {
       const result = await api("/api/gemini-jobs");
       state.geminiJobs = result.jobs || [];
-      renderGeminiJobs();
-      renderGeminiJob(state.geminiJobs.find((row) => row.id === id) || job);
+      if (!patchJobCardStatus("#gemini-job-list", "data-gemini-job-id", "geminiJobId", job, pipelineStatusLabel(job.status))) {
+        renderGeminiJobs();
+      }
+      const current = state.geminiJobs.find((row) => row.id === id);
+      if (current && state.selectedGeminiJob?.id === id) renderGeminiJob(current);
       populatePostprocessGeminiJobs();
-      toast(job.status === "done" ? "Output Gemini concluído" : "Render Gemini falhou", job.status === "error");
+      const provider = imageProviderLabel(job.payload?.provider);
+      toast(job.status === "done" ? `Output ${provider} concluído` : `Render ${provider} falhou`, job.status === "error");
       return;
     }
   }
@@ -1912,21 +2653,56 @@ function fileToDataUrl(file) {
 }
 
 async function generateGemini() {
+  const renderName = $("#gemini-render-name")?.value.trim() || "";
   const sourceId = $("#gemini-source")?.value || "";
+  const provider = selectedImageProvider();
+  const referenceChannels = selectedReferenceChannels();
+  const blenderChannels = referenceChannels.filter((channel) => channel !== "frame_control");
   const file = $("#gemini-reference")?.files?.[0];
   let referenceId = $("#gemini-reference-cache")?.value || "";
   const prompt = $("#gemini-prompt")?.value.trim() || "";
-  const model = $("#gemini-model")?.value.trim() || "gemini-3-pro-image";
+  const model = $("#gemini-model")?.value.trim() || IMAGE_PROVIDER_DEFAULT_MODELS[provider];
+  const seedValue = $("#qwen-seed")?.value.trim() || "";
+  const temperatureValue = $("#gemini-temperature")?.value.trim() || String(DEFAULT_GEMINI_TEMPERATURE);
+  const geminiTemperature = Number(temperatureValue);
+  const topKValue = $("#gemini-top-k")?.value.trim() || String(DEFAULT_GEMINI_TOP_K);
+  const geminiTopK = Number(topKValue);
+  const renderSpec = readAiRenderSpecFromForm();
+  if (!renderName) {
+    toast("Informe um nome para o AI Render", true);
+    $("#gemini-render-name")?.focus();
+    return;
+  }
+  if (provider === "google" && (!Number.isFinite(geminiTemperature) || geminiTemperature < 0 || geminiTemperature > 1)) {
+    toast("A temperatura do Gemini deve estar entre 0 e 1 para este modelo", true);
+    $("#gemini-temperature")?.focus();
+    return;
+  }
+  if (provider === "google" && (!Number.isInteger(geminiTopK) || geminiTopK < 1 || geminiTopK > 1000)) {
+    toast("O topK do Gemini deve ser um inteiro entre 1 e 1000", true);
+    $("#gemini-top-k")?.focus();
+    return;
+  }
+  const normalizedRenderName = renderName.toLocaleLowerCase();
+  if (state.geminiJobs.some((job) => (job.payload?.render_name || "").trim().toLocaleLowerCase() === normalizedRenderName)) {
+    toast("Esse nome de AI Render já foi usado", true);
+    $("#gemini-render-name")?.focus();
+    return;
+  }
   if (!sourceId) {
     toast("Selecione um render estrutural", true);
     return;
   }
-  if (!file && !referenceId) {
-    toast("Selecione ou envie uma imagem de referência", true);
+  if (!referenceChannels.length) {
+    toast("Selecione ao menos uma referência estrutural", true);
     return;
   }
-  if (!prompt) {
-    toast("Escreva um prompt para o Gemini", true);
+  if (provider === "qwen" && referenceChannels.length > 2) {
+    toast("No Qwen, selecione no máximo duas referências estruturais", true);
+    return;
+  }
+  if (!file && !referenceId) {
+    toast("Selecione ou envie uma imagem de referência", true);
     return;
   }
   const button = $("#gemini-render");
@@ -1935,7 +2711,7 @@ async function generateGemini() {
     button.textContent = "Enviando…";
   }
   try {
-    if (file && !referenceId) {
+    if (file) {
       const cached = await api("/api/gemini/references", { method: "POST", body: { name: file.name, reference_data: await fileToDataUrl(file) } });
       state.geminiReferences = [cached.reference, ...state.geminiReferences];
       renderGeminiReferences();
@@ -1946,10 +2722,19 @@ async function generateGemini() {
       method: "POST",
       body: {
         source_id: sourceId,
+        render_name: renderName,
+        provider,
+        reference_channels: referenceChannels,
+        blender_channels: blenderChannels,
         prompt,
+        additional_instructions: prompt,
+        render_spec: renderSpec,
         model,
+        qwen_seed: provider === "qwen" && seedValue !== "" ? Number(seedValue) : null,
+        gemini_temperature: provider === "google" ? geminiTemperature : null,
+        gemini_top_k: provider === "google" ? geminiTopK : null,
         reference_id: referenceId || null,
-        reference_name: state.geminiReferences.find((reference) => reference.id === referenceId)?.name || file?.name || "referência",
+        reference_name: state.geminiReferences.find((reference) => reference.id === referenceId)?.name || file?.name || "identity reference",
         reference_data: "",
       },
     });
@@ -1962,7 +2747,7 @@ async function generateGemini() {
   } finally {
     if (button) {
       button.disabled = false;
-      button.textContent = "Gerar com Gemini";
+      button.textContent = "Gerar spritesheet";
     }
   }
 }
@@ -1971,24 +2756,49 @@ function initializeGemini() {
   const source = $("#gemini-source");
   if (!source) return;
   const promptEditor = $("#gemini-prompt");
-  if (promptEditor && !promptEditor.value.trim()) promptEditor.value = state.geminiPrompt || DEFAULT_GEMINI_PROMPT;
+  if (promptEditor && !promptEditor.value.trim()) {
+    const savedPrompt = state.geminiPrompt || "";
+    // Complete legacy contracts can conflict with the canonical compiler.
+    // Keep them in history, but never inject them as supplemental instructions.
+    promptEditor.value = isLegacyFixedAiPrompt(savedPrompt) ? "" : savedPrompt;
+  }
+  initializeAiRenderSpec();
+  updateImageProviderControls();
   renderGeminiSources();
   renderGeminiReferences();
+  updateAiRenderSummary();
   renderGeminiJobs();
-  source.onchange = renderGeminiSources;
+  source.onchange = () => {
+    renderGeminiSources();
+    updateAiRenderSummary();
+    scheduleCompiledPromptRefresh();
+  };
+  $("#gemini-provider").onchange = () => {
+    updateImageProviderControls();
+    scheduleCompiledPromptRefresh();
+  };
+  $("#gemini-channel-options")?.addEventListener("change", () => {
+    updateReferenceChannelControls();
+    scheduleCompiledPromptRefresh();
+  });
   $("#gemini-reference").onchange = () => {
     const file = $("#gemini-reference").files?.[0];
     const preview = $("#gemini-reference-preview");
     const image = $("#gemini-reference-image");
     $("#gemini-reference-name").textContent = file ? `${file.name} · ${(file.size / 1024 / 1024).toFixed(2)} MB` : "Nenhuma imagem selecionada.";
+    if (file) $("#gemini-reference-cache").value = "";
     if (!file || !preview || !image) {
       if (preview) preview.hidden = true;
+      updateAiRenderSummary();
+      scheduleCompiledPromptRefresh();
       return;
     }
     const objectUrl = URL.createObjectURL(file);
     image.onload = () => URL.revokeObjectURL(objectUrl);
     image.src = objectUrl;
     preview.hidden = false;
+    updateAiRenderSummary();
+    scheduleCompiledPromptRefresh();
   };
   $("#gemini-reference-cache").onchange = () => {
     const referenceId = $("#gemini-reference-cache").value;
@@ -1997,13 +2807,19 @@ function initializeGemini() {
     const image = $("#gemini-reference-image");
     if (!reference) {
       if (preview) preview.hidden = true;
+      updateAiRenderSummary();
+      scheduleCompiledPromptRefresh();
       return;
     }
+    const fileInput = $("#gemini-reference");
+    if (fileInput) fileInput.value = "";
     $("#gemini-reference-name").textContent = `${reference.name} · cache local`;
     if (image && preview) {
       image.src = geminiReferenceUrl(reference.id);
       preview.hidden = false;
     }
+    updateAiRenderSummary();
+    scheduleCompiledPromptRefresh();
   };
   $("#gemini-cache-reference").onclick = async () => {
     const file = $("#gemini-reference")?.files?.[0];
@@ -2050,16 +2866,37 @@ function initializeGemini() {
       $("#gemini-render")?.click();
     }
   });
-  $("#gemini-render").onclick = generateGemini;
+  $("#gemini-render-name")?.addEventListener("input", () => {
+    scheduleCompiledPromptRefresh();
+    updateAiRenderSummary();
+  });
+  promptEditor?.addEventListener("input", scheduleCompiledPromptRefresh);
+  $("#ai-render-form").onsubmit = (event) => {
+    event.preventDefault();
+    generateGemini();
+  };
+  scheduleCompiledPromptRefresh();
   const latestJob = state.geminiJobs.slice().reverse()[0];
   if (latestJob) selectGeminiJob(latestJob.id);
 }
 
-function renderPostprocessGeminiPreview(jobId) {
+function postprocessSelectedGeminiJobIds() {
+  const checklist = $("#postprocess-gemini-job");
+  return Array.from(checklist?.querySelectorAll('input[type="checkbox"]:checked') || [])
+    .map((input) => input.value)
+    .filter(Boolean);
+}
+
+function renderPostprocessGeminiPreview(jobIds) {
   const preview = $("#postprocess-gemini-preview");
   const image = $("#postprocess-gemini-image");
   const label = $("#postprocess-gemini-preview-label");
-  const job = state.geminiJobs.find((item) => item.id === jobId && item.status === "done");
+  const ids = Array.isArray(jobIds) ? jobIds : [jobIds];
+  const selectedJobs = ids
+    .filter(Boolean)
+    .map((id) => state.geminiJobs.find((item) => item.id === id && item.status === "done"))
+    .filter(Boolean);
+  const job = selectedJobs[0];
   if (!preview || !image || !label) return;
   if (!job?.outputs?.image) {
     preview.hidden = true;
@@ -2067,25 +2904,29 @@ function renderPostprocessGeminiPreview(jobId) {
     label.textContent = "";
     return;
   }
+  const name = aiRenderDisplayName(job);
   image.src = geminiOutputUrl(job.outputs.image);
-  image.alt = `Output Gemini selecionado · ${job.payload?.reference_name || job.id}`;
-  label.textContent = `${job.payload?.reference_name || job.id} · PNG 2048×2048`;
+  image.alt = `AI Render selecionado · ${name}`;
+  label.textContent = selectedJobs.length > 1
+    ? `${name} + ${selectedJobs.length - 1} spritesheet(s) · PNG 2048×2048`
+    : `${name} · PNG 2048×2048`;
   preview.hidden = false;
 }
 
 function populatePostprocessGeminiJobs() {
-  const select = $("#postprocess-gemini-job");
-  if (!select) return;
-  const selected = select.value;
+  const checklist = $("#postprocess-gemini-job");
+  if (!checklist) return;
+  const selected = new Set(postprocessSelectedGeminiJobIds());
   const jobs = state.geminiJobs.filter((job) => job.status === "done").slice().reverse();
-  select.innerHTML = jobs.length
-    ? `<option value="">Selecione um output</option>${jobs.map((job) => {
-      const source = state.geminiSources.find((item) => item.id === job.payload?.source_id);
-      return `<option value="${esc(job.id)}">${esc(job.payload?.reference_name || job.id)} · ${esc(source?.id || job.payload?.source_id || "fonte")}</option>`;
-    }).join("")}`
-    : `<option value="">Nenhum output concluído</option>`;
-  if (selected && jobs.some((job) => job.id === selected)) select.value = selected;
-  renderPostprocessGeminiPreview(select.value);
+  checklist.innerHTML = jobs.length
+    ? jobs.map((job) => {
+      return `<label class="postprocess-source-option"><input type="checkbox" value="${esc(job.id)}"><span>${esc(aiRenderDisplayName(job))}</span></label>`;
+    }).join("")
+    : `<span class="muted">Nenhum output concluído</span>`;
+  checklist.querySelectorAll('input[type="checkbox"]').forEach((input) => {
+    input.checked = selected.has(input.value);
+  });
+  renderPostprocessGeminiPreview(postprocessSelectedGeminiJobIds());
 }
 
 function renderPostprocessJobs() {
@@ -2093,8 +2934,10 @@ function renderPostprocessJobs() {
   if (!list) return;
   list.innerHTML = state.postprocessJobs.slice().reverse().map((job) => {
     const gemini = state.geminiJobs.find((item) => item.id === job.payload?.gemini_job_id);
+    const provider = imageProviderLabel(gemini?.payload?.provider);
+    const aiRenderName = gemini ? aiRenderDisplayName(gemini) : (job.payload?.ai_render_name || job.payload?.gemini_job_id || `Output ${provider}`);
     return `<div class="pipeline-job-card ${state.selectedPostprocessJob?.id === job.id ? "selected" : ""}" data-postprocess-job-id="${esc(job.id)}">
-      <div class="pipeline-job-head"><b>${esc(gemini?.payload?.reference_name || job.payload?.gemini_job_id || "Output Gemini")}</b><span class="job-status ${esc(job.status)}">${esc(pipelineStatusLabel(job.status))}</span></div>
+      <div class="pipeline-job-head"><b>${esc(aiRenderName)}</b><span class="job-status ${esc(job.status)}">${esc(pipelineStatusLabel(job.status))}</span></div>
       <div class="pipeline-job-sub">${esc(job.payload?.gemini_job_id || job.id)} · ${esc(job.id)}</div>
     </div>`;
   }).join("") || `<p class="muted">Nenhum pós-processamento iniciado.</p>`;
@@ -2108,6 +2951,10 @@ function renderPostprocessJob(job) {
   const detail = $("#postprocess-detail");
   if (!empty || !detail || !job) return;
   state.selectedPostprocessJob = job;
+  const sourceAiRender = state.geminiJobs.find((item) => item.id === job.payload?.gemini_job_id);
+  const sourceAiRenderName = sourceAiRender
+    ? aiRenderDisplayName(sourceAiRender)
+    : (job.payload?.ai_render_name || job.payload?.gemini_job_id || "AI Render");
   if (job.status === "done" && job.outputs?.variants) {
     empty.hidden = true;
     detail.hidden = false;
@@ -2121,10 +2968,10 @@ function renderPostprocessJob(job) {
     const sheet = postprocessOutputUrl(output.spritesheet);
     const gif = postprocessOutputUrl(output.gif);
     detail.innerHTML = `
-      <div class="pipeline-output-head"><div><h2>Output final</h2><p>Spritesheet 512×512 por frame · GIF unificado na ordem 1→2→5→4→3→8→7→6</p></div><span class="job-status done">${esc(pipelineStatusLabel(job.status))}</span></div>
+      <div class="pipeline-output-head"><div><h2>Output final · ${esc(sourceAiRenderName)}</h2><p>Spritesheet 512×512 por frame · GIF unificado na ordem 1→2→5→4→3→8→7→6</p></div><span class="job-status done">${esc(pipelineStatusLabel(job.status))}</span></div>
       <div class="postprocess-variant-selector"><label for="postprocess-variant-select">Variante exibida</label><select id="postprocess-variant-select">${Object.keys(variants).map((name) => `<option value="${esc(name)}"${name === selectedVariant ? " selected" : ""}>${esc(POSTPROCESS_VARIANT_LABELS[name] || name)}</option>`).join("")}</select></div>
       <div class="postprocess-output-preview"><figure class="postprocess-preview-card"><button class="sprite-media-trigger pipeline-variant-preview" type="button" data-media-open data-media-src="${esc(gif)}" data-media-title="${esc(title)} · GIF" data-media-alt="${esc(title)} · GIF animado"><img src="${esc(gif)}" alt="${esc(title)} · GIF animado"></button><figcaption>GIF giratório · clique para ampliar</figcaption></figure><figure class="postprocess-preview-card"><button class="sprite-media-trigger pipeline-variant-preview" type="button" data-media-open data-media-src="${esc(sheet)}" data-media-title="${esc(title)} · spritesheet" data-media-alt="${esc(title)} · spritesheet"><img src="${esc(sheet)}" alt="${esc(title)} · spritesheet"></button><figcaption>Spritesheet · clique para ampliar</figcaption></figure></div>
-      <div class="pipeline-output-actions"><button class="button-link" type="button" data-media-open data-media-src="${esc(gif)}" data-media-title="${esc(title)} · GIF" data-media-alt="${esc(title)} · GIF animado">Visualizar GIF</button><button class="button-link" type="button" data-media-open data-media-src="${esc(sheet)}" data-media-title="${esc(title)} · spritesheet" data-media-alt="${esc(title)} · spritesheet">Visualizar spritesheet</button></div>`;
+      <div class="pipeline-output-actions"><button class="button-link" type="button" data-media-open data-media-src="${esc(gif)}" data-media-title="${esc(title)} · GIF" data-media-alt="${esc(title)} · GIF animado">Visualizar GIF</button><button class="button-link" type="button" data-media-open data-media-src="${esc(sheet)}" data-media-title="${esc(title)} · spritesheet" data-media-alt="${esc(title)} · spritesheet">Visualizar spritesheet</button>${job.outputs.asset_manifest ? `<a class="button-link" href="${esc(postprocessOutputUrl(job.outputs.asset_manifest))}" target="_blank" rel="noopener">Manifesto JSON</a>` : ""}</div>`;
     detail.querySelector("#postprocess-variant-select").onchange = (event) => {
       state.selectedPostprocessVariantByJob[job.id] = event.target.value;
       renderPostprocessJob(job);
@@ -2144,28 +2991,36 @@ function selectPostprocessJob(id) {
   renderPostprocessJobs();
 }
 
-async function pollPostprocessJob(id) {
+async function pollPostprocessJob(id, { announce = true } = {}) {
   for (let index = 0; index < 1800; index += 1) {
     await new Promise((resolve) => setTimeout(resolve, 1500));
     const job = await api(`/api/postprocess-jobs/${encodeURIComponent(id)}`);
-    state.postprocessJobs = [...state.postprocessJobs.filter((row) => row.id !== id), job];
-    renderPostprocessJobs();
-    renderPostprocessJob(job);
+    state.postprocessJobs = replaceJobInCollection(state.postprocessJobs, job);
+    if (!patchJobCardStatus("#postprocess-job-list", "data-postprocess-job-id", "postprocessJobId", job, pipelineStatusLabel(job.status))) {
+      renderPostprocessJobs();
+    }
+    if (state.selectedPostprocessJob?.id === id) renderPostprocessJob(job);
     if (job.status === "done" || job.status === "error") {
       const result = await api("/api/postprocess-jobs");
       state.postprocessJobs = result.jobs || [];
-      renderPostprocessJobs();
-      renderPostprocessJob(state.postprocessJobs.find((row) => row.id === id) || job);
-      toast(job.status === "done" ? "Pós-processamento concluído" : "Pós-processamento falhou", job.status === "error");
-      return;
+      if (!patchJobCardStatus("#postprocess-job-list", "data-postprocess-job-id", "postprocessJobId", job, pipelineStatusLabel(job.status))) {
+        renderPostprocessJobs();
+      }
+      const current = state.postprocessJobs.find((row) => row.id === id);
+      if (current && state.selectedPostprocessJob?.id === id) renderPostprocessJob(current);
+      if (announce) {
+        toast(job.status === "done" ? "Pós-processamento concluído" : "Pós-processamento falhou", job.status === "error");
+      }
+      return job;
     }
   }
+  return null;
 }
 
 async function runPostprocess() {
-  const geminiJobId = $("#postprocess-gemini-job")?.value || "";
-  if (!geminiJobId) {
-    toast("Selecione um output Gemini concluído", true);
+  const selectedIds = postprocessSelectedGeminiJobIds();
+  if (!selectedIds.length) {
+    toast("Selecione pelo menos um Nome IA Render concluído", true);
     return;
   }
   const button = $("#run-postprocess");
@@ -2174,14 +3029,26 @@ async function runPostprocess() {
     button.textContent = "Enviando…";
   }
   try {
-    const job = await api("/api/postprocess", {
+    const response = await api("/api/postprocess", {
       method: "POST",
-      body: { gemini_job_id: geminiJobId, fps: Number($("#postprocess-fps")?.value || 10), model_profile: $("#postprocess-model-profile")?.value || "anime_x4plus_6b" },
+      body: { gemini_job_ids: selectedIds, fps: Number($("#postprocess-fps")?.value || 10), model_profile: $("#postprocess-model-profile")?.value || "anime_x4plus_6b" },
     });
-    state.postprocessJobs = [...state.postprocessJobs, job];
+    const jobs = Array.isArray(response?.jobs) ? response.jobs : [response];
+    state.postprocessJobs = [...state.postprocessJobs, ...jobs];
     renderPostprocessJobs();
-    renderPostprocessJob(job);
-    await pollPostprocessJob(job.id);
+    renderPostprocessJob(jobs[0]);
+    const finishedJobs = await Promise.all(
+      jobs.map((job) => pollPostprocessJob(job.id, { announce: jobs.length === 1 })),
+    );
+    if (jobs.length > 1) {
+      const failed = finishedJobs.filter((job) => job?.status === "error").length;
+      toast(
+        failed
+          ? `Lote concluído com ${failed} falha(s)`
+          : `${jobs.length} spritesheets processadas`,
+        failed > 0,
+      );
+    }
   } catch (error) {
     toast(error.message, true);
   } finally {
@@ -2193,11 +3060,11 @@ async function runPostprocess() {
 }
 
 function initializePostprocess() {
-  const select = $("#postprocess-gemini-job");
-  if (!select) return;
+  const checklist = $("#postprocess-gemini-job");
+  if (!checklist) return;
   populatePostprocessGeminiJobs();
   renderPostprocessJobs();
-  select.onchange = () => renderPostprocessGeminiPreview(select.value);
+  checklist.onchange = () => renderPostprocessGeminiPreview(postprocessSelectedGeminiJobIds());
   $("#run-postprocess").onclick = runPostprocess;
   const latestJob = state.postprocessJobs.slice().reverse()[0];
   if (latestJob) selectPostprocessJob(latestJob.id);
@@ -2284,8 +3151,8 @@ function renderViewport() {
 async function saveComposition() {
   const characterAssetId = $("#composition-character").value;
   const animationId = $("#composition-animation").value;
-  if (!characterAssetId || !animationId) {
-    toast("Selecione mesh base e Action", true);
+  if (!characterAssetId) {
+    toast("Selecione o mesh principal", true);
     return;
   }
   const components = compositionComponentsPayload();
@@ -2304,12 +3171,12 @@ async function saveComposition() {
       currentComposition
       && enteredName !== String(currentComposition.semantic_name || "").trim(),
     );
-    const semanticName = enteredName || `${assetLabel(characterAssetId)} · ${animationLabel(animationId)}`;
+    const semanticName = enteredName || `${assetLabel(characterAssetId)}${animationId ? ` · ${animationLabel(animationId)}` : " · estática"}`;
     const payload = {
       id: saveAsNew ? undefined : state.editingCompositionId || undefined,
       save_as_new: saveAsNew,
       character_asset_id: characterAssetId,
-      animation_id: animationId,
+      animation_id: animationId || null,
       ...legacyIds,
       components,
       semantic_name: semanticName,
@@ -2351,6 +3218,185 @@ async function saveAnnotation() {
   } catch (error) { toast(error.message, true); }
 }
 
+const WORKSPACE_PANE_LIMITS = Object.freeze({
+  left: { min: 300, max: 520, defaultSize: 360 },
+  right: { min: 240, max: 400, defaultSize: 300 },
+});
+
+function clampNumber(value, minimum, maximum) {
+  return Math.min(maximum, Math.max(minimum, value));
+}
+
+function workspacePaneSize(workspace, side) {
+  const variable = getComputedStyle(workspace).getPropertyValue(`--${side}-pane-size`).trim();
+  const parsed = Number.parseFloat(variable);
+  return Number.isFinite(parsed) ? parsed : WORKSPACE_PANE_LIMITS[side].defaultSize;
+}
+
+function setWorkspacePaneSize(workspace, side, size) {
+  const limits = WORKSPACE_PANE_LIMITS[side];
+  const next = clampNumber(size, limits.min, limits.max);
+  workspace.style.setProperty(`--${side}-pane-size`, `${next}px`);
+  const handle = workspace.querySelector(`[data-resize-pane="${side}"]`);
+  if (handle) handle.setAttribute("aria-valuenow", String(Math.round(next)));
+}
+
+function initializePaneResizers() {
+  document.querySelectorAll("[data-resize-pane]").forEach((handle) => {
+    if (handle.dataset.initialized === "true") return;
+    handle.dataset.initialized = "true";
+    const workspace = handle.closest(".workspace, .page-workspace");
+    const side = handle.dataset.resizePane;
+    if (!workspace || !WORKSPACE_PANE_LIMITS[side]) return;
+    const limits = WORKSPACE_PANE_LIMITS[side];
+    handle.setAttribute("aria-valuemin", String(limits.min));
+    handle.setAttribute("aria-valuemax", String(limits.max));
+    handle.setAttribute("aria-valuenow", String(Math.round(workspacePaneSize(workspace, side))));
+    let resizing = false;
+    const updateFromPointer = (event) => {
+      if (!resizing || window.innerWidth < 1440) return;
+      const bounds = workspace.getBoundingClientRect();
+      const size = side === "left" ? event.clientX - bounds.left : bounds.right - event.clientX;
+      setWorkspacePaneSize(workspace, side, size);
+    };
+    handle.addEventListener("pointerdown", (event) => {
+      if (window.innerWidth < 1440) return;
+      event.preventDefault();
+      resizing = true;
+      handle.setPointerCapture?.(event.pointerId);
+      document.body.classList.add("is-resizing-pane");
+    });
+    handle.addEventListener("pointermove", updateFromPointer);
+    const stop = (event) => {
+      if (!resizing) return;
+      resizing = false;
+      handle.releasePointerCapture?.(event.pointerId);
+      document.body.classList.remove("is-resizing-pane");
+    };
+    handle.addEventListener("pointerup", stop);
+    handle.addEventListener("pointercancel", stop);
+    handle.addEventListener("keydown", (event) => {
+      if (window.innerWidth < 1440) return;
+      const direction = event.key === "ArrowRight" ? 1 : event.key === "ArrowLeft" ? -1 : 0;
+      if (!direction) return;
+      event.preventDefault();
+      const adjustment = side === "left" ? direction : -direction;
+      setWorkspacePaneSize(workspace, side, workspacePaneSize(workspace, side) + adjustment * 16);
+    });
+  });
+}
+
+function initializeHistoryToggles() {
+  document.querySelectorAll("[data-history-toggle]").forEach((button) => {
+    if (button.dataset.initialized === "true") return;
+    button.dataset.initialized = "true";
+    const workspace = button.closest(".page-workspace");
+    const panel = document.getElementById(button.getAttribute("aria-controls"));
+    if (!workspace || !panel) return;
+    if (window.innerWidth >= 901 && window.innerWidth < 1440) {
+      panel.classList.add("is-collapsed");
+      workspace.classList.add("history-collapsed");
+      button.setAttribute("aria-expanded", "false");
+      button.textContent = "Mostrar execuções";
+    }
+    button.onclick = () => {
+      const collapsed = !panel.classList.contains("is-collapsed");
+      panel.classList.toggle("is-collapsed", collapsed);
+      panel.classList.toggle("is-open", !collapsed);
+      workspace.classList.toggle("history-collapsed", collapsed);
+      button.setAttribute("aria-expanded", String(!collapsed));
+      button.textContent = collapsed ? "Mostrar execuções" : "Ocultar execuções";
+    };
+  });
+}
+
+function initializeMobileWorkspaceTabs() {
+  document.querySelectorAll(".mobile-workspace-tabs").forEach((tabList) => {
+    if (tabList.dataset.initialized === "true") return;
+    tabList.dataset.initialized = "true";
+    const workspace = tabList.closest(".page-workspace");
+    if (!workspace) return;
+    workspace.dataset.mobileView = "setup";
+    tabList.querySelectorAll("[data-mobile-tab]").forEach((tab) => {
+      tab.onclick = () => {
+        const view = tab.dataset.mobileTab;
+        workspace.dataset.mobileView = view;
+        tabList.querySelectorAll("[data-mobile-tab]").forEach((other) => {
+          const active = other === tab;
+          other.setAttribute("aria-selected", String(active));
+          other.classList.toggle("active", active);
+        });
+      };
+    });
+  });
+}
+
+function setStageScale(stage, scale) {
+  const next = clampNumber(scale, 0.5, 2.5);
+  stage.style.setProperty("--stage-scale", String(next));
+  stage.classList.toggle("stage-scaled", next !== 1);
+  const reset = stage.querySelector('[data-stage-action="reset"]');
+  if (reset) reset.textContent = `${Math.round(next * 100)}%`;
+}
+
+function viewerForStage(stage) {
+  if (stage.classList.contains("viewport-column")) return state.viewer;
+  if (stage.classList.contains("composition-stage")) return state.compositionViewer;
+  if (stage.classList.contains("sprite-stage")) return state.spriteCompositionViewer;
+  return null;
+}
+
+function adjustViewerZoom(viewer, direction) {
+  if (!viewer?.controls) return;
+  if (direction > 0 && typeof viewer.controls.dollyIn === "function") viewer.controls.dollyIn(1.1);
+  if (direction < 0 && typeof viewer.controls.dollyOut === "function") viewer.controls.dollyOut(1.1);
+  viewer.controls.update?.();
+}
+
+function initializeStageToolbars() {
+  document.querySelectorAll(".stage-toolbar").forEach((toolbar) => {
+    if (toolbar.dataset.initialized === "true") return;
+    toolbar.dataset.initialized = "true";
+    const stage = toolbar.closest(".pipeline-stage, .viewport-column, .composition-stage, .sprite-stage");
+    if (!stage) return;
+    setStageScale(stage, 1);
+    toolbar.addEventListener("click", async (event) => {
+      const action = event.target.closest("[data-stage-action]")?.dataset.stageAction;
+      if (!action) return;
+      const viewer = viewerForStage(stage);
+      const scale = Number.parseFloat(getComputedStyle(stage).getPropertyValue("--stage-scale")) || 1;
+      if (action === "zoom-in") {
+        setStageScale(stage, scale + .1);
+        adjustViewerZoom(viewer, 1);
+      }
+      if (action === "zoom-out") {
+        setStageScale(stage, scale - .1);
+        adjustViewerZoom(viewer, -1);
+      }
+      if (action === "reset" || action === "fit") {
+        setStageScale(stage, 1);
+        viewer?.resetCamera?.();
+      }
+      if (action === "background") {
+        const backgrounds = ["default", "checker", "dark", "light"];
+        const current = stage.dataset.stageBackground || "default";
+        stage.dataset.stageBackground = backgrounds[(backgrounds.indexOf(current) + 1) % backgrounds.length];
+      }
+      if (action === "fullscreen") {
+        if (document.fullscreenElement === stage) await document.exitFullscreen?.();
+        else await stage.requestFullscreen?.();
+      }
+    });
+  });
+}
+
+function initializeWorkspaceChrome() {
+  initializePaneResizers();
+  initializeHistoryToggles();
+  initializeMobileWorkspaceTabs();
+  initializeStageToolbars();
+}
+
 $("#query").addEventListener("input", renderAssets);
 $("#kind").addEventListener("change", renderAssets);
 $("#open-bug-popup").onclick = () => {
@@ -2378,6 +3424,8 @@ window.addEventListener("popstate", () => switchPage(pageForRoute(), { updateHis
 $("#sidebar-toggle").addEventListener("click", () => {
   const collapsed = document.body.classList.toggle("sidebar-collapsed");
   $("#sidebar-toggle").setAttribute("aria-expanded", String(!collapsed));
+  $("#sidebar-toggle").setAttribute("aria-label", collapsed ? "Expandir navegação" : "Recolher navegação");
+  $("#sidebar-toggle").title = collapsed ? "Expandir navegação" : "Recolher navegação";
   $("#sidebar-toggle").textContent = collapsed ? "›" : "‹";
 });
 $("#btn-reindex").addEventListener("click", async () => {
@@ -2404,11 +3452,129 @@ window.addEventListener("sprite-lab-component-transform", (event) => {
   if (event.detail?.viewer !== state.compositionViewer) return;
   syncComponentTransformFields(event.detail.id, event.detail.transform);
 });
+
+async function runEnvAtlas() {
+  const blenderPath = $("#env-atlas-blender")?.value || "/usr/bin/blender";
+  const directions = $("#env-atlas-directions")?.value || "8";
+  const profileId = $("#env-atlas-render-profile")?.value || "env_atlas_v1";
+
+  const selectedAssets = ENV_ATLAS_ASSETS.filter((a) => selectedEnvAtlasAssets.has(a.col));
+
+  try {
+    toast("Iniciando renderização do Environment Atlas...");
+    const response = await fetch("/api/env-atlas", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        blender_path: blenderPath,
+        directions: Number(directions),
+        render_profile: profileId,
+        selected_assets: selectedAssets,
+      }),
+    });
+
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.message || "Falha na renderização");
+    }
+
+    const result = await response.json();
+    toast("Environment Atlas renderizado com sucesso!");
+
+    if (result.atlas_path) {
+      const detail = $("#env-atlas-detail");
+      detail.hidden = false;
+      detail.innerHTML = `
+        <div class="sprite-render-result">
+          <img src="${result.atlas_path}" alt="Environment Atlas" style="max-width: 100%; border-radius: 8px;">
+          <p style="margin-top: 12px; color: var(--muted);">Atlas: ${result.cells || 64} células · ${result.size || "2048×2048"}</p>
+        </div>
+      `;
+    }
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+const ENV_ATLAS_ASSETS = [
+  { col: 0, name: "FloorTile_Basic", tile_key: "floor", category: "floor", fbx_path: "/home/ggnp/tools/source-assets/catalog/web-source-cache/6bf218a67329cca12cc32a5d/Ultimate Modular Sci-Fi - Feb 2021/FBX/FloorTile_Basic.fbx" },
+  { col: 1, name: "Wall_1", tile_key: "solid", category: "wall", fbx_path: "/home/ggnp/tools/source-assets/catalog/web-source-cache/6bf218a67329cca12cc32a5d/Ultimate Modular Sci-Fi - Feb 2021/FBX/Walls/Wall_1.fbx" },
+  { col: 2, name: "Door_Single", tile_key: "doorway", category: "door", fbx_path: "/home/ggnp/tools/source-assets/catalog/web-source-cache/6bf218a67329cca12cc32a5d/Ultimate Modular Sci-Fi - Feb 2021/FBX/Door_Single.fbx" },
+  { col: 3, name: "Column_1", tile_key: "pillar", category: "pillar", fbx_path: "/home/ggnp/tools/source-assets/catalog/web-source-cache/6bf218a67329cca12cc32a5d/Ultimate Modular Sci-Fi - Feb 2021/FBX/Column_1.fbx" },
+  { col: 4, name: "Brick", tile_key: "ruin", category: "ruin", fbx_path: "/home/ggnp/tools/source-assets/catalog/web-source-cache/bb5effea805a1a640e591fe4/Ultimate Modular Ruins Pack - Aug 2021/FBX/Brick.fbx" },
+  { col: 5, name: "BridgeSection", tile_key: "bridge", category: "bridge", fbx_path: "/home/ggnp/tools/source-assets/catalog/web-source-cache/bb5effea805a1a640e591fe4/Ultimate Modular Ruins Pack - Aug 2021/FBX/BridgeSection.fbx" },
+  { col: 6, name: "Crate", tile_key: "low_cover", category: "cover", fbx_path: "/home/ggnp/tools/source-assets/catalog/web-source-cache/bb5effea805a1a640e591fe4/Ultimate Modular Ruins Pack - Aug 2021/FBX/Crate.fbx" },
+  { col: 7, name: "FloorTile_Basic2", tile_key: "rough", category: "floor", fbx_path: "/home/ggnp/tools/source-assets/catalog/web-source-cache/6bf218a67329cca12cc32a5d/Ultimate Modular Sci-Fi - Feb 2021/FBX/FloorTile_Basic2.fbx" },
+];
+
+let selectedEnvAtlasAssets = new Set(ENV_ATLAS_ASSETS.map((a) => a.col));
+
+function renderEnvAtlasAssets() {
+  const query = $("#env-atlas-query")?.value.toLowerCase().trim() || "";
+  const list = $("#env-atlas-asset-list");
+  if (!list) return;
+
+  const filtered = ENV_ATLAS_ASSETS.filter((asset) => {
+    if (!query) return true;
+    return asset.name.toLowerCase().includes(query) ||
+           asset.tile_key.toLowerCase().includes(query) ||
+           asset.category.toLowerCase().includes(query);
+  });
+
+  list.innerHTML = filtered.map((asset) => `
+    <label class="asset-item" style="display: flex; align-items: center; gap: 8px; padding: 8px; border: 1px solid var(--line); border-radius: 8px; margin-bottom: 4px; cursor: pointer; ${selectedEnvAtlasAssets.has(asset.col) ? 'background: rgba(138, 167, 255, 0.15); border-color: var(--accent);' : ''}">
+      <input type="checkbox" value="${asset.col}" ${selectedEnvAtlasAssets.has(asset.col) ? 'checked' : ''} style="width: auto;">
+      <div>
+        <div style="font-weight: 600;">${asset.name}</div>
+        <div style="font-size: 11px; color: var(--muted);">${asset.tile_key} · ${asset.category}</div>
+      </div>
+    </label>
+  `).join("");
+
+  list.querySelectorAll("input[type=checkbox]").forEach((checkbox) => {
+    checkbox.addEventListener("change", (e) => {
+      const col = Number(e.target.value);
+      if (e.target.checked) {
+        selectedEnvAtlasAssets.add(col);
+      } else {
+        selectedEnvAtlasAssets.delete(col);
+      }
+      renderEnvAtlasAssets();
+      renderEnvAtlasPreview();
+    });
+  });
+
+  renderEnvAtlasPreview();
+}
+
+function renderEnvAtlasPreview() {
+  const preview = $("#env-atlas-preview");
+  if (!preview) return;
+
+  const orderedAssets = ENV_ATLAS_ASSETS
+    .filter((a) => selectedEnvAtlasAssets.has(a.col))
+    .sort((a, b) => a.col - b.col);
+
+  preview.innerHTML = orderedAssets.map((asset) => `
+    <div class="env-atlas-preview-item" style="background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 6px; text-align: center;">
+      <div style="font-size: 10px; color: var(--accent); font-weight: 700;">Col ${asset.col}</div>
+      <div style="font-size: 11px; font-weight: 600; margin: 2px 0;">${asset.name}</div>
+      <div style="font-size: 9px; color: var(--muted);">${asset.tile_key}</div>
+    </div>
+  `).join("");
+}
+
+function initializeEnvAtlas() {
+  renderEnvAtlasAssets();
+  $("#env-atlas-query")?.addEventListener("input", renderEnvAtlasAssets);
+  $("#run-env-atlas")?.addEventListener("click", runEnvAtlas);
+}
 window.addEventListener("resize", positionSemanticPanel);
 window.setInterval(refreshProgressClocks, 1000);
 const initialPage = pageForRoute();
 if (window.location.pathname !== routeForPage(initialPage)) {
   history.replaceState({}, "", routeForPage(initialPage));
 }
+initializeWorkspaceChrome();
 switchPage(initialPage, { updateHistory: false });
 load();

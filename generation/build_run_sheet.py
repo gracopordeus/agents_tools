@@ -23,9 +23,12 @@ from PIL import Image, ImageDraw
 from path_config import PROJECT_ROOT
 import sprite_manifest as manifest_lib
 
+sys.path.insert(0, str(Path(__file__).resolve().parent / "sprite-lab"))
+from direction_contract import DIRECTION_ROWS, direction_contract_for
+
 ROOT = PROJECT_ROOT
 CELLS = ROOT / "artifacts/run_template_cells"
-ROWS = ["w", "nw", "e", "ne", "n", "sw", "s", "se"]
+ROWS = list(DIRECTION_ROWS)
 CELL = 256               # célula no sheet (base) — aproveita render de alta resolução
 FILL_FRAC = 0.95         # conteúdo ocupa 95% da altura da célula (chão quase na borda)
 SIL = (0.82, 0.82, 0.82)
@@ -254,6 +257,7 @@ def main() -> int:
     bboxes: dict[str, list] = {}
     foot_anchor = [frame_w // 2, round(union_h * common_scale)]
     report = {"source": f"Mixamo run (tag '{tag}' ou padrão)", "rows": directions,
+              "direction_contract": direction_contract_for(directions),
               "columns": n_cols, "cell_size": CELL, "frame_size": [frame_w, frame_h],
               "fit_policy": args.fit,
               "fill_frac": FILL_FRAC if args.fit == "reference_fit" else args.runtime_fill,
@@ -351,6 +355,7 @@ def main() -> int:
             "compositor": "build_run_sheet",
             "compositor_version": manifest_lib.MANIFEST_VERSION,
         },
+        "direction_contract": direction_contract_for(directions),
         "layout": {
             "fit_policy": args.fit,
             "directions": directions,

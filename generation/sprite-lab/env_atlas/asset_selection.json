@@ -1,0 +1,62 @@
+{
+  "schema": "sprite_lab.asset_selection/v1",
+  "render_profile": "env_atlas_v1",
+  "assets": [
+    {
+      "col": 0,
+      "name": "FloorTile_Basic",
+      "tile_key": "floor",
+      "capabilities": ["walkable", "flat"],
+      "fbx_path": "/home/ggnp/tools/source-assets/catalog/web-source-cache/6bf218a67329cca12cc32a5d/Ultimate Modular Sci-Fi - Feb 2021/FBX/FloorTile_Basic.fbx"
+    },
+    {
+      "col": 1,
+      "name": "Wall_1",
+      "tile_key": "solid",
+      "capabilities": ["collision", "decoration"],
+      "fbx_path": "/home/ggnp/tools/source-assets/catalog/web-source-cache/6bf218a67329cca12cc32a5d/Ultimate Modular Sci-Fi - Feb 2021/FBX/Walls/Wall_1.fbx"
+    },
+    {
+      "col": 2,
+      "name": "Door_Single",
+      "tile_key": "doorway",
+      "capabilities": ["walkable", "interactive"],
+      "fbx_path": "/home/ggnp/tools/source-assets/catalog/web-source-cache/6bf218a67329cca12cc32a5d/Ultimate Modular Sci-Fi - Feb 2021/FBX/Door_Single.fbx"
+    },
+    {
+      "col": 3,
+      "name": "Column_1",
+      "tile_key": "pillar",
+      "capabilities": ["collision", "decoration"],
+      "fbx_path": "/home/ggnp/tools/source-assets/catalog/web-source-cache/6bf218a67329cca12cc32a5d/Ultimate Modular Sci-Fi - Feb 2021/FBX/Column_1.fbx"
+    },
+    {
+      "col": 4,
+      "name": "Brick",
+      "tile_key": "ruin",
+      "capabilities": ["collision", "decoration"],
+      "fbx_path": "/home/ggnp/tools/source-assets/catalog/web-source-cache/bb5effea805a1a640e591fe4/Ultimate Modular Ruins Pack - Aug 2021/FBX/Brick.fbx"
+    },
+    {
+      "col": 5,
+      "name": "BridgeSection",
+      "tile_key": "bridge",
+      "capabilities": ["walkable", "structural"],
+      "fbx_path": "/home/ggnp/tools/source-assets/catalog/web-source-cache/bb5effea805a1a640e591fe4/Ultimate Modular Ruins Pack - Aug 2021/FBX/BridgeSection.fbx"
+    },
+    {
+      "col": 6,
+      "name": "Crate",
+      "tile_key": "low_cover",
+      "capabilities": ["collision", "interactive"],
+      "fbx_path": "/home/ggnp/tools/source-assets/catalog/web-source-cache/bb5effea805a1a640e591fe4/Ultimate Modular Ruins Pack - Aug 2021/FBX/Crate.fbx"
+    },
+    {
+      "col": 7,
+      "name": "FloorTile_Basic2",
+      "tile_key": "rough",
+      "capabilities": ["walkable", "flat"],
+      "fbx_path": "/home/ggnp/tools/source-assets/catalog/web-source-cache/6bf218a67329cca12cc32a5d/Ultimate Modular Sci-Fi - Feb 2021/FBX/FloorTile_Basic2.fbx"
+    }
+  ]
+}

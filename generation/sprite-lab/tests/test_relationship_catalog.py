@@ -226,6 +226,51 @@ class RelationshipCatalogTests(unittest.TestCase):
 
             self.assertEqual(indexed["relationships"][0]["components"][0]["attach_to"], "hand_r")
 
+    def test_static_relationship_does_not_require_animation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            assets_path = root / "assets.json"
+            animations_path = root / "animations.json"
+            output_path = root / "relationships.json"
+            annotations_path = root / "semantic_annotations.json"
+            assets_path.write_text(
+                json.dumps(
+                    {
+                        "catalog_root": str(root),
+                        "assets": [
+                            {
+                                "id": "tree",
+                                "name": "Tree",
+                                "category": "environment",
+                                "format": "glb",
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            animations_path.write_text(json.dumps({"animations": []}), encoding="utf-8")
+            output_path.write_text(
+                json.dumps({"relationship_count": 0, "relationships": []}),
+                encoding="utf-8",
+            )
+
+            relationship = catalog.add_relationship(
+                {
+                    "character_asset_id": "tree",
+                    "semantic_name": "Oak tree",
+                },
+                output_path,
+            )
+            self.assertIsNone(relationship["animation_id"])
+
+            indexed = catalog.build_relationship_catalog(
+                assets_path, animations_path, output_path, annotations_path
+            )
+            self.assertEqual(indexed["relationship_count"], 1)
+            self.assertIsNone(indexed["relationships"][0]["animation_id"])
+            self.assertEqual(catalog.validate_relationship_catalog(output_path), [])
+
 
 if __name__ == "__main__":
     unittest.main()

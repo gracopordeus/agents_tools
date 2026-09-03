@@ -9,7 +9,10 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw
 
-DEFAULT_ROWS = ["w", "nw", "e", "ne", "n", "sw", "s", "se"]
+sys.path.insert(0, str(Path(__file__).resolve().parent / "sprite-lab"))
+from direction_contract import DIRECTION_ROWS, direction_contract_for
+
+DEFAULT_ROWS = list(DIRECTION_ROWS)
 CELL = 128
 FILL_FRAC = 0.82
 
@@ -55,6 +58,12 @@ def compose_job(cells: Path, output: Path, fps: int = 10) -> dict:
     render_metadata = json.loads(metadata_path.read_text()) if metadata_path.exists() else {}
     directions = render_metadata.get("directions", DEFAULT_ROWS[:rows])
     directions = directions[:rows]
+    try:
+        direction_contract = direction_contract_for(directions)
+    except ValueError:
+        # Preserve historical catalogs with the old short labels, but make the
+        # missing contract visible instead of silently claiming canonical rows.
+        direction_contract = None
     frames: dict[str, list[Image.Image]] = {}
     boxes: dict[str, list[list[int]]] = {}
     for row, direction in enumerate(directions):
@@ -101,6 +110,7 @@ def compose_job(cells: Path, output: Path, fps: int = 10) -> dict:
         "schema": "mixamo_sheet/v1",
         "source": render_metadata,
         "directions": directions,
+        "direction_contract": direction_contract,
         "rows": rows,
         "columns": columns,
         "cell": [CELL, CELL],

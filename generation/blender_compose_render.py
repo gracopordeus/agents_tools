@@ -23,11 +23,13 @@ import bpy
 from mathutils import Matrix, Vector
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent / "sprite-lab"))
 import blender_render_catalog as brc  # noqa: E402
 import composite_spec as cspec  # noqa: E402
+from direction_contract import DIRECTION_ROWS, DIRECTION_TARGETS, direction_contract_for  # noqa: E402
 
-ROWS = ["w", "nw", "e", "ne", "n", "sw", "s", "se"]
-TARGETS = [(-1, 0), (-1, 1), (1, 0), (1, 1), (0, 1), (-1, -1), (0, -1), (1, -1)]
+ROWS = list(DIRECTION_ROWS)
+TARGETS = [DIRECTION_TARGETS[row] for row in DIRECTION_ROWS]
 ELEV = 35.264
 AZIM = 45.0
 
@@ -238,6 +240,7 @@ def main() -> int:
         "animation_action": anim["action"],
         "direction_rows": ROWS[:n_rows],
         "row_targets": TARGETS[:n_rows],
+        "direction_contract": direction_contract_for(ROWS[:n_rows]),
         "phases": phases,
         "loop_period": cycle,
         "camera": {"elev": args.elev, "azim": args.azim,

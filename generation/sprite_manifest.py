@@ -59,6 +59,17 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
         )
     directions = list(layout["directions"])
     columns = int(layout["columns"])
+    direction_contract = manifest.get("direction_contract")
+    if direction_contract is not None:
+        contract_rows = direction_contract.get("rows") if isinstance(direction_contract, dict) else None
+        if not isinstance(contract_rows, list) or len(contract_rows) != len(directions):
+            raise ValueError("direction_contract não cobre todas as rows")
+        for row_number, item in enumerate(contract_rows, start=1):
+            if not isinstance(item, dict):
+                raise ValueError("direction_contract possui uma row inválida")
+            row_id = item.get("row_id") or item.get("row")
+            if row_id != directions[row_number - 1] or item.get("row") != row_number:
+                raise ValueError("direction_contract não corresponde à posição física das rows")
     seen: set[tuple[str, int]] = set()
     for frame in manifest["frames"]:
         for key in ("direction", "index", "path", "rect", "bbox"):

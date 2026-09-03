@@ -43,12 +43,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parent / "sprite-lab"))
+from direction_contract import DIRECTION_ROWS, direction_contract_for
+
 PIPELINE_VERSION = "0.2.0"
 DEFAULT_DIRECTIONS = 8
 DEFAULT_PHASES = 8
 DEFAULT_CELL = 256
 DEFAULT_FPS = 10
-DEFAULT_ROWS = ("w", "nw", "e", "ne", "n", "sw", "s", "se")
+DEFAULT_ROWS = DIRECTION_ROWS
 
 
 def slugify(value: str) -> str:
@@ -412,6 +415,7 @@ def make_job(path: Path, config: CatalogConfig) -> dict[str, Any]:
         "render": {
             "directions": config.directions,
             "rows": list(config.rows[: config.directions]),
+            "direction_contract": direction_contract_for(config.rows[: config.directions]),
             "phases": config.phases,
             "cell": config.cell,
             "fps": config.fps,
@@ -450,6 +454,7 @@ def build_catalog(config: CatalogConfig) -> dict[str, Any]:
         "render_defaults": {
             "directions": config.directions,
             "rows": list(config.rows[: config.directions]),
+            "direction_contract": direction_contract_for(config.rows[: config.directions]),
             "phases": config.phases,
             "cell": config.cell,
             "fps": config.fps,

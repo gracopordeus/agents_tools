@@ -14,10 +14,14 @@ import semantic_preview
 import composition_schema
 import model_cache
 import render_profile
+import asset_manifest
+from orientation_contract import normalize_orientation
 from direction_contract import (
     DIRECTION_CONTRACT,
     DIRECTION_LABELS,
     DIRECTION_ROWS,
+    DIRECTION_TARGETS,
+    direction_contract_for,
     ROTATION_SEQUENCE,
 )
 
@@ -111,6 +115,51 @@ def _relationship(payload: dict[str, Any]) -> dict[str, Any]:
 
 def _by_id(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     return {str(row.get("id")): row for row in rows if row.get("id")}
+
+
+def _character_orientation(
+    character_id: str,
+    animations: list[dict[str, Any]],
+    override: Any = None,
+) -> dict[str, Any]:
+    """Build a stable orientation manifest from the character's rest pose.
+
+    The active Action is deliberately not used here.  A character can reuse
+    the same mesh with Roll, Dash or Attack clips, whose hip displacement is
+    not a facing vector.  The matching A_TPose entry is recorded as the
+    calibration reference and the authored UAL forward axis is kept explicit.
+    """
+    rest_poses = [
+        item
+        for item in animations
+        if isinstance(item, dict)
+        and str(item.get("asset_id") or "") == character_id
+        and str(item.get("category") or "").casefold() == "tpose"
+    ]
+    rest_pose = next(
+        (
+            item
+            for item in rest_poses
+            if not str(item.get("asset_name") or "").casefold().endswith("_rm")
+        ),
+        rest_poses[0] if rest_poses else None,
+    )
+    automatic = {
+        "source": "rest_pose" if rest_pose else "default",
+        "reference_bone": "root",
+        "local_forward_axis": "-Y",
+        "yaw_offset_degrees": 0.0,
+        "character_asset_id": character_id,
+        "rest_pose_id": rest_pose.get("id") if rest_pose else None,
+        "rest_pose_asset_id": rest_pose.get("asset_id") if rest_pose else None,
+        "rest_pose_action_name": (
+            rest_pose.get("action_name") or rest_pose.get("clip_name")
+            if rest_pose
+            else None
+        ),
+    }
+    incoming = override if isinstance(override, dict) else {}
+    return normalize_orientation({**automatic, **incoming})
 
 
 def _build_sheet(output: Path, rows: int, phases: int, resolution: int) -> Path:
@@ -418,6 +467,12 @@ def generate_sprite_render(
     animation_asset = assets.get(str(animation.get("asset_id")))
     if animation_asset is None:
         raise KeyError("Action aponta para um asset inexistente")
+    orientation = _character_orientation(
+        character_id,
+        animations_catalog.get("animations", []),
+        payload.get("orientation"),
+    )
+    asset_spec = asset_manifest.normalize_asset_spec(payload)
     components = composition_schema.normalize_components(relationship)
     component_requests = []
     for component in components:
@@ -442,10 +497,31 @@ def generate_sprite_render(
     animation_path = model_cache.model_path(str(animation_asset["id"]))
     output = (output_root or SPRITE_WORK / job_id).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
+    animation_metadata = {
+        key: animation.get(key)
+        for key in (
+            "id",
+            "action_name",
+            "clip_name",
+            "category",
+            "frame_start",
+            "frame_end",
+            "frame_count",
+            "fps",
+            "duration_seconds",
+            "loop",
+            "loop_recommended",
+            "loop_name_hint",
+            "root_motion",
+        )
+    }
     request = {
         "character_path": str(character_path),
         "animation_path": str(animation_path),
         "action_name": animation.get("action_name") or animation.get("clip_name"),
+        "animation_metadata": animation_metadata,
+        "orientation": orientation,
+        "asset_spec": asset_spec,
         "components": component_requests,
         "weapon_hand": payload.get("weapon_hand", "right"),
         "weapon_height_ratio": float(payload.get("weapon_height_ratio", 0.8)),
@@ -456,7 +532,9 @@ def generate_sprite_render(
         "phases": phases,
         "render_mode": render_mode,
         "direction_rows": list(AI_DIRECTION_ROWS if render_mode == "ai_base" else DIRECTION_ROWS[:rows]),
-        "direction_contract": DIRECTION_CONTRACT,
+        "direction_contract": direction_contract_for(
+            AI_DIRECTION_ROWS if render_mode == "ai_base" else DIRECTION_ROWS[:rows]
+        ),
         "fps": fps,
         "camera_preset": camera_preset["id"] if camera_preset else None,
         "light_preset": light_preset,
@@ -510,6 +588,27 @@ def generate_sprite_render(
     if not result_path.is_file():
         raise RuntimeError(_worker_error(completed, output))
     worker_report = json.loads(result_path.read_text(encoding="utf-8"))
+    expected_direction_rows = list(
+        AI_DIRECTION_ROWS if render_mode == "ai_base" else DIRECTION_ROWS[:rows]
+    )
+    if worker_report.get("directions") != expected_direction_rows:
+        raise RuntimeError(
+            "Blender retornou rows fora do contrato: "
+            f"esperado {expected_direction_rows}, "
+            f"recebido {worker_report.get('directions')}"
+        )
+    observed_targets = worker_report.get("direction_targets") or []
+    expected_targets = [
+        {"row": row, "target": list(DIRECTION_TARGETS[row])}
+        for row in expected_direction_rows
+    ]
+    normalized_targets = [
+        {"row": item.get("row"), "target": item.get("target")}
+        for item in observed_targets
+        if isinstance(item, dict)
+    ]
+    if normalized_targets != expected_targets:
+        raise RuntimeError("Blender retornou targets de direção fora do contrato")
     worker_cell = worker_report.get("cell")
     if (
         isinstance(worker_cell, list)
@@ -542,6 +641,7 @@ def generate_sprite_render(
         if legacy_gif != gif:
             legacy_gif.write_bytes(gif.read_bytes())
         gif = legacy_gif
+    direction_contract = direction_contract_for(direction_rows)
     report = {
         "schema": SPRITE_SCHEMA,
         "job_id": job_id,
@@ -553,7 +653,13 @@ def generate_sprite_render(
         "resolution": resolution,
         "fps": fps,
         "render_mode": render_mode,
+        "direction_rows": list(direction_rows),
+        "direction_contract": direction_contract,
+        "orientation": worker_report.get("orientation", orientation),
+        "asset_spec": asset_spec,
         "render_profile": locked_profile,
+        "animation_source": worker_report.get("animation_source", animation_metadata),
+        "animation_timing": worker_report.get("animation_timing"),
         "spritesheet_generated": True,
         "worker": worker_report,
         "spritesheet": str(sheet),
@@ -576,6 +682,111 @@ def generate_sprite_render(
         "upscaled_gif_scale": DEFAULT_UPSCALE,
         "upscaled_gif_sequence": upscaled_sequence,
         "metadata": str(output / "render_metadata.json"),
+        "asset_manifest": str(output / "asset_manifest.json"),
     }
+    write_json_atomic(output / "render.json", report)
+    worker_timing = worker_report.get("animation_timing") or {}
+    foot_anchor = (
+        (worker_report.get("effective_render_profile") or {}).get("foot_anchor")
+        or (locked_profile or {}).get("foot_anchor")
+        or [resolution // 2, round(resolution * 0.86)]
+    )
+    runtime_contract = {
+        "schema": "sprite_lab.runtime_asset/v1",
+        "representation": asset_spec["representation"],
+        "atlas": {
+            "texture": "spritesheet.png",
+            "rows": rows,
+            "columns": phases,
+            "cell_size": [resolution, resolution],
+            "phase_order": "columns_0_to_phases_minus_1",
+        },
+        "directions": direction_contract,
+        "animation": {
+            "fps": fps,
+            "loop": worker_timing.get("playback_loop", worker_report.get("playback_loop", False)),
+            "duration_seconds": worker_timing.get("playback_duration_seconds"),
+        },
+        "pivot": {
+            "foot_anchor": list(foot_anchor),
+            "normalized": [
+                float(foot_anchor[0]) / max(resolution, 1),
+                float(foot_anchor[1]) / max(resolution, 1),
+            ],
+        },
+        "background": {"mode": "transparent"},
+    }
+    manifest = asset_manifest.build_manifest(
+        asset_spec,
+        asset_id=character_id,
+        name=str(relationship.get("semantic_name") or character.get("name") or character_id),
+        contract={
+            "direction_contract": direction_contract,
+            "camera": {
+                "type": "orthographic",
+                "preset": (
+                    (worker_report.get("camera") or {}).get("preset")
+                    or camera_preset_id
+                    or "isometric"
+                ),
+                "shadow": False,
+            },
+            "action": animation.get("action_name") or animation.get("clip_name") or animation_id,
+            "background": "transparent",
+        },
+        source={
+            "relationship_id": relationship["id"],
+            "character_asset_id": character_id,
+            "animation_id": animation_id,
+            "animation": animation_metadata,
+            "orientation": worker_report.get("orientation", orientation),
+            "raw_render_metadata": "render_metadata.json",
+        },
+        generation={
+            "renderer": "blender",
+            "worker": BLENDER_WORKER.name,
+            "render_mode": render_mode,
+            "render_profile_id": locked_profile_id or None,
+            "request": "request.json",
+        },
+        layout={
+            "rows": rows,
+            "columns": phases,
+            "cell_size": [resolution, resolution],
+            "size": [phases * resolution, rows * resolution],
+        },
+        animation={
+            "source": worker_report.get("animation_source", animation_metadata),
+            "timing": worker_timing,
+            "output_fps": fps,
+        },
+        placement={
+            "pivot": runtime_contract["pivot"],
+            "orientation": worker_report.get("orientation", orientation),
+            "root_motion_removed": (worker_report.get("root_motion_removed") if isinstance(worker_report, dict) else None),
+        },
+        gameplay={"capabilities": asset_spec["capabilities"]},
+        runtime=runtime_contract,
+        artifacts=asset_manifest.collect_artifacts(
+            output,
+            [
+                ("spritesheet", sheet),
+                ("animation", gif),
+                *[(f"direction_{direction}", path) for direction, path in direction_gifs.items()],
+                *[(f"ai_base_{direction}", path) for direction, path in ai_base_pages.items()],
+                ("animation_upscaled", upscaled_gif),
+                ("request", request_path),
+                ("render_report", output / "render.json"),
+                ("render_metadata", output / "render_metadata.json"),
+            ],
+        ),
+        validation={
+            "status": "rendered",
+            "expected_cells": rows * phases,
+            "actual_cells": len(worker_report.get("cells") or []),
+        },
+        provenance={"pipeline": SPRITE_SCHEMA},
+    )
+    asset_manifest.write_manifest(output / "asset_manifest.json", manifest)
     write_json_atomic(output / "render.json", report)
     return report

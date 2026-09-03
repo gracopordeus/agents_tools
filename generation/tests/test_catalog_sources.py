@@ -145,3 +145,44 @@ class CatalogSourcesTests(unittest.TestCase):
             catalog, report = build_catalog(registry_path)
             self.assertEqual(report["summary"]["assets"], 1)
             self.assertEqual(catalog["assets"][0]["source_id"], "incoming__new_pack")
+
+    def test_auto_discover_exclude_and_exact_content_deduplication(self) -> None:
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary) / "assets"
+            sources = root / "sources"
+            sources.mkdir(parents=True)
+            (sources / "one.fbx").write_bytes(b"same-content")
+            (sources / "two.fbx").write_bytes(b"same-content")
+            (root / "Ignored Pack").mkdir()
+            (root / "Ignored Pack" / "ignored.fbx").write_bytes(b"ignored")
+            registry_path = root / "catalog" / "sources.json"
+            write_json_atomic(
+                registry_path,
+                {
+                    "schema": "sprite_lab.source_registry/v1",
+                    "catalog_root": str(root),
+                    "auto_discover": True,
+                    "auto_discover_exclude": ["Ignored Pack"],
+                    "deduplicate_exact_content": True,
+                    "sources": [
+                        {
+                            "id": "test_sources",
+                            "name": "Test sources",
+                            "kind": "fixture",
+                            "license": "test-license",
+                            "root": "sources",
+                            "category_by_extension": {"fbx": "model"},
+                        }
+                    ],
+                },
+            )
+
+            catalog, report = build_catalog(registry_path)
+
+            self.assertEqual(report["summary"]["assets_before_deduplication"], 2)
+            self.assertEqual(report["summary"]["deduplicated_exact_content"], 1)
+            self.assertEqual(catalog["asset_count"], 1)
+            self.assertEqual(len(catalog["assets"][0]["aliases"]), 1)
+            self.assertNotIn("ignored", json.dumps(catalog))

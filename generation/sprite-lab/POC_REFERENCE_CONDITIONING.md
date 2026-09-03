@@ -6,7 +6,7 @@ personagem, a renderização 3D do frame e canais auxiliares; o resultado é
 normalizado e organizado em spritesheet e GIF para inspeção.
 
 O contrato foi desenhado para modelos Transformer de imagem. Ele não presume
-ControlNet, difusão ou uma API específica. OpenAI e Google são adaptadores
+ControlNet, difusão ou uma API específica. OpenAI, Google e Qwen Cloud são adaptadores
 intercambiáveis; o provider `dry-run` permite validar todos os arquivos e
 prompts sem chamar um serviço remoto.
 
@@ -17,7 +17,7 @@ prompts sem chamar um serviço remoto.
 | Exportação 3D | `blender_conditioning_export.py` | beauty, silhouette, segmentation, skeleton e depth opcional |
 | Pacote de referência | `conditioning_pack.py` | cópia normalizada, manifesto, prompt e montagem de inspeção |
 | Contrato | `conditioning_schema.py` | validação de caminhos, frames, canais, resolução e âncora |
-| Geração | `conditioning_runner.py` | uma requisição por frame para OpenAI, Google ou dry-run |
+| Geração | `conditioning_runner.py` | uma requisição por frame para OpenAI, Google, Qwen Cloud ou dry-run |
 | Pós-processamento | `postprocess_conditioning.py` | remoção de fundo, escala, âncora, spritesheet e GIF |
 | Métricas | `conditioning_metrics.py` | presença, bounding box, âncora, área, IoU diagnóstico e temporalidade |
 
@@ -171,6 +171,34 @@ python3 /home/ggnp/tools/generation/sprite-lab/conditioning_runner.py \
   --condition segmentation
 ```
 
+Para o adaptador Qwen Cloud, configure o Token/API em `DASHSCOPE_API_KEY` e escolha
+`qwen-image-3.0-pro` (padrão, maior qualidade) ou `qwen-image-3.0` (mais
+rápido):
+
+```bash
+export DASHSCOPE_API_KEY="..."
+python3 -m pip install -r /home/ggnp/tools/generation/sprite-lab/requirements-qwen.txt
+python3 /home/ggnp/tools/generation/sprite-lab/conditioning_runner.py \
+  /abs/path/work/generation-packs/run-r1/manifest.json \
+  /abs/path/work/generation-runs/run-r1/qwen \
+  --provider qwen \
+  --model qwen-image-3.0-pro \
+  --condition segmentation
+```
+
+Na tela **AI Sprite Render**, a mesma chave pode ser salva no menu de
+configurações. O provider envia as imagens em Base64 e baixa imediatamente a
+URL temporária retornada pela API para o output local. A tela permite escolher
+quais referências Blender (`beauty`, `bones` e `lineart`) serão enviadas. A
+referência de identidade é enviada separadamente; no Qwen, podem ser escolhidas
+até duas referências Blender para respeitar o limite de três imagens por
+chamada.
+
+Tokens do Token Plan com prefixo `sk-sp-` usam automaticamente o endpoint
+`https://token-plan.ap-southeast-1.maas.aliyuncs.com/api/v1`. Para outras
+modalidades, sobrescreva com `QWEN_API_BASE_URL` ou
+`DASHSCOPE_HTTP_BASE_URL`.
+
 As chaves não são gravadas no manifesto. O runner salva somente o request
 local, o status e o caminho do resultado. O resultado esperado pelo runner é
 um PNG local por frame, com nomes iguais aos IDs do manifesto (`f00.png`,
@@ -182,6 +210,7 @@ usar no provider real:
 ```bash
 python3 -m pip install openai
 python3 -m pip install google-genai
+python3 -m pip install -r /home/ggnp/tools/generation/sprite-lab/requirements-qwen.txt
 ```
 
 ## 5. Normalizar e gerar spritesheet/GIF

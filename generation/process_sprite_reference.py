@@ -8,9 +8,11 @@ escondem duas linhas são divididas no vale de conteúdo) e colunas por linha
 via gutters. Cada frame é recortado pela bbox do conteúdo e alinhado
 bottom-center num canvas comum.
 
-Direções por linha (padrão, ordem do usuário):
-    A, WA, D, WD, W, SA, S, SD  ->  w, nw, e, ne, n, sw, s, se
-Use --mapping para outra ordem (ex.: "w,nw,e,ne,n,sw,s,se").
+Direções por linha (padrão do contrato Blender):
+    R1 North, R2 North-East, R3 East, R4 South-East,
+    R5 South, R6 South-West, R7 West, R8 North-West
+Use --mapping somente quando a imagem externa tiver outra ordem
+(ex.: "r1,r2,r3,r4,r5,r6,r7,r8").
 
 Uso:
     process_sprite_reference.py IN.png --out OUT_DIR --name nome [--white-bg]
@@ -26,7 +28,10 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-DEFAULT_MAPPING = ["w", "nw", "e", "ne", "n", "sw", "s", "se"]
+sys.path.insert(0, str(Path(__file__).resolve().parent / "sprite-lab"))
+from direction_contract import DIRECTION_ROWS, direction_contract_for
+
+DEFAULT_MAPPING = list(DIRECTION_ROWS)
 WHITE_HI, WHITE_LO = 250.0, 235.0
 SEP_THRESH_FRAC = 0.01
 FPS = 10
@@ -170,7 +175,17 @@ def main(argv: list[str] | None = None) -> int:
         print(f"detectadas {len(rows)} linhas (esperado {len(mapping)}): {rows}", file=sys.stderr)
         return 1
 
-    report: dict = {"source": str(args.input), "size": [w, h], "rows": {}, "cells": {}}
+    try:
+        direction_contract = direction_contract_for(mapping)
+    except ValueError:
+        direction_contract = None
+    report: dict = {
+        "source": str(args.input),
+        "size": [w, h],
+        "rows": {},
+        "cells": {},
+        "direction_contract": direction_contract,
+    }
     frames_by_dir: dict[str, list[Image.Image]] = {}
     all_sizes = []
 

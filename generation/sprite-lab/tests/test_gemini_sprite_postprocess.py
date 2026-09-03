@@ -14,6 +14,28 @@ import gemini_sprite_postprocess as subject  # noqa: E402
 
 
 class GeminiSpritePostprocessTests(unittest.TestCase):
+    def test_resumes_masks_when_chroma_cleanup_failed_after_birefnet(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            mask_pass = root / "mask-pass"
+            mask_pass.mkdir()
+            birefnet = mask_pass / "birefnet_masks"
+            birefnet.mkdir()
+            for row in range(1):
+                for column in range(2):
+                    Image.new("L", (8, 8), 255).save(birefnet / f"row{row}_col{column}.png")
+                    Image.new("RGBA", (8, 8), (60, 45, 30, 0)).save(
+                        mask_pass / f"row{row}_col{column}.png"
+                    )
+
+            with patch.object(subject, "MASK_CACHE_ROOT", root / "mask-cache"):
+                report = subject._load_cached_mask_pass(mask_pass, "cache-key", 1, 2)
+
+            self.assertIsNotNone(report)
+            assert report is not None
+            self.assertEqual(report["source_masks"], "birefnet_masks")
+            self.assertEqual(len(list((mask_pass / "foreground_cleanup_masks").glob("*.png"))), 2)
+
     def test_process_uses_birefnet_mask_pass_before_quality_pass(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -62,6 +84,10 @@ class GeminiSpritePostprocessTests(unittest.TestCase):
 
             self.assertIn("realesrgan_birefnet_pipeline.py", commands[0][1])
             self.assertIn("--birefnet-threshold", commands[0])
+            self.assertEqual(
+                commands[0][commands[0].index("--chroma-cleanup") + 1],
+                "auto",
+            )
             self.assertEqual(
                 commands[0][commands[0].index("--model-profile") + 1],
                 "anime_x4plus_6b",
