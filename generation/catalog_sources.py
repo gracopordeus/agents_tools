@@ -30,7 +30,7 @@ import subprocess
 import time
 import unicodedata
 import zipfile
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Iterator
@@ -495,9 +495,18 @@ def _auto_discovered_sources(
     used_ids = {str(source.get("id", "")) for source in sources}
     discovered: list[dict[str, Any]] = []
     excluded_names = IGNORED_DIRECTORIES | {"catalog"}
+    configured_excludes = {
+        str(value)
+        for value in _as_list(registry.get("auto_discover_exclude"))
+        if str(value)
+    }
 
     for candidate in sorted(root.iterdir(), key=lambda item: item.name.casefold()):
-        if candidate.name in excluded_names or candidate.name.startswith("."):
+        if (
+            candidate.name in excluded_names
+            or candidate.name in configured_excludes
+            or candidate.name.startswith(".")
+        ):
             continue
         if _is_declared_candidate(candidate, declared):
             continue
@@ -531,6 +540,75 @@ def _auto_discovered_sources(
         source["archive" if candidate.is_file() and candidate.suffix.lower() == ".zip" else "root"] = relative
         discovered.append(source)
     return discovered
+
+
+def _canonical_record_key(record: dict[str, Any]) -> tuple[int, int, int, str, str]:
+    """Choose a stable representative when records have identical content."""
+    source_id = str(record.get("source_id") or "")
+    record_format = str(record.get("format") or "").casefold()
+    category = str(record.get("category") or "").casefold()
+    format_priority = {
+        "glb": 0,
+        "gltf": 1,
+        "fbx": 2,
+        "blend": 3,
+        "obj": 4,
+        "dae": 5,
+    }
+    category_priority = {
+        "weapon": 0,
+        "character": 1,
+        "environment": 2,
+        "model": 3,
+        "animation_reference": 4,
+        "animation": 5,
+        "texture": 6,
+    }
+    return (
+        1 if source_id.startswith("incoming__") else 0,
+        format_priority.get(record_format, 99),
+        category_priority.get(category, 99),
+        source_id.casefold(),
+        str(record.get("relative_path") or "").casefold(),
+    )
+
+
+def _deduplicate_exact_records(
+    records: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    """Collapse byte-identical records while retaining provenance aliases."""
+    by_hash: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    unique_without_hash: list[dict[str, Any]] = []
+    for record in records:
+        digest = str(record.get("sha256") or "")
+        if digest:
+            by_hash[digest].append(record)
+        else:
+            unique_without_hash.append(record)
+
+    deduplicated = 0
+    canonical: list[dict[str, Any]] = []
+    for group in by_hash.values():
+        representative = min(group, key=_canonical_record_key)
+        aliases = [
+            {
+                "id": item.get("id"),
+                "category": item.get("category"),
+                "format": item.get("format"),
+                "source_id": item.get("source_id"),
+                "source": item.get("source"),
+                "relative_path": item.get("relative_path"),
+            }
+            for item in sorted(group, key=lambda item: str(item.get("id") or ""))
+            if item is not representative
+        ]
+        if aliases:
+            representative = dict(representative)
+            representative["aliases"] = aliases
+            deduplicated += len(aliases)
+        canonical.append(representative)
+    canonical.extend(unique_without_hash)
+    return canonical, deduplicated
 
 
 def load_registry(path: Path) -> tuple[dict[str, Any], Path]:
@@ -573,6 +651,11 @@ def build_catalog(
             all_records.append(record)
         summaries.append(summary)
 
+    asset_records_before_dedup = len(all_records)
+    deduplicated_exact_content = 0
+    if registry.get("deduplicate_exact_content", False):
+        all_records, deduplicated_exact_content = _deduplicate_exact_records(all_records)
+
     seen: set[str] = set()
     for record in all_records:
         original = record["id"]
@@ -610,6 +693,8 @@ def build_catalog(
         "summary": {
             "sources": len(summaries),
             "assets": len(all_records),
+            "assets_before_deduplication": asset_records_before_dedup,
+            "deduplicated_exact_content": deduplicated_exact_content,
             "missing_sources": sum(bool(item["missing"]) for item in summaries),
             "duplicate_ids": sum(count - 1 for count in duplicate_ids.values() if count > 1),
         },

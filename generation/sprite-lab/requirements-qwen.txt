@@ -1,0 +1,2 @@
+# QwenCloud provider for Sprite Lab (API mode)
+dashscope>=1.25.15

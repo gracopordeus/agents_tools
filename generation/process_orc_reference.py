@@ -8,8 +8,9 @@ de conteúdo, e acha as 8 colunas por linha via gutters. Cada frame é recortado
 pela bbox do conteúdo, alinhado bottom-center (baseline nos pés) num canvas
 comum.
 
-Direções por linha (ordem do usuário):
-    A, WA, D, WD, W, SA, S, SD  ->  w, nw, e, ne, n, sw, s, se
+Direções por linha (contrato Blender):
+    R1 North, R2 North-East, R3 East, R4 South-East,
+    R5 South, R6 South-West, R7 West, R8 North-West
 
 Saídas (tudo determinístico, sem redimensionar a arte):
     artifacts/orc_reference_preview/orc_walk_<dir>.gif   (8 GIFs, loop infinito)
@@ -26,9 +27,12 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
+sys.path.insert(0, str(Path(__file__).resolve().parent / "sprite-lab"))
+from direction_contract import DIRECTION_ROWS, direction_contract_for
+
 REF = Path("/home/ggnp/simple-arpg/references/orc_reference.jpeg")
 OUT = Path("/home/ggnp/simple-arpg/artifacts/orc_reference_preview")
-ROWS_TO_DIR = ["w", "nw", "e", "ne", "n", "sw", "s", "se"]
+ROWS_TO_DIR = list(DIRECTION_ROWS)
 
 WHITE_HI, WHITE_LO = 250.0, 235.0
 SEP_THRESH_FRAC = 0.01
@@ -154,7 +158,13 @@ def main() -> int:
         print(f"detectadas {len(rows)} linhas (esperado 8): {rows}", file=sys.stderr)
         return 1
 
-    report: dict = {"source": str(REF), "size": [w, h], "rows": {}, "cells": {}}
+    report: dict = {
+        "source": str(REF),
+        "size": [w, h],
+        "rows": {},
+        "cells": {},
+        "direction_contract": direction_contract_for(ROWS_TO_DIR),
+    }
     frames_by_dir: dict[str, list[Image.Image]] = {}
     all_sizes = []
 

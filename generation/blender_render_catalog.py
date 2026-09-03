@@ -23,11 +23,15 @@ from pathlib import Path
 import bpy
 from mathutils import Matrix, Vector
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+GENERATION_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(GENERATION_ROOT))
+sys.path.insert(0, str(GENERATION_ROOT / "sprite-lab"))
 from blender_mixamo_props import _attach, _find_bone, add_placeholder_props
+from direction_contract import DIRECTION_ROWS, DIRECTION_TARGETS, direction_contract_for
+from blender_semantic_preview import rest_pose_forward
 
-ROWS = ["w", "nw", "e", "ne", "n", "sw", "s", "se"]
-TARGETS = [(-1, 0), (-1, 1), (1, 0), (1, 1), (0, 1), (-1, -1), (0, -1), (1, -1)]
+ROWS = list(DIRECTION_ROWS)
+TARGETS = [DIRECTION_TARGETS[row] for row in DIRECTION_ROWS]
 DEFAULT_ELEV = 35.264
 DEFAULT_AZIM = 45.0
 
@@ -60,6 +64,18 @@ def parse_args() -> argparse.Namespace:
                         help="cant (rotação ao redor do eixo da lâmina) da arma externa, em graus")
     parser.add_argument("--weapon-grip", type=float, default=0.13,
                         help="distância (mundo) do cabo em direção à palma da mão (0 = no pulso)")
+    parser.add_argument(
+        "--forward-axis",
+        choices=("+X", "-X", "+Y", "-Y"),
+        default="-Y",
+        help="eixo frontal local do personagem na rest pose",
+    )
+    parser.add_argument(
+        "--yaw-offset",
+        type=float,
+        default=0.0,
+        help="correção horizontal da orientação da rest pose, em graus",
+    )
     return parser.parse_args(argv)
 
 
@@ -464,16 +480,14 @@ def main() -> int:
     extent = max(maxs.x - mins.x, maxs.y - mins.y)
     camera = make_camera(scene, math.radians(args.elev), math.radians(args.azim), height, extent)
 
-    scene.frame_set(start)
-    arm.location = (0.0, 0.0, 0.0)
-    first_hips, _ = evaluated_hips(arm, scene)
-    scene.frame_set(end)
-    last_hips, _ = evaluated_hips(arm, scene)
-    forward = Vector((last_hips.x - first_hips.x, last_hips.y - first_hips.y, 0.0))
-    if forward.length < 1e-4:
-        forward = Vector((0.0, -1.0, 0.0))
-    else:
-        forward.normalize()
+    forward, orientation_metadata = rest_pose_forward(
+        arm,
+        {
+            "source": "explicit",
+            "local_forward_axis": args.forward_axis,
+            "yaw_offset_degrees": args.yaw_offset,
+        },
+    )
     ground = mins.z
 
     row_names = ROWS[:args.rows]
@@ -513,9 +527,11 @@ def main() -> int:
         "source_fps": source_fps,
         "output_fps": args.fps,
         "directions": row_names,
+        "direction_contract": direction_contract_for(row_names),
         "phases": args.phases,
         "cell": [args.cell, args.cell],
         "camera": {"type": "ORTHO", "elevation": args.elev, "azimuth": args.azim},
+        "orientation": orientation_metadata,
         "root_motion_removed": True,
         "transparent_background": True,
         "bounds": {"min": list(mins), "max": list(maxs)},

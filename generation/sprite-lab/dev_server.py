@@ -10,6 +10,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent
+VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
 WATCHED_SUFFIXES = {".css", ".html", ".js", ".py"}
 
 
@@ -24,8 +25,9 @@ def source_snapshot() -> dict[str, int]:
 
 
 def start_server(host: str, port: int) -> subprocess.Popen[bytes]:
+    interpreter = str(VENV_PYTHON) if VENV_PYTHON.is_file() else sys.executable
     return subprocess.Popen(
-        [sys.executable, str(ROOT / "server.py"), "--host", host, "--port", str(port)],
+        [interpreter, str(ROOT / "server.py"), "--host", host, "--port", str(port)],
     )
 
 

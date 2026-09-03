@@ -16,13 +16,15 @@ sys.path.insert(0, str(SPRITE_LAB))
 sys.path.insert(0, str(GENERATION))
 
 import blender_render_catalog as brc  # noqa: E402
+import asset_manifest  # noqa: E402
 import render_profile  # noqa: E402
 from direction_contract import (  # noqa: E402
-    DIRECTION_CONTRACT,
     DIRECTION_ROWS,
     DIRECTION_TARGETS,
+    direction_contract_for,
     ordered_subset,
 )
+from orientation_contract import normalize_orientation  # noqa: E402
 from blender_semantic_preview import (  # noqa: E402
     action_range,
     apply_animation,
@@ -31,6 +33,7 @@ from blender_semantic_preview import (  # noqa: E402
     find_armature,
     import_asset,
     root_motion_lock_metadata,
+    rest_pose_forward,
     update_two_hand_components,
 )
 from blender_conditioning_export import (  # noqa: E402
@@ -384,7 +387,14 @@ def configure_sprite_lighting(
         intensity = float(request.get("light_intensity", 3.0))
     except (TypeError, ValueError) as exc:
         raise RuntimeError("configuração de luz inválida") from exc
-    origin = [float(value) for value in camera.matrix_world.translation]
+    # Camera transforms can remain stale for one dependency-graph cycle after
+    # configure_locked_camera() changes location/rotation.  Reading the stale
+    # matrix places the key at the world origin, which is also the character's
+    # foot anchor and produces an almost-black render with light only at the
+    # feet.
+    bpy.context.view_layer.update()
+    camera_world = camera.matrix_world.copy()
+    origin = [float(value) for value in camera_world.translation]
     if len(origin) != 3 or not all(math.isfinite(value) for value in origin) or not math.isfinite(intensity) or intensity <= 0.0:
         raise RuntimeError("configuração de luz inválida")
     data = bpy.data.lights.new("sprite_key_light", "AREA")
@@ -400,7 +410,7 @@ def configure_sprite_lighting(
     scene.collection.objects.link(light)
     light.location = Vector(origin)
     light.rotation_mode = "QUATERNION"
-    light.rotation_quaternion = camera.rotation_quaternion.copy()
+    light.rotation_quaternion = camera_world.to_quaternion()
 
     return {
         "preset": str(request.get("light_preset", "default")),
@@ -555,6 +565,7 @@ def main() -> int:
     request = json.loads(request_path.read_text(encoding="utf-8"))
     output = Path(request["output"]).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
+    asset_spec = asset_manifest.normalize_asset_spec(request.get("asset_spec"))
     rows = max(1, min(len(ROWS), int(request.get("rows", 8))))
     phases_count = max(1, min(32, int(request.get("phases", 8))))
     resolution = max(128, int(request.get("resolution", 256)))
@@ -622,19 +633,70 @@ def main() -> int:
             extent,
         )
 
-    scene.frame_set(start)
-    armature.location = (0.0, 0.0, 0.0)
-    first_hips, _ = brc.evaluated_hips(armature, scene)
-    scene.frame_set(end)
-    last_hips, _ = brc.evaluated_hips(armature, scene)
-    root_delta = root_motion_lock.get("delta", [0.0, 0.0, 0.0])
-    forward = Vector((float(root_delta[0]), float(root_delta[1]), 0.0))
-    if forward.length < 1e-4:
-        forward = Vector((last_hips.x - first_hips.x, last_hips.y - first_hips.y, 0.0))
-    if forward.length < 1e-4:
-        forward = Vector((0.0, -1.0, 0.0))
+    animation_metadata = request.get("animation_metadata")
+    if not isinstance(animation_metadata, dict):
+        animation_metadata = {}
+    scene_fps = float(scene.render.fps) / max(float(scene.render.fps_base), 1e-6)
+    catalog_fps = animation_metadata.get("fps")
+    try:
+        source_fps = float(catalog_fps)
+    except (TypeError, ValueError):
+        source_fps = scene_fps
+    if source_fps <= 0:
+        source_fps = scene_fps if scene_fps > 0 else 30.0
+    catalog_duration = animation_metadata.get("duration_seconds")
+    try:
+        catalog_duration = float(catalog_duration)
+    except (TypeError, ValueError):
+        catalog_duration = None
+    source_duration = (end - start) / source_fps
+    cycle_duration = cycle / source_fps if cycle else source_duration
+    output_fps = float(request.get("fps", 10))
+    source_loop = animation_metadata.get("loop")
+    loop_recommended = animation_metadata.get("loop_recommended")
+    if isinstance(loop_recommended, bool):
+        playback_loop = loop_recommended
+    elif isinstance(source_loop, bool):
+        playback_loop = source_loop
     else:
-        forward.normalize()
+        playback_loop = bool(cycle)
+    if cycle and not playback_loop:
+        phases = brc.phase_frames(start, end, phases_count)
+    animation_timing = {
+        "source_frame_range": [start, end],
+        "source_fps": round(source_fps, 6),
+        "source_duration_seconds": round(source_duration, 6),
+        "catalog_duration_seconds": (
+            round(catalog_duration, 6) if catalog_duration and catalog_duration > 0 else None
+        ),
+        "cycle_period_frames": cycle,
+        "cycle_duration_seconds": round(cycle_duration, 6),
+        "playback_duration_seconds": round(
+            cycle_duration if playback_loop and cycle else source_duration, 6
+        ),
+        "output_fps": round(output_fps, 6),
+        "phase_count": len(phases),
+        "phase_duration_seconds": round(cycle_duration / len(phases), 6),
+        "sampled_frames": phases,
+        "cycle_detected": bool(cycle),
+        "source_loop": source_loop if isinstance(source_loop, bool) else None,
+        "loop_recommended": loop_recommended if isinstance(loop_recommended, bool) else None,
+        "playback_loop": playback_loop,
+        "loop": playback_loop,
+        "source_fps_origin": "animation_catalog" if catalog_fps else "blender_scene",
+    }
+
+    orientation = normalize_orientation(request.get("orientation"))
+    forward, orientation_report = rest_pose_forward(armature, orientation)
+    print(
+        "ORIENTATION "
+        f"source={orientation_report['source']} "
+        f"rest_pose={orientation_report.get('rest_pose_id') or 'none'} "
+        f"axis={orientation_report['local_forward_axis']} "
+        f"forward={orientation_report['forward_vector_world']} "
+        f"yaw_offset={orientation_report['yaw_offset_degrees']:.3f}",
+        flush=True,
+    )
     ground = float(render_profile["ground_z"]) if render_profile else minimum.z
     requested_rows = request.get("direction_rows")
     if requested_rows is None:
@@ -785,8 +847,15 @@ def main() -> int:
 
     metadata = {
         "schema": "sprite_lab.sprite_render/v1",
+        "asset": asset_spec,
+        "animation_source": {
+            key: animation_metadata.get(key)
+            for key in ("id", "action_name", "clip_name", "category")
+        },
+        "animation_timing": animation_timing,
+        "orientation": orientation_report,
         "directions": row_names,
-        "direction_contract": DIRECTION_CONTRACT,
+        "direction_contract": direction_contract_for(row_names),
         "direction_targets": [
             {
                 "row": row,
@@ -800,6 +869,7 @@ def main() -> int:
         "sampled_frames": phases,
         "frame_range": [start, end],
         "looping": bool(cycle),
+        "playback_loop": playback_loop,
         "cycle_period": cycle,
         "cell": [resolution, resolution],
         "fps": float(request.get("fps", 10)),

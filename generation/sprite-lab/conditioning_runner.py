@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import conditioning_schema as schema
-from image_generation_provider import GenerationRequest, create_provider
+from image_generation_provider import GenerationRequest, create_provider, default_model
 
 
 def _condition_channels(manifest: dict[str, Any], condition: str) -> list[str]:
@@ -120,8 +120,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("manifest", type=Path)
     parser.add_argument("output_dir", type=Path)
-    parser.add_argument("--provider", default="dry-run", choices=("dry-run", "openai", "google"))
-    parser.add_argument("--model", default="gpt-image-2")
+    parser.add_argument("--provider", default="dry-run", choices=("dry-run", "openai", "google", "qwen"))
+    parser.add_argument("--model")
     parser.add_argument("--condition", default="segmentation", choices=schema.CONDITIONS)
     parser.add_argument("--frames", help="IDs separados por vírgula; padrão: todos")
     args = parser.parse_args(argv)
@@ -129,7 +129,7 @@ def main(argv: list[str] | None = None) -> int:
     report = run(
         args.manifest,
         provider_name=args.provider,
-        model=args.model,
+        model=args.model or default_model(args.provider),
         condition=args.condition,
         output_dir=args.output_dir,
         frame_ids=frame_ids,

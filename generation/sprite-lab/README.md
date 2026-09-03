@@ -16,12 +16,13 @@ assets.json + animations.json
         ├── semantic_annotations.json nomes, tags, família e notas
         ├── action_annotations.json   análise semântica das Actions
         ├── composition-exports/      GLBs compostos salvos pelo usuário
-        └── sprite-renders/          células + spritesheet + animation.gif
+        └── sprite-renders/           células + spritesheet + asset_manifest.json
 ```
 
 ## Executar a página
 
-Na máquina local:
+Na máquina local (o launcher de desenvolvimento seleciona automaticamente o
+ambiente virtual quando ele existir):
 
 ```bash
 python3 /home/ggnp/tools/generation/sprite-lab/server.py --host 127.0.0.1 --port 8002
@@ -34,6 +35,9 @@ forem alterados:
 ```bash
 python3 /home/ggnp/tools/generation/sprite-lab/dev_server.py --host 127.0.0.1 --port 8002
 ```
+
+Se existir o ambiente virtual `.venv` do Sprite Lab, o launcher o utiliza
+automaticamente para disponibilizar os SDKs opcionais, como `openai`.
 
 Abra <http://127.0.0.1:8002/catalog>. As páginas também estão disponíveis em
 `/composition` e `/sprites`, permitindo compartilhar ou recarregar cada seção
@@ -55,6 +59,44 @@ diretamente pela URL. A página permite:
 - acompanhar renderizações de sprites e abrir o spritesheet, GIF e JSON de
   metadados do resultado.
 
+### Providers de renderização por IA
+
+A página **AI Render** usa OpenAI como provider padrão e oferece Gemini e Qwen
+Cloud como alternativas. Para usar GPT Image 2,
+instale o SDK `openai` e informe sua chave no menu de configurações ou pela
+variável `OPENAI_API_KEY`:
+
+```bash
+python3 -m pip install openai
+export OPENAI_API_KEY="..."
+```
+
+O provider Gemini usa `temperature=1.0` e `topK=64`, os defaults do modelo
+`gemini-3.1-flash-image`, para equilibrar exploração visual e consistência
+durante a geração condicionada, mantendo o valor registrado no código do
+provider para que as requisições sejam reproduzíveis e auditáveis.
+
+Para usar Qwen, instale o SDK e informe seu Token/API no menu de configurações
+ou pela variável `DASHSCOPE_API_KEY`:
+
+```bash
+python3 -m pip install -r /home/ggnp/tools/generation/sprite-lab/requirements-qwen.txt
+export DASHSCOPE_API_KEY="..."
+```
+
+Os modelos disponíveis são `gpt-image-2` para OpenAI e
+`qwen-image-3.0-pro` (padrão) ou `qwen-image-3.0` para Qwen. O formulário permite escolher quais referências Blender
+(`beauty`, `bones` e `lineart`) serão enviadas. A referência de identidade é
+enviada separadamente; no Qwen, podem ser selecionadas até duas referências
+Blender para respeitar o limite de três imagens por chamada. O output retornado
+pela URL temporária da Qwen Cloud é baixado imediatamente e validado como PNG
+2048×2048.
+
+Se o token começar com `sk-sp-` (Token Plan), o provider seleciona
+automaticamente `https://token-plan.ap-southeast-1.maas.aliyuncs.com/api/v1`.
+Para outra modalidade, é possível informar explicitamente
+`QWEN_API_BASE_URL` ou `DASHSCOPE_HTTP_BASE_URL`.
+
 ## Contrato de dados
 
 `relationship_catalog.py index` recompõe o índice semântico sem modificar os
@@ -71,6 +113,26 @@ O contrato de renderização é `sprite_lab.sprite_render/v1`. Cada resultado
 declara bounds, Action, FPS, frames amostrados, componentes e as dimensões do
 spritesheet. Isso permite que um cliente SaaS consuma a exportação sem
 depender de uma engine específica.
+
+### Manifesto agnóstico de asset
+
+Todo novo render começa com `asset_type`, `representation` e
+`capabilities`. O resultado cria `asset_manifest.json`, seguindo
+`sprite_lab.asset_manifest/v1` (o schema está em
+`schemas/asset_manifest_v1.json`). O manifesto é a fonte única para o
+contrato de conteúdo, origem, geração, layout, animação, posicionamento,
+capacidades de gameplay, runtime, artefatos e validação. Os PNGs/GIFs não são
+embutidos em base64: ficam como arquivos normais, referenciados por caminho
+relativo, tamanho e SHA-256.
+
+Os tipos previstos são `actor`, `prop_static`, `prop_animated`, `tile` e
+`vfx`. O renderer pode ser especializado por tipo, mas o formato de saída não
+muda; um adaptador do jogo escolhe como importar a seção `runtime`. Nesta
+primeira integração, a rota de composição de sprites usa diretamente o worker
+Blender de personagens para `actor` e `prop_animated`; os demais tipos já
+estão definidos no contrato e aparecem como workers pendentes, sem permitir
+que um render de personagem seja gravado acidentalmente como árvore, tile ou
+VFX.
 
 ### Enquadramento consistente
 
@@ -219,6 +281,7 @@ uma relação v2 para não quebrar clientes legados.
 - `GET /api/catalog`, `/api/animations`, `/api/relationships`
 - `GET /api/sprite-jobs`
 - `GET /api/render-profiles`, `/api/camera-presets`
+- `GET /api/asset-contract`
 - `POST /api/annotate`
 - `POST /api/annotate-action`
 - `POST /api/relationships`
@@ -229,7 +292,7 @@ uma relação v2 para não quebrar clientes legados.
 
 As renderizações de sprites ficam em
 `tools/generation/sprite-lab/work/sprite-renders/<job-id>/` e incluem as células,
-o spritesheet final e um GIF de inspeção para cada linha (`animation_r1.gif` até
+o spritesheet final, `asset_manifest.json` e um GIF de inspeção para cada linha (`animation_r1.gif` até
 `animation_r8.gif`). A ordem canônica de câmera é `r1: South`, `r2:
 South-east`, `r3: East`, `r4: North-east`, `r5: North`, `r6: North-west`,
 `r7: West` e `r8: South-west`. Essa ordem é registrada em

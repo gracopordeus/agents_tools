@@ -46,6 +46,72 @@ class ServerGeminiConfigTests(unittest.TestCase):
             self.assertFalse(server.GEMINI_CONFIG_PATH.exists())
 
 
+class ServerQwenConfigTests(unittest.TestCase):
+    def test_local_key_is_private_and_never_returned_by_status(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            server, "QWEN_CONFIG_PATH", Path(temporary) / "qwen_config.json"
+        ), patch.dict(
+            os.environ,
+            {"DASHSCOPE_API_KEY": "", "QWEN_API_KEY": ""},
+            clear=False,
+        ):
+            result = server.save_qwen_api_key(" test-\nqwen-key ")
+
+            self.assertEqual(result["source"], "local")
+            self.assertTrue(result["configured"])
+            self.assertNotIn("api_key", result)
+            self.assertEqual(server.qwen_api_key(), "test-qwen-key")
+            mode = stat.S_IMODE(server.QWEN_CONFIG_PATH.stat().st_mode)
+            self.assertEqual(mode, 0o600)
+
+            cleared = server.save_qwen_api_key("")
+            self.assertFalse(cleared["configured"])
+            self.assertFalse(server.QWEN_CONFIG_PATH.exists())
+
+    def test_environment_key_is_detected_without_persisting_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            server, "QWEN_CONFIG_PATH", Path(temporary) / "qwen_config.json"
+        ), patch.dict(
+            os.environ,
+            {"DASHSCOPE_API_KEY": "environment-key", "QWEN_API_KEY": ""},
+            clear=False,
+        ):
+            result = server.qwen_config_status()
+
+            self.assertEqual(result, {"configured": True, "source": "environment", "updated_at": None})
+            self.assertEqual(server.qwen_api_key(), "environment-key")
+            self.assertFalse(server.QWEN_CONFIG_PATH.exists())
+
+
+class ServerOpenAIConfigTests(unittest.TestCase):
+    def test_local_key_is_private_and_never_returned_by_status(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            server, "OPENAI_CONFIG_PATH", Path(temporary) / "openai_config.json"
+        ), patch.dict(os.environ, {"OPENAI_API_KEY": ""}, clear=False):
+            result = server.save_openai_api_key("test-openai-key")
+
+            self.assertEqual(result["source"], "local")
+            self.assertTrue(result["configured"])
+            self.assertNotIn("api_key", result)
+            self.assertEqual(server.openai_api_key(), "test-openai-key")
+            mode = stat.S_IMODE(server.OPENAI_CONFIG_PATH.stat().st_mode)
+            self.assertEqual(mode, 0o600)
+
+            cleared = server.save_openai_api_key("")
+            self.assertFalse(cleared["configured"])
+            self.assertFalse(server.OPENAI_CONFIG_PATH.exists())
+
+    def test_environment_key_is_detected_without_persisting_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            server, "OPENAI_CONFIG_PATH", Path(temporary) / "openai_config.json"
+        ), patch.dict(os.environ, {"OPENAI_API_KEY": "environment-key"}, clear=False):
+            result = server.openai_config_status()
+
+            self.assertEqual(result, {"configured": True, "source": "environment", "updated_at": None})
+            self.assertEqual(server.openai_api_key(), "environment-key")
+            self.assertFalse(server.OPENAI_CONFIG_PATH.exists())
+
+
 class ServerHuggingFaceConfigTests(unittest.TestCase):
     def test_local_token_is_private_and_never_returned_by_status(self) -> None:
         with tempfile.TemporaryDirectory() as temporary, patch.object(

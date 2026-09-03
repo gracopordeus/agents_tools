@@ -18,6 +18,8 @@ from typing import Any
 import bpy
 from mathutils import Euler, Matrix, Quaternion, Vector
 
+from orientation_contract import axis_vector, normalize_orientation
+
 
 BONE_PATH_RE = re.compile(r"pose\.bones\[(?:\"([^\"]+)\"|'([^']+)')\]")
 ROOT_BONE_TOKENS = ("root", "hips", "pelvis", "master")
@@ -283,6 +285,50 @@ def find_action(name: str | None) -> bpy.types.Action | None:
         (item for item in actions if item.name == leaf or item.name.endswith("|" + leaf)),
         None,
     )
+
+
+def rest_pose_forward(
+    armature: bpy.types.Object,
+    orientation: dict[str, Any] | None = None,
+) -> tuple[Vector, dict[str, Any]]:
+    """Resolve facing from the armature's rest-bone basis, never its action.
+
+    A T-pose/rest pose is a calibration reference.  It must not be inferred
+    from the first and last frames of the active animation: those frames can
+    contain arbitrary hip displacement for rolls, dashes and attacks.
+    """
+    manifest = normalize_orientation(orientation)
+    forward = Vector(axis_vector(manifest["local_forward_axis"]))
+    reference_bone = armature.data.bones.get(manifest["reference_bone"])
+    if reference_bone is not None:
+        forward = reference_bone.matrix_local.to_3x3() @ forward
+    forward = armature.matrix_world.to_3x3() @ forward
+    forward.z = 0.0
+    if forward.length < 1e-6:
+        forward = Vector((0.0, -1.0, 0.0))
+    else:
+        forward.normalize()
+
+    yaw = math.radians(float(manifest["yaw_offset_degrees"]))
+    if abs(yaw) > 1e-9:
+        forward = Vector(
+            (
+                forward.x * math.cos(yaw) - forward.y * math.sin(yaw),
+                forward.x * math.sin(yaw) + forward.y * math.cos(yaw),
+                0.0,
+            )
+        )
+        forward.normalize()
+    report = {
+        **manifest,
+        "calibration_basis": "armature_rest_bone",
+        "forward_vector_world": [
+            round(float(forward.x), 8),
+            round(float(forward.y), 8),
+            round(float(forward.z), 8),
+        ],
+    }
+    return forward, report
 
 
 def _action_fcurves(action: bpy.types.Action) -> list[Any]:

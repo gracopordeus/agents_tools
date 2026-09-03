@@ -201,7 +201,8 @@ def build_relationship_catalog(
     for previous_relationship in previous_relationships:
         if str(previous_relationship.get("character_asset_id")) not in asset_ids:
             continue
-        if str(previous_relationship.get("animation_id")) not in animation_ids:
+        animation_id = str(previous_relationship.get("animation_id") or "").strip()
+        if animation_id and animation_id not in animation_ids:
             continue
         try:
             components = composition_schema.normalize_components(previous_relationship)
@@ -210,6 +211,7 @@ def build_relationship_catalog(
         if any(str(item["asset_id"]) not in asset_ids for item in components):
             continue
         relationship = dict(previous_relationship)
+        relationship["animation_id"] = animation_id or None
         relationship["components"] = components
         weapon_id, shield_id = composition_schema.legacy_asset_ids(components)
         relationship["weapon_asset_id"] = weapon_id
@@ -260,9 +262,9 @@ def add_relationship(
     payload: dict[str, Any],
     output_path: Path = DEFAULT_OUTPUT,
 ) -> dict[str, Any]:
-    required = ("character_asset_id", "animation_id")
-    if any(not payload.get(key) for key in required):
-        raise ValueError("relationship exige character_asset_id e animation_id")
+    if not payload.get("character_asset_id"):
+        raise ValueError("relationship exige mesh principal")
+    animation_id = str(payload.get("animation_id") or "").strip() or None
     components = composition_schema.normalize_components(payload)
     weapon_id, shield_id = composition_schema.legacy_asset_ids(components)
     data = load_relationship_state(output_path)
@@ -279,7 +281,7 @@ def add_relationship(
             json.dumps(identity_payload, sort_keys=True).encode("utf-8")
         ).hexdigest()[:20],
         "character_asset_id": payload["character_asset_id"],
-        "animation_id": payload["animation_id"],
+        "animation_id": animation_id,
         "weapon_asset_id": weapon_id,
         "shield_asset_id": shield_id,
         "components": components,
@@ -337,7 +339,8 @@ def validate_relationship_catalog(path: Path = DEFAULT_OUTPUT) -> list[str]:
     for item in relationships:
         if str(item.get("character_asset_id")) not in asset_ids:
             errors.append(f"personagem ausente: {item.get('id')}")
-        if str(item.get("animation_id")) not in animation_ids:
+        animation_id = str(item.get("animation_id") or "").strip()
+        if animation_id and animation_id not in animation_ids:
             errors.append(f"animação ausente: {item.get('id')}")
         try:
             components = composition_schema.normalize_components(item)

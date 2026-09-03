@@ -27,9 +27,26 @@ import build_run_sheet as b
 from path_config import PROJECT_ROOT
 import sprite_manifest as manifest_lib
 
+SPRITE_LAB_ROOT = Path(__file__).resolve().parent / "sprite-lab"
+sys.path.insert(0, str(SPRITE_LAB_ROOT))
+from direction_contract import DIRECTION_LABELS, direction_contract_for
+
 ROOT = PROJECT_ROOT
-GODOT_DIRS = ["west", "north_west", "east", "north_east",
-              "north", "south_west", "south", "south_east"]
+LEGACY_DIRECTION_LABELS = {
+    "w": "west",
+    "nw": "north_west",
+    "e": "east",
+    "ne": "north_east",
+    "n": "north",
+    "sw": "south_west",
+    "s": "south",
+    "se": "south_east",
+}
+
+
+def direction_label(direction: str) -> str:
+    """Map the physical Blender row id to Godot's semantic direction name."""
+    return DIRECTION_LABELS.get(direction, LEGACY_DIRECTION_LABELS.get(direction, direction))
 
 
 def parse_args():
@@ -89,6 +106,7 @@ def build(cells_root: Path, sharpen: bool = True):
     meta = {"n_rows": n_rows, "n_cols": n_cols, "window": list(window),
             "scale": round(scale, 4), "foot_anchor": foot_anchor,
             "frame_size": [b.CELL, b.CELL], "directions": list(b.ROWS),
+            "direction_contract": direction_contract_for(b.ROWS),
             "fit_policy": "reference_fit", "animation": "run", "fps": 10.0}
     return atlas, meta
 
@@ -133,19 +151,16 @@ def build_from_manifest(manifest_path: Path, manifest: dict):
         "animation": manifest["asset"].get("animation") or "run",
         "fps": float(layout["fps"]),
         "manifest_path": str(manifest_path),
+        "direction_contract": manifest.get("direction_contract"),
     }
     return atlas, meta
 
 
 def write_tres(path: Path, atlas_rel: str, meta: dict, args) -> None:
     fs = meta["frame_size"]
-    logical_to_godot = {
-        "w": "west", "nw": "north_west", "e": "east", "ne": "north_east",
-        "n": "north", "sw": "south_west", "s": "south", "se": "south_east",
-    }
     directions = meta.get("directions", b.ROWS)
     origins = ", ".join(
-        f'&"{logical_to_godot.get(direction, direction)}": Vector2i(0, {row * fs[1]})'
+        f'&"{direction_label(direction)}": Vector2i(0, {row * fs[1]})'
         for row, direction in enumerate(directions))
     animation = args.anim or meta.get("animation") or "run"
     fps = args.fps if args.fps is not None else float(meta.get("fps", 10.0))
@@ -191,11 +206,10 @@ def write_spec(path: Path, atlas_rel: str, meta: dict, args) -> None:
         },
         "directions_authored": meta.get("directions", b.ROWS),
         "directions_runtime": [
-            {"w": "west", "nw": "north_west", "e": "east", "ne": "north_east",
-             "n": "north", "sw": "south_west", "s": "south", "se": "south_east"}
-            .get(direction, direction)
+            direction_label(direction)
             for direction in meta.get("directions", b.ROWS)
         ],
+        "direction_contract": meta.get("direction_contract"),
         "horizontal_mirroring": False,
         "animations": {animation: {"row": 0, "frames": meta["n_cols"], "fps": fps}},
         "fit_policy": meta.get("fit_policy", "reference_fit"),
@@ -215,12 +229,8 @@ def write_test(path: Path, atlas_rel: str, meta: dict, args) -> None:
     fps = args.fps if args.fps is not None else float(meta.get("fps", 10.0))
     display_height = args.display_height
     directions = meta.get("directions", b.ROWS)
-    first_direction = {"w": "west", "nw": "north_west", "e": "east", "ne": "north_east",
-                       "n": "north", "sw": "south_west", "s": "south", "se": "south_east"}.get(
-                           directions[0], directions[0])
-    last_direction = {"w": "west", "nw": "north_west", "e": "east", "ne": "north_east",
-                      "n": "north", "sw": "south_west", "s": "south", "se": "south_east"}.get(
-                          directions[-1], directions[-1])
+    first_direction = direction_label(directions[0])
+    last_direction = direction_label(directions[-1])
     profile = f"res://assets/characters/{args.category}/{args.id}/{args.id}_profile.tres"
     lines = [
         "extends SceneTree",

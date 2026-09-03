@@ -1,0 +1,3 @@
+[submodule "sprite-gpu-worker"]
+	path = sprite-gpu-worker
+	url = git@github.com:gracopordeus/sprite-gpu-worker.git

@@ -27,8 +27,8 @@ def parse_args() -> argparse.Namespace:
     values = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
     parser = argparse.ArgumentParser()
     parser.add_argument("--character", type=Path, required=True)
-    parser.add_argument("--animation", type=Path, required=True)
-    parser.add_argument("--action-name", required=True)
+    parser.add_argument("--animation", type=Path)
+    parser.add_argument("--action-name", default="")
     parser.add_argument("--components", default="[]")
     parser.add_argument("--weapon", type=Path)
     parser.add_argument("--output", type=Path, required=True)
@@ -41,11 +41,13 @@ def run() -> int:
     import_asset(args.character)
 
     armature = find_armature()
-    if armature is None:
-        raise RuntimeError("composição sem armature para receber a Action")
-    action = apply_animation(armature, args.animation, args.action_name)
-    if action is None:
-        raise RuntimeError(f"Action não encontrada: {args.action_name}")
+    action = None
+    if args.animation:
+        if armature is None:
+            raise RuntimeError("composição sem armature para receber a Action")
+        action = apply_animation(armature, args.animation, args.action_name)
+        if action is None:
+            raise RuntimeError(f"Action não encontrada: {args.action_name}")
 
     components = json.loads(args.components)
     if not isinstance(components, list):
@@ -63,7 +65,7 @@ def run() -> int:
             {"character_path": str(args.character)},
         )
 
-    if action is not None:
+    if action is not None and armature is not None:
         bake_two_hand_components(armature, action)
 
     bpy.context.scene.frame_set(1)

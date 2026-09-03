@@ -1,0 +1,27 @@
+{
+  "schema": "sprite_lab.render_profile/v1",
+  "id": "tile_reference_v1",
+  "cell_size": [256, 256],
+  "cell_size_mode": "fixed",
+  "ortho_scale_mode": "fixed",
+  "cell_size_quantum": 16,
+  "ortho_scale": 1.0,
+  "dynamic_x": false,
+  "horizontal_margin_px": 0.0,
+  "dynamic_y": false,
+  "vertical_margin_px": 0.0,
+  "foot_anchor": [128, 128],
+  "camera_elevation": 80.0,
+  "camera_azimuth": 45.0,
+  "directions": 1,
+  "phases": 1,
+  "ground_z": 0.0,
+  "camera_preset": "top_down",
+  "tile_config": {
+    "description": "Configuração específica para tiles — 1 nav-cell ≈ 1m, ortho_scale calibrado para costura perfeita.",
+    "nav_cell_world_size": 1.0,
+    "stitch_mode": "pixel_perfect",
+    "orientation_steps": 16,
+    "orientation_step_degrees": 22.5
+  }
+}

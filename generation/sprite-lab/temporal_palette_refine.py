@@ -146,7 +146,7 @@ def main() -> None:
     )
     ordered_frames = [
         args.output / f"row{direction - 1}_col{phase}.png"
-        for direction in (1, 2, 5, 4, 3, 8, 7, 6)
+        for direction in range(1, min(args.rows, len(sprite_render.DIRECTION_ROWS)) + 1)
         for phase in range(args.phases)
     ]
     ordered = sprite_render._write_gif(
@@ -168,6 +168,7 @@ def main() -> None:
         "frames": reports,
         "images": len(names),
         "cell_size": list(size),
+        "fps": float(args.fps),
         "elapsed_seconds": round(time.monotonic() - started, 3),
         "spritesheet": "spritesheet.png",
         "gifs": {direction: path.name for direction, path in gifs.items()},

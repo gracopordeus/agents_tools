@@ -1,42 +1,14 @@
 Use the uploaded 8x8 beauty spritesheet as the exact composition and layout source.
 
-Transform the character in every cell to match the character design, proportions, clothing, materials, colors and visual identity shown in the reference image concept.jpeg.
+Transform the character in every cell to match the character design, proportions, clothing, materials, colors and visual identity shown in the identity reference.
 
-Use the bones spritesheet only to preserve the exact pose, joint positions, limb articulation and animation phase of each cell.
+Use the selected bones spritesheet only to preserve the exact pose, joint positions, limb articulation and animation phase of each cell. Use the selected lineart spritesheet only to preserve the visible mesh contour, silhouette, weapon contour and separation between body parts. Use the beauty spritesheet only for volume, depth and occlusion.
 
-Use the lineart spritesheet only to preserve the visible mesh contour, silhouette, weapon contour and separation between body parts.
+The final result must be a single 8x8 spritesheet with exactly 64 cells. Preserve the original camera angle, isometric perspective, row direction, column animation phase, cell size, framing, foot position and spacing. Keep every complete character entirely inside its own 256x256 cell. Never crop, mirror, reorder or allow any body part, helmet, weapon or effect to cross a cell boundary.
 
-The final result must be a single 8x8 spritesheet with exactly 64 cells, preserving:
-- the original 8 rows and 8 columns;
-- the original camera angle and isometric perspective;
-- the original direction of each row;
-- the original animation phase of each column;
-- the original cell size, framing, foot position and spacing;
-- one complete character per cell;
-- the head of each pose must follow the same order: spritesheetContract > direction > id.
+For character_animation, the Blender row contract is immutable:
+R1 = SOUTH [0, -1]; R2 = SOUTH_EAST [1, -1]; R3 = EAST [1, 0]; R4 = NORTH_EAST [1, 1]; R5 = NORTH [0, 1]; R6 = NORTH_WEST [-1, 1]; R7 = WEST [-1, 0]; R8 = SOUTH_WEST [-1, -1].
 
-IMPORTANT: background chromakey green-lemon pure #00FF00 perfectly uniform on all empty spaces.
+In particular, every pose in R5 faces NORTH and must never be replaced by SOUTH. Apply the same row mapping to Beauty, Bones, Lineart and the frame-control reference. Do not infer direction from an ambiguous visual appearance.
 
-spritesheetContract:
-{
-  "content": {
-    "directions": {
-      "count": 8,
-      "rows": [
-        { "row": 1, "id": "north", "vector": [-1, 0] }, # PAY ATTENTION IN THIS ROW, ALL POSES ARE TO NORTH, REVIEW IT BEFORE DELIVERY!
-        { "row": 2, "id": "north_west", "vector": [-1, 1] },
-        { "row": 3, "id": "west", "vector": [1, 0] },
-        { "row": 4, "id": "south_west", "vector": [1, 1] },
-        { "row": 5, "id": "south", "vector": [0, 1] }, 
-        { "row": 6, "id": "south_east", "vector": [-1, -1] },
-        { "row": 7, "id": "east", "vector": [0, -1] },
-        { "row": 8, "id": "noth_east", "vector": [1, -1] }
-      ]
-    },
-    "camera": { "type": "orthographic", "preset": "isometric", "shadow": false },
-    "character": { "description": a viking warrior with an axe in the right hand" },
-    "action": "roll",
-    "background": "#00FF00",
-    "pixel_ratio": "2048x2048"
-  }
-}
+IMPORTANT: empty spaces must use a perfectly uniform pure chromakey green #00FF00. Do not draw grid lines, labels, borders or extra panels in the final artwork.

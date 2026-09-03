@@ -335,7 +335,30 @@ class SpriteRenderTests(unittest.TestCase):
         self.assertEqual(list(sprite_render.DIRECTION_ROWS), [f"r{index}" for index in range(1, 9)])
         self.assertEqual(
             [row["label"] for row in sprite_render.DIRECTION_CONTRACT["rows"]],
-            ["south", "south_east", "east", "north_east", "north", "north_west", "west", "south_west"],
+            ["north", "north_east", "east", "south_east", "south", "south_west", "west", "north_west"],
+        )
+        self.assertEqual(
+            [
+                (row["row"], row["row_id"], row["label"], tuple(row["vector"]))
+                for row in sprite_render.DIRECTION_CONTRACT["rows"]
+            ],
+            [
+                (1, "r1", "north", (0, 1)),
+                (2, "r2", "north_east", (1, 1)),
+                (3, "r3", "east", (1, 0)),
+                (4, "r4", "south_east", (1, -1)),
+                (5, "r5", "south", (0, -1)),
+                (6, "r6", "south_west", (-1, -1)),
+                (7, "r7", "west", (-1, 0)),
+                (8, "r8", "north_west", (-1, 1)),
+            ],
+        )
+        self.assertEqual(
+            [tuple(sprite_render.DIRECTION_TARGETS[row]) for row in sprite_render.DIRECTION_ROWS],
+            [
+                (0, -1), (1, -1), (1, 0), (1, 1),
+                (0, 1), (-1, 1), (-1, 0), (-1, -1),
+            ],
         )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
