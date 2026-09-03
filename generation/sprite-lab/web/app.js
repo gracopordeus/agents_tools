@@ -3432,6 +3432,63 @@ $("#btn-reindex").addEventListener("click", async () => {
   try { await api("/api/reindex", { method: "POST", body: {} }); await load(); toast("Índice atualizado"); }
   catch (error) { toast(error.message, true); }
 });
+function formatUploadBytes(bytes) {
+  const value = Number(bytes || 0);
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  if (value < 1024 * 1024 * 1024) return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(value / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+async function refreshUploadList() {
+  const list = $("#catalog-upload-list");
+  if (!list) return;
+  try {
+    const data = await api("/api/catalog/uploads");
+    const rows = data.uploads || [];
+    list.innerHTML = rows.length
+      ? rows.map((item) => `<li><span>${esc(item.file)}</span><span>${esc(formatUploadBytes(item.bytes))}</span></li>`).join("")
+      : `<li class="muted">Nenhum ZIP enviado ainda.</li>`;
+  } catch (error) {
+    list.innerHTML = `<li class="muted">Não foi possível listar uploads.</li>`;
+  }
+}
+$("#btn-upload-zip").addEventListener("click", () => {
+  const input = $("#catalog-upload-file");
+  const status = $("#catalog-upload-status");
+  const progress = $("#catalog-upload-progress");
+  const file = input?.files?.[0];
+  if (!file) { toast("Escolha um arquivo .zip", true); return; }
+  if (!/\.zip$/i.test(file.name)) { toast("Apenas arquivos .zip", true); return; }
+  const xhr = new XMLHttpRequest();
+  xhr.open("POST", `/api/catalog/upload?filename=${encodeURIComponent(file.name)}`);
+  xhr.setRequestHeader("Content-Type", "application/zip");
+  xhr.upload.onprogress = (event) => {
+    if (event.lengthComputable && progress) {
+      progress.hidden = false;
+      progress.value = Math.round((event.loaded / event.total) * 100);
+    }
+  };
+  xhr.onload = async () => {
+    if (progress) progress.hidden = true;
+    let data = {};
+    try { data = JSON.parse(xhr.responseText); } catch (error) { /* corpo não-JSON */ }
+    if (xhr.status === 201) {
+      if (status) status.textContent = `Recebido ${data.file} — indexação automática em segundos.`;
+      toast("ZIP enviado para o catálogo");
+      input.value = "";
+      await refreshUploadList();
+      await load();
+    } else {
+      toast(data.error || `Falha no upload (HTTP ${xhr.status})`, true);
+    }
+  };
+  xhr.onerror = () => {
+    if (progress) progress.hidden = true;
+    toast("Erro de rede no upload", true);
+  };
+  if (status) status.textContent = `Enviando ${file.name}…`;
+  xhr.send(file);
+});
 window.addEventListener("sprite-viewer-ready", () => {
   if (state.selected) renderDetail();
   if (state.compositionPreviewRequested && !$("#composition-page")?.hidden) refreshCompositionViewer();
@@ -3578,3 +3635,4 @@ if (window.location.pathname !== routeForPage(initialPage)) {
 initializeWorkspaceChrome();
 switchPage(initialPage, { updateHistory: false });
 load();
+refreshUploadList();

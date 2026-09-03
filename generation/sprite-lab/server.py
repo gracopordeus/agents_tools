@@ -634,6 +634,96 @@ def _decode_reference(data_url: str, destination: Path) -> dict:
     return {"mime": mime.removeprefix("data:"), "bytes": len(raw), "size": size}
 
 
+UPLOAD_MAX_BYTES = 1_073_741_824  # 1 GiB
+UPLOAD_FILENAME_RE = re.compile(r"[\w][\w .()\[\]-]*\.zip\Z", re.IGNORECASE)
+
+
+class UploadTooLargeError(ValueError):
+    """Raised when a catalog upload exceeds UPLOAD_MAX_BYTES."""
+
+
+def catalog_upload_root() -> Path:
+    """Inbox directory watched by the catalog indexer (auto_discover)."""
+    root = rel.DEFAULT_OUTPUT.parent.parent
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def sanitize_upload_filename(name: str) -> str:
+    base = Path(str(name or "").replace("\\", "/")).name.strip()
+    if not base or base.startswith(".") or not UPLOAD_FILENAME_RE.fullmatch(base):
+        raise ValueError("nome de arquivo inválido: envie um .zip com nome simples")
+    return base
+
+
+def incoming_source_id(filename: str) -> str:
+    stem = Path(filename).stem.casefold()
+    slug = re.sub(r"[^a-z0-9]+", "_", stem).strip("_") or "upload"
+    return f"incoming__{slug}"
+
+
+def save_catalog_upload(handler: BaseHTTPRequestHandler, filename: str) -> dict:
+    """Stream a raw ZIP body into the catalog inbox atomically."""
+    safe = sanitize_upload_filename(filename)
+    try:
+        total = int(handler.headers.get("Content-Length", 0) or 0)
+    except (TypeError, ValueError):
+        total = 0
+    if total <= 0:
+        raise ValueError("corpo ZIP vazio ou sem Content-Length")
+    if total > UPLOAD_MAX_BYTES:
+        raise UploadTooLargeError("ZIP acima do limite de 1 GiB")
+    root = catalog_upload_root()
+    destination = root / safe
+    counter = 2
+    while destination.exists():
+        destination = root / f"{Path(safe).stem}_{counter}.zip"
+        counter += 1
+    temporary = destination.with_name(f".{destination.name}.upload")
+    remaining = total
+    with open(temporary, "wb") as output:
+        while remaining > 0:
+            chunk = handler.rfile.read(min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            output.write(chunk)
+            remaining -= len(chunk)
+    try:
+        if remaining > 0 or temporary.stat().st_size != total:
+            raise ValueError("upload incompleto, tente novamente")
+        if not zipfile.is_zipfile(temporary):
+            raise ValueError("arquivo não é um ZIP válido")
+        temporary.replace(destination)
+    except (OSError, ValueError):
+        temporary.unlink(missing_ok=True)
+        raise
+    return {
+        "file": destination.name,
+        "bytes": total,
+        "source_id_hint": incoming_source_id(destination.name),
+    }
+
+
+def list_catalog_uploads() -> list[dict]:
+    root = catalog_upload_root()
+    rows = []
+    for child in sorted(root.iterdir(), key=lambda item: item.name.casefold()):
+        if not child.is_file() or child.suffix.lower() != ".zip" or child.name.startswith("."):
+            continue
+        stat = child.stat()
+        rows.append(
+            {
+                "file": child.name,
+                "bytes": stat.st_size,
+                "modified_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
+                .replace(microsecond=0)
+                .isoformat(),
+                "source_id_hint": incoming_source_id(child.name),
+            }
+        )
+    return rows
+
+
 def update_sprite_job(job_id: str, patch: dict) -> dict | None:
     with JOB_LOCK:
         jobs = read_sprite_jobs()
@@ -1518,6 +1608,9 @@ class Handler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if path == "/api/catalog/uploads":
+                _json(self, {"uploads": list_catalog_uploads()})
+                return
             if path == "/api/catalog":
                 assets = catalog_assets(
                     query.get("query", [""])[0],
@@ -1736,6 +1829,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):  # noqa: N802
         path = urlparse(self.path).path
+        if path == "/api/catalog/upload":
+            filename = parse_qs(urlparse(self.path).query).get("filename", [""])[0]
+            try:
+                result = save_catalog_upload(self, filename)
+            except UploadTooLargeError as exc:
+                _json(self, {"error": str(exc)}, 413)
+                return
+            except (OSError, ValueError) as exc:
+                _json(self, {"error": str(exc)}, 400)
+                return
+            _json(self, result, 201)
+            return
         body = _body(self)
         try:
             if path == "/api/reindex":

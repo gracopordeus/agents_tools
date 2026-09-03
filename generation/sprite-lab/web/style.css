@@ -1587,3 +1587,15 @@ body.is-resizing-pane { cursor: col-resize; user-select: none; }
   border-color: var(--accent);
   transform: translateY(-2px);
 }
+
+/* Upload de ZIP para o catálogo */
+.upload-card { border: 1px solid var(--line); border-radius: 10px; padding: 12px; margin: 12px 0; background: var(--panel-2); }
+.upload-card h2 { font-size: 14px; margin: 0 0 4px; }
+.upload-card .hint { font-size: 12px; opacity: .75; margin: 0 0 8px; }
+.upload-row { display: flex; gap: 8px; align-items: center; }
+.upload-row input[type="file"] { flex: 1; min-width: 0; }
+.upload-card progress { width: 100%; margin-top: 8px; }
+.upload-status { display: block; font-size: 12px; margin-top: 6px; }
+.upload-list { list-style: none; margin: 8px 0 0; padding: 0; font-size: 12px; }
+.upload-list li { display: flex; justify-content: space-between; gap: 8px; padding: 3px 0; border-top: 1px dashed var(--line); }
+.upload-list .muted { opacity: .6; }

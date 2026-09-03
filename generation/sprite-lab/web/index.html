@@ -78,6 +78,17 @@
             <option value="texture">Texturas</option>
           </select>
         </div>
+        <section class="upload-card" aria-label="Enviar pacote ZIP para o catálogo">
+          <h2>Enviar pacote ZIP</h2>
+          <p class="hint">O ZIP cai na pasta de entrada do catálogo e é indexado sozinho em segundos.</p>
+          <div class="upload-row">
+            <input id="catalog-upload-file" type="file" accept=".zip,application/zip">
+            <button id="btn-upload-zip" class="primary" type="button">Enviar ZIP</button>
+          </div>
+          <progress id="catalog-upload-progress" max="100" value="0" hidden></progress>
+          <output id="catalog-upload-status" class="upload-status"></output>
+          <ul id="catalog-upload-list" class="upload-list"></ul>
+        </section>
         <div id="asset-list" class="asset-list"></div>
       </section>
     </div>

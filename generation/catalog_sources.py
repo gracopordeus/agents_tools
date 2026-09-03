@@ -27,6 +27,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 import unicodedata
 import zipfile
@@ -779,6 +780,42 @@ def _notify_catalog_finished(
             return
 
 
+def rebuild_relationship_catalog() -> dict[str, Any] | None:
+    """Rebuild relationships.json from assets/animations manifests.
+
+    Returns the manifest on success, None on error. Import errors are
+    raised: relationship_catalog lives in sprite-lab/ and is a hard
+    requirement of the pipeline, not an optional probe.
+    """
+    sprite_lab = Path(__file__).resolve().parent / "sprite-lab"
+    sys.path.insert(0, str(sprite_lab))
+    try:
+        import relationship_catalog as rel
+
+        manifest = rel.build_relationship_catalog()
+        print(
+            json.dumps(
+                {
+                    "relationships": manifest.get("relationship_count", 0),
+                    "assets": manifest.get("asset_count", 0),
+                    "animations": manifest.get("animation_count", 0),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        return manifest
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"RELATIONSHIP_INDEX_ERROR {exc}", flush=True)
+        return None
+    finally:
+        try:
+            sys.path.remove(str(sprite_lab))
+        except ValueError:
+            pass
+
+
 def _watch_snapshot(root: Path) -> dict[str, tuple[int, int]]:
     """Return a cheap snapshot that ignores generated catalog manifests."""
     if not root.is_dir():
@@ -814,6 +851,7 @@ def watch_catalog(
     probe_animations: bool,
     animation_all_fbx: bool,
     blender: str | None,
+    rebuild_relationships: bool = True,
 ) -> int:
     """Watch source files and re-index after a stable debounce window."""
     _, catalog_root = load_registry(registry_path)
@@ -850,6 +888,8 @@ def watch_catalog(
                 )
             except (OSError, ValueError, json.JSONDecodeError, RuntimeError) as exc:
                 print(f"ANIMATION_INDEX_ERROR {exc}", flush=True)
+        if rebuild_relationships:
+            rebuild_relationship_catalog()
         if notify:
             _notify_catalog_finished(report, animation_report)
         while True:
@@ -888,6 +928,8 @@ def watch_catalog(
                         )
                     except (OSError, ValueError, json.JSONDecodeError, RuntimeError) as exc:
                         print(f"ANIMATION_INDEX_ERROR {exc}", flush=True)
+                if rebuild_relationships:
+                    rebuild_relationship_catalog()
                 if notify:
                     _notify_catalog_finished(report, animation_report)
             except (OSError, ValueError, json.JSONDecodeError) as exc:
@@ -994,6 +1036,7 @@ def parse_args() -> argparse.Namespace:
     index.add_argument("--dry-run", action="store_true", help="não grava manifests")
     index.add_argument("--no-notify", action="store_true")
     index.add_argument("--no-animation-probe", action="store_true")
+    index.add_argument("--no-relationships", action="store_true")
     index.add_argument("--animation-all-fbx", action="store_true")
     index.add_argument("--blender", default=None)
     index.add_argument("--animation-output", type=Path, default=None)
@@ -1011,6 +1054,7 @@ def parse_args() -> argparse.Namespace:
     watch.add_argument("--no-hash", action="store_true")
     watch.add_argument("--no-notify", action="store_true")
     watch.add_argument("--no-animation-probe", action="store_true")
+    watch.add_argument("--no-relationships", action="store_true")
     watch.add_argument("--animation-all-fbx", action="store_true")
     watch.add_argument("--blender", default=None)
     watch.add_argument("--animation-output", type=Path, default=None)
@@ -1077,6 +1121,8 @@ def main() -> int:
             except (OSError, ValueError, json.JSONDecodeError, RuntimeError) as exc:
                 print(f"ANIMATION_INDEX_ERROR {exc}")
                 animation_error = True
+        if not args.dry_run and not args.no_relationships:
+            rebuild_relationship_catalog()
         if not args.dry_run and not args.no_notify:
             _notify_catalog_finished(report, animation_report if not animation_error else None)
         return 0 if (report["summary"]["assets"] and not animation_error) or args.dry_run else 1
@@ -1097,6 +1143,7 @@ def main() -> int:
                 not args.no_animation_probe,
                 args.animation_all_fbx,
                 args.blender,
+                not args.no_relationships,
             )
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             print(f"ERROR {exc}")

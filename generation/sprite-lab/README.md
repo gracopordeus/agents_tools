@@ -279,6 +279,8 @@ uma relação v2 para não quebrar clientes legados.
 ## API mínima
 
 - `GET /api/catalog`, `/api/animations`, `/api/relationships`
+- `GET /api/catalog/uploads`
+- `POST /api/catalog/upload?filename=<nome>.zip` (corpo ZIP cru, limite 1 GiB)
 - `GET /api/sprite-jobs`
 - `GET /api/render-profiles`, `/api/camera-presets`
 - `GET /api/asset-contract`
