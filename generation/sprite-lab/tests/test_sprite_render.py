@@ -54,6 +54,30 @@ class SpriteRenderTests(unittest.TestCase):
         self.assertEqual(manifest["phases"], 9)
         self.assertEqual(sprite_render.render_dimensions({"profile": "5x9"}), ("5x9", 5, 9))
 
+    def test_single_direction_profile_is_valid_for_tiles(self) -> None:
+        manifest = render_profile.normalize_manifest(
+            {
+                "schema": "sprite_lab.render_profile/v1",
+                "id": "tile_reference_v1",
+                "cell_size": [256, 256],
+                "ortho_scale": 2.5,
+                "foot_anchor": [128, 128],
+                "camera_elevation": 35.264,
+                "camera_azimuth": 45,
+                "directions": 1,
+                "phases": 1,
+                "ground_z": 0.0,
+            }
+        )
+        self.assertEqual(manifest["directions"], 1)
+        with self.assertRaises(ValueError):
+            render_profile.normalize_manifest({**manifest, "directions": 3})
+
+    def test_list_profiles_includes_tile_profile(self) -> None:
+        by_id = {item["id"]: item for item in render_profile.list_profiles()}
+        self.assertIn("tile_reference_v1", by_id)
+        self.assertEqual(by_id["tile_reference_v1"]["directions"], 1)
+
     def test_locked_render_profile_rejects_invalid_anchor_and_scale(self) -> None:
         base = {
             "schema": "sprite_lab.render_profile/v1",

@@ -2,6 +2,8 @@ import sys
 import tempfile
 import unittest
 import json
+from types import SimpleNamespace
+from unittest.mock import patch
 from pathlib import Path
 
 from PIL import Image
@@ -14,6 +16,85 @@ import server  # noqa: E402
 
 
 class AiRenderReferenceTests(unittest.TestCase):
+    def test_identity_lineart_cache_is_reused_by_source_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "identity.png"
+            output = root / "job" / "identity_lineart.png"
+            cache = root / "cache"
+            Image.new("RGB", (32, 32), (255, 255, 255)).save(source)
+            source_hash = server.sha256_file(source)
+            cached = cache / f"{source_hash}_lineart_standard.png"
+            cached.parent.mkdir(parents=True, exist_ok=True)
+            Image.new("L", (32, 32), 0).save(cached)
+
+            with patch.object(server, "GEMINI_IDENTITY_LINEART_CACHE", cache), patch.object(
+                server.subprocess, "run"
+            ) as run:
+                report = server._prepare_identity_lineart(source, output)
+
+            self.assertTrue(report["cache_hit"])
+            self.assertEqual(report["mode"], "lineart_standard")
+            self.assertEqual(output.read_bytes(), cached.read_bytes())
+            run.assert_not_called()
+
+    def test_canny_identity_guide_uses_a_separate_cache_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "identity.png"
+            output = root / "job" / "identity_lineart.png"
+            cache = root / "cache"
+            Image.new("RGB", (32, 32), (255, 255, 255)).save(source)
+            source_hash = server.sha256_file(source)
+            cached = cache / f"{source_hash}_canny_edges.png"
+            cached.parent.mkdir(parents=True, exist_ok=True)
+            Image.new("L", (32, 32), 128).save(cached)
+
+            with patch.object(server, "GEMINI_IDENTITY_LINEART_CACHE", cache), patch.object(
+                server.subprocess, "run"
+            ) as run:
+                report = server._prepare_identity_lineart(
+                    source, output, mode="canny_edges"
+                )
+
+            self.assertTrue(report["cache_hit"])
+            self.assertEqual(report["mode"], "canny_edges")
+            self.assertEqual(report["detector"], "controlnet_aux.CannyDetector")
+            self.assertEqual(output.read_bytes(), cached.read_bytes())
+            run.assert_not_called()
+
+    def test_identity_guide_mode_is_forwarded_to_pipeline(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "identity.png"
+            output = root / "job" / "identity_lineart.png"
+            cache = root / "cache"
+            Image.new("RGB", (32, 32), (255, 255, 255)).save(source)
+
+            def fake_run(command, **kwargs):
+                self.assertEqual(command[-4:], ["--mode", "canny_edges", "--device", "auto"])
+                Image.new("L", (32, 32), 0).save(output)
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({"mode": "canny_edges"}),
+                    stderr="",
+                )
+
+            with patch.object(server, "GEMINI_IDENTITY_LINEART_CACHE", cache), patch.object(
+                server.subprocess, "run", side_effect=fake_run
+            ):
+                report = server._prepare_identity_lineart(
+                    source, output, mode="canny_edges"
+                )
+
+            self.assertFalse(report["cache_hit"])
+            self.assertEqual(report["mode"], "canny_edges")
+            self.assertTrue((cache / f"{server.sha256_file(source)}_canny_edges.png").is_file())
+
+    def test_identity_guide_rejects_unknown_mode(self) -> None:
+        with self.assertRaisesRegex(ValueError, "identity_lineart_mode inválido"):
+            server.normalize_identity_guide_mode("unknown")
+
     def test_frame_control_is_a_selectable_reference(self) -> None:
         channels = server.normalize_gemini_channels(
             ["beauty", "bones", "lineart", "frame_control"]

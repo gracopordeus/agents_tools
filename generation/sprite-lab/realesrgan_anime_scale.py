@@ -3,9 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 import time
-import types
 from pathlib import Path
 
 import cv2
@@ -15,65 +13,20 @@ from PIL import Image
 
 import huggingface_realesrgan
 from waifu2x_cunet_scale import alpha_bleed
+from postprocess_runtime import add_runtime_arguments, resolve_device
 
 
-def _load_realesrgan(profile_id: str, tile_size: int, tile_pad: int):
-    """Load a selected Hub checkpoint with the local torchvision compatibility shim."""
-    import torchvision.transforms.functional as functional
-
-    compat = types.ModuleType("torchvision.transforms.functional_tensor")
-    compat.rgb_to_grayscale = functional.rgb_to_grayscale
-    sys.modules["torchvision.transforms.functional_tensor"] = compat
-    from basicsr.archs.rrdbnet_arch import RRDBNet  # noqa: PLC0415
-    from realesrgan import RealESRGANer  # noqa: PLC0415
-    selected = huggingface_realesrgan.profile(profile_id)
-    if selected["architecture"] == "traditional":
+def _load_realesrgan(profile_id: str, tile_size: int, tile_pad: int, device="auto", precision="fp32"):
+    """Keep the historical entry point while supporting multiple architectures."""
+    if huggingface_realesrgan.profile(profile_id)["architecture"] == "traditional":
         return None
-    model_path = huggingface_realesrgan.download_weight(profile_id)
-    if selected["architecture"] == "rrdb":
-        model = RRDBNet(
-            num_in_ch=3,
-            num_out_ch=3,
-            num_feat=64,
-            num_block=int(selected["num_block"]),
-            num_grow_ch=32,
-            scale=int(selected["network_scale"]),
-        )
-    else:
-        from realesrgan.archs.srvgg_arch import SRVGGNetCompact  # noqa: PLC0415
-        from safetensors.torch import load_file  # noqa: PLC0415
-
-        model = SRVGGNetCompact(
-            num_in_ch=3,
-            num_out_ch=3,
-            num_feat=64,
-            num_conv=int(selected["num_conv"]),
-            upscale=int(selected["network_scale"]),
-            act_type="prelu",
-        )
-        state = load_file(str(model_path), device="cpu")
-        state = state.get("params", state)
-        converted_dir = huggingface_realesrgan.HF_CACHE_DIR / "converted"
-        converted_dir.mkdir(parents=True, exist_ok=True)
-        converted_path = converted_dir / f"{profile_id}.pth"
-        if not converted_path.is_file():
-            torch.save({"params": state}, converted_path)
-        model_path = converted_path
-    return RealESRGANer(
-        scale=int(selected["network_scale"]),
-        model_path=str(model_path),
-        model=model,
-        tile=tile_size,
-        tile_pad=tile_pad,
-        pre_pad=0,
-        half=False,
-        device=torch.device("cpu"),
-        gpu_id=None,
-    )
+    from upscale_backend import Upscaler
+    return Upscaler(profile_id, tile_size, tile_pad, device, precision)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    add_runtime_arguments(parser)
     parser.add_argument("source", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--realesrgan-repo", type=Path, required=True)
@@ -106,7 +59,10 @@ def main() -> None:
     bleed_output = args.output / "alpha_bleed"
     bleed_output.mkdir(parents=True, exist_ok=True)
     selected_profile = huggingface_realesrgan.profile(args.model_profile)
-    upsampler = _load_realesrgan(args.model_profile, args.tile_size, args.tile_pad)
+    device = "cpu" if selected_profile["architecture"] == "traditional" else resolve_device(args.device)
+    upsampler = _load_realesrgan(args.model_profile, args.tile_size, args.tile_pad, device, args.precision)
+    if device == "cuda":
+        torch.cuda.reset_peak_memory_stats()
 
     import sprite_render  # noqa: PLC0415
 
@@ -182,17 +138,21 @@ def main() -> None:
         "alpha_bleed_radius": args.bleed_radius,
         "alpha_filter": args.alpha_filter,
         "mask": "source_alpha_resized",
-        "rgb_resize_filter": "opencv_inter_cubic" if selected_profile["architecture"] == "traditional" else "realesrgan_internal_lanczos4",
+        "rgb_resize_filter": "opencv_inter_cubic" if selected_profile["architecture"] == "traditional" else (
+            "opencv_lanczos4" if selected_profile["network_scale"] != args.scale else "native_model_scale"),
         "realesrgan": {
-            "implementation": "xinntao/Real-ESRGAN",
+            "implementation": "spandrel" if upsampler else "opencv",
             "model_profile": args.model_profile,
-            "model": selected_profile.get("repo_id", "opencv.INTER_CUBIC"),
-            "network_scale": 4,
+            "model": selected_profile.get("repo_id", selected_profile.get("url", "opencv.INTER_CUBIC")),
+            "network_scale": selected_profile["network_scale"],
             "output_scale": args.scale,
-            "device": "cpu",
-            "precision": "fp32",
+            "device": device,
+            "precision": args.precision if upsampler else "uint8",
+            "weight_sha256": upsampler.sha256 if upsampler else None,
+            "peak_vram_bytes": torch.cuda.max_memory_allocated() if device == "cuda" else 0,
             "tile_size": args.tile_size,
             "tile_pad": args.tile_pad,
+            "tiling": "full_frame_global_context" if selected_profile["architecture"] == "realcugan" else "padded_tiles",
             "images": len(inputs),
             "elapsed_seconds": round(time.monotonic() - started, 3),
         },

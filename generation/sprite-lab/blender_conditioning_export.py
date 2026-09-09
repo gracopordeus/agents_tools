@@ -23,6 +23,12 @@ import numpy as np
 from bpy_extras.object_utils import world_to_camera_view  # type: ignore
 from mathutils import Vector  # type: ignore
 
+try:
+    from skeleton_filter import keep_skeleton_bone
+except ImportError:  # blender --python nem sempre põe o dir do script no path
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from skeleton_filter import keep_skeleton_bone
+
 
 ROLES = (
     "head",
@@ -46,6 +52,7 @@ ROLE_COLORS = {
     "accessory": (233, 30, 99, 255),
     "other": (189, 195, 199, 255),
 }
+DEPTH_RANGE_DEFAULT = (0.1, 20.0)
 NAME_ROLE_HINTS = (
     ("weapon", "weapon"),
     ("sword", "weapon"),
@@ -185,6 +192,21 @@ def _render_with_overrides(
                     slot.material = material
             else:
                 obj.data.materials.clear()
+
+
+def _render_neutral_beauty(
+    scene: bpy.types.Scene,
+    objects: list[bpy.types.Object],
+    path: Path,
+) -> None:
+    """Render geometry with a neutral clay material for img2img init."""
+    clay = _material("__generation_neutral_clay", (128, 128, 128, 255))
+    _render_with_overrides(
+        scene,
+        objects,
+        {role: clay for role in ROLES},
+        path,
+    )
 
 
 def _render_depth_material(
@@ -458,21 +480,26 @@ def _draw_line(pixels: np.ndarray, first: tuple[int, int], second: tuple[int, in
 
 
 def _write_skeleton(scene: bpy.types.Scene, camera: bpy.types.Object, path: Path, width: int, height: int) -> dict[str, Any]:
+    """Render the filtered, projected Blender deform bones as white lines."""
     pixels = np.zeros((height, width, 4), dtype=np.uint8)
     bones: list[dict[str, Any]] = []
     for obj in scene.objects:
         if obj.type != "ARMATURE" or not obj.visible_get():
             continue
         for bone in obj.pose.bones:
+            if not keep_skeleton_bone(
+                bone.name, bool(getattr(bone.bone, "use_deform", True))
+            ):
+                continue
             head = obj.matrix_world @ bone.head
             tail = obj.matrix_world @ bone.tail
             head_px = _project(camera, scene, head, width, height)
             tail_px = _project(camera, scene, tail, width, height)
             item: dict[str, Any] = {"name": bone.name}
             if head_px and tail_px:
-                _draw_line(pixels, head_px, tail_px, (255, 255, 255, 255))
                 item["head"] = list(head_px)
                 item["tail"] = list(tail_px)
+                _draw_line(pixels, head_px, tail_px, (255, 255, 255, 255))
             bones.append(item)
     image = bpy.data.images.new(f"conditioning_skeleton_{path.stem}", width=width, height=height, alpha=True)
     # Blender's image buffer is bottom-up while projected pixel coordinates are top-down.
@@ -482,7 +509,7 @@ def _write_skeleton(scene: bpy.types.Scene, camera: bpy.types.Object, path: Path
     path.parent.mkdir(parents=True, exist_ok=True)
     image.save()
     bpy.data.images.remove(image)
-    return {"bones": bones}
+    return {"bones": bones, "format": "blender_projected_deform_bones", "bone_count": len(bones)}
 
 
 def _write_pose_heatmap(
@@ -560,7 +587,7 @@ def export(request: dict[str, Any]) -> dict[str, Any]:
     white = _material("__generation_silhouette_white", (255, 255, 255, 255))
     materials = {role: _material(f"__generation_seg_{role}", color) for role, color in ROLE_COLORS.items()}
     camera = scene.camera
-    depth_range = request.get("depth_range", [0.0, 100.0])
+    depth_range = request.get("depth_range", list(DEPTH_RANGE_DEFAULT))
     depth_near, depth_far = float(depth_range[0]), float(depth_range[1])
     if depth_near >= depth_far:
         raise ValueError("depth_range inválido")
@@ -571,7 +598,10 @@ def export(request: dict[str, Any]) -> dict[str, Any]:
         beauty = output / "beauty" / f"{frame_id}.png"
         silhouette = output / "silhouette" / f"{frame_id}.png"
         segmentation = output / "segmentation" / f"{frame_id}.png"
-        _render(scene, beauty)
+        if str(request.get("beauty_mode", "neutral")).casefold() == "original":
+            _render(scene, beauty)
+        else:
+            _render_neutral_beauty(scene, objects, beauty)
         _render_with_overrides(scene, objects, {role: white for role in ROLES}, silhouette)
         _render_with_overrides(scene, objects, materials, segmentation)
         channels = {
@@ -628,6 +658,7 @@ def export(request: dict[str, Any]) -> dict[str, Any]:
         "profile_id": request.get("profile_id"),
         "engine": render_engine,
         "depth_mode": depth_config["mode"] if depth_config else None,
+        "depth_range": [depth_near, depth_far] if depth_config else None,
         "channels": sorted({channel for frame in frame_manifest for channel in frame["channels"]}),
         "frames": frame_manifest,
         "role_colors": ROLE_COLORS,

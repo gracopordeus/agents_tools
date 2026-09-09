@@ -14,6 +14,7 @@ from PIL import Image
 
 import chroma_despill
 import huggingface_realesrgan
+from postprocess_runtime import add_runtime_arguments, resolve_device
 import sprite_render
 from waifu2x_cunet_scale import alpha_bleed
 
@@ -36,6 +37,63 @@ def _mask_from_image(image: Image.Image, size: tuple[int, int]) -> Image.Image:
     else:
         mask = image.convert("L")
     return mask.resize(size, Image.Resampling.NEAREST)
+
+
+def build_lineart_layer(image: Image.Image, lineart: Image.Image, strength: float) -> Image.Image:
+    """Build a white, transparent lineart layer without altering the beauty frame."""
+    if not 0.0 <= strength <= 1.0:
+        raise ValueError("lineart-strength deve estar entre 0 e 1")
+    result = image.convert("RGBA")
+    if strength == 0:
+        result.putdata([(255, 255, 255, 0)] * (result.width * result.height))
+        return result
+    resized = lineart.convert("RGBA").resize(result.size, Image.Resampling.LANCZOS)
+    line_alpha = np.asarray(resized.getchannel("A"), dtype=np.float32) * strength
+    output_alpha = np.asarray(result.getchannel("A"), dtype=np.float32)
+    mask = Image.fromarray(np.minimum(line_alpha, output_alpha).astype(np.uint8), mode="L")
+    layer = Image.new("RGBA", result.size, (255, 255, 255, 0))
+    layer.putalpha(mask)
+    resized.close()
+    mask.close()
+    result.close()
+    return layer
+
+
+def _detector_output_as_lineart(image: Image.Image) -> Image.Image:
+    """Convert a detector's grayscale map to transparent black linework."""
+    grayscale = np.asarray(image.convert("L"), dtype=np.uint8)
+    # ControlNet annotators are not all consistent about polarity. Their
+    # conditioning convention is normalized here to bright lines on black.
+    if float(grayscale.mean()) > 127.0:
+        grayscale = 255 - grayscale
+    alpha = Image.fromarray(grayscale, mode="L")
+    result = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    result.putalpha(alpha)
+    alpha.close()
+    return result
+
+
+def _black_composite(image: Image.Image) -> Image.Image:
+    """Make a detector input without leaking transparent RGB into the map."""
+    background = Image.new("RGBA", image.size, (0, 0, 0, 255))
+    background.alpha_composite(image.convert("RGBA"))
+    return background.convert("RGB")
+
+
+def _build_ordered_gif(output: Path, rows: int, phases: int, fps: float) -> Path:
+    """Build the runtime direction-order GIF for an exported layer."""
+    frame_paths = [
+        output / f"row{row}_col{phase}.png"
+        for row in range(rows)
+        for phase in range(phases)
+    ]
+    if not all(path.is_file() for path in frame_paths):
+        raise RuntimeError("frames insuficientes para o GIF unificado da camada")
+    return sprite_render._write_gif(
+        frame_paths,
+        output / "animation_all_directions_1-2-5-4-3-8-7-6.gif",
+        fps,
+    )
 
 
 def preclean_cell(
@@ -95,6 +153,7 @@ def preclean_cell(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    add_runtime_arguments(parser)
     parser.add_argument("source", type=Path)
     parser.add_argument("mask_source", type=Path)
     parser.add_argument("output", type=Path)
@@ -112,15 +171,51 @@ def main() -> None:
     parser.add_argument("--tolerance", type=float, default=2.0)
     parser.add_argument("--key-color", type=int, nargs=3)
     parser.add_argument("--final-bleed-radius", type=int, default=8)
+    parser.add_argument("--lineart-dir", type=Path,
+                        help="raiz com lineart/row*_col*.png; omitido desativa aplicação")
+    parser.add_argument(
+        "--lineart-mode",
+        choices=("blender", "lineart_standard", "lineart_coarse", "lineart_anime", "none"),
+        default="blender",
+        help="fonte do lineart final: Blender, detector ControlNet por frame ou desligado",
+    )
+    parser.add_argument("--lineart-strength", type=float, default=0.85)
     parser.add_argument("--foot-anchor", type=int, nargs=2, default=(128, 220))
     args = parser.parse_args()
 
     if not args.source.is_file() or not args.mask_source.is_dir():
         raise FileNotFoundError("source ou mask_source ausente")
+    if not 0.0 <= args.lineart_strength <= 1.0:
+        raise ValueError("lineart-strength deve estar entre 0 e 1")
+    if args.lineart_dir is not None and not args.lineart_dir.is_dir():
+        raise FileNotFoundError("lineart-dir ausente")
+    if args.lineart_mode == "blender" and args.lineart_dir is None:
+        # Keep direct CLI compatibility: no structural directory means no
+        # Blender overlay, while the explicit detector mode remains strict.
+        lineart_applied = False
+    else:
+        lineart_applied = args.lineart_mode != "none"
+    lineart_detector = None
+    lineart_device = None
+    if args.lineart_mode in ("lineart_standard", "lineart_coarse", "lineart_anime"):
+        if args.lineart_mode in ("lineart_standard", "lineart_coarse"):
+            from controlnet_aux import LineartDetector
+
+            detector_class = LineartDetector
+        else:
+            from controlnet_aux import LineartAnimeDetector
+
+            detector_class = LineartAnimeDetector
+
+        lineart_device = resolve_device(args.device)
+        lineart_detector = detector_class.from_pretrained("lllyasviel/Annotators").to(lineart_device)
     args.output.mkdir(parents=True, exist_ok=True)
     preclean_dir = args.output / "preclean_256"
     upscaled_dir = args.output / "realesrgan_512"
+    lineart_output = args.output / "lineart" if lineart_applied else None
     preclean_dir.mkdir(parents=True, exist_ok=True)
+    if lineart_output is not None:
+        lineart_output.mkdir(parents=True, exist_ok=True)
 
     with Image.open(args.source) as opened:
         sheet = opened.convert("RGB")
@@ -162,6 +257,8 @@ def main() -> None:
             str(Path(__file__).with_name("realesrgan_anime_scale.py")),
             str(preclean_dir),
             str(upscaled_dir),
+            "--device", args.device,
+            "--precision", args.precision,
             "--realesrgan-repo",
             str(args.realesrgan_repo),
             "--model-profile",
@@ -200,7 +297,38 @@ def main() -> None:
             frame.putalpha(final_alpha)
             result = alpha_bleed(frame, args.final_bleed_radius)
             result.putalpha(final_alpha)
+            lineart_layer = None
+            if args.lineart_mode == "blender" and args.lineart_dir is not None:
+                candidate = args.lineart_dir / "lineart" / name
+                if not candidate.is_file():
+                    candidate = args.lineart_dir / name
+                if not candidate.is_file():
+                    raise FileNotFoundError(f"lineart ausente: {name}")
+                with Image.open(candidate) as opened_lineart:
+                    lineart_layer = build_lineart_layer(
+                        result, opened_lineart, args.lineart_strength
+                    )
+            elif args.lineart_mode in ("lineart_standard", "lineart_coarse", "lineart_anime"):
+                detector_input = _black_composite(result)
+                detector_kwargs = {
+                    "detect_resolution": final_size[0],
+                    "image_resolution": final_size[0],
+                    "output_type": "pil",
+                }
+                if args.lineart_mode in ("lineart_standard", "lineart_coarse"):
+                    detector_kwargs["coarse"] = args.lineart_mode == "lineart_coarse"
+                detected = lineart_detector(detector_input, **detector_kwargs)
+                detected_lineart = _detector_output_as_lineart(detected)
+                lineart_layer = build_lineart_layer(
+                    result, detected_lineart, args.lineart_strength
+                )
+                detector_input.close()
+                detected.close()
+                detected_lineart.close()
             result.save(args.output / name, format="PNG")
+            if lineart_layer is not None and lineart_output is not None:
+                lineart_layer.save(lineart_output / name, format="PNG")
+                lineart_layer.close()
             frame.close()
             final_alpha.close()
             result.close()
@@ -214,6 +342,39 @@ def main() -> None:
     diagonal, diagonal_sequence = sprite_render._build_upscaled_diagonal_gif(
         args.output, args.rows, args.phases, args.fps
     )
+    lineart_sheet = None
+    lineart_gifs: dict[str, Path] = {}
+    lineart_legacy = None
+    lineart_ordered = None
+    if lineart_output is not None:
+        lineart_sheet = sprite_render._build_sheet(
+            lineart_output, args.rows, args.phases, final_size[0]
+        )
+        lineart_gifs = sprite_render._build_gifs(
+            lineart_output, args.rows, args.phases, args.fps, directions
+        )
+        lineart_legacy = sprite_render._build_gif(
+            lineart_output, args.phases, args.fps
+        )
+        lineart_ordered = _build_ordered_gif(
+            lineart_output, args.rows, args.phases, args.fps
+        )
+    lineart_export = {
+        "enabled": lineart_output is not None,
+        "mode": args.lineart_mode,
+        "color": "white",
+        "background": "transparent",
+        "composite": "separate_runtime_layer",
+        "directory": "lineart" if lineart_output is not None else None,
+        "spritesheet": (
+            str(lineart_sheet.relative_to(args.output))
+            if lineart_sheet is not None
+            else None
+        ),
+        "gifs": {direction: path.name for direction, path in lineart_gifs.items()},
+        "legacy_gif": lineart_legacy.name if lineart_legacy else None,
+        "ordered_gif": lineart_ordered.name if lineart_ordered else None,
+    }
     metadata = {
         "schema": "sprite_lab.pregan_realesrgan_reuse_mask/v1",
         "source": str(args.source.resolve()),
@@ -231,7 +392,25 @@ def main() -> None:
             "realesrgan_2x",
             "reapply_approved_512_mask",
             "alpha_bleed",
+            f"lineart_export_{args.lineart_mode}" if lineart_applied else "lineart_disabled",
         ],
+        "lineart": {
+            "mode": args.lineart_mode,
+            "applied": lineart_applied,
+            "source": str(args.lineart_dir.resolve()) if args.lineart_mode == "blender" and args.lineart_dir else (
+                "lllyasviel/Annotators:LineartDetector" if args.lineart_mode in ("lineart_standard", "lineart_coarse") else (
+                    "lllyasviel/Annotators:LineartAnimeDetector" if args.lineart_mode == "lineart_anime" else None
+                )
+            ),
+            "strength": args.lineart_strength if lineart_applied else 0.0,
+            "mask": "source_alpha_intersection",
+            "composite_color": "white",
+            "composite": "separate_spritesheet",
+            "spritesheet": lineart_export["spritesheet"],
+            "device": lineart_device,
+            "per_frame": args.lineart_mode in ("lineart_standard", "lineart_coarse", "lineart_anime"),
+        },
+        "lineart_export": lineart_export,
         "preclean": {
             "tolerance": args.tolerance,
             "reports": preclean_reports,

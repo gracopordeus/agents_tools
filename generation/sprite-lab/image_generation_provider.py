@@ -27,6 +27,7 @@ OPENAI_MASK_GUARD_PX = 8
 OPENAI_MASK_GRID_COUNT = 8
 GEMINI_TEMPERATURE = 1.0
 GEMINI_TOP_K = 64
+SUPPORTED_OUTPUT_SIZES = ((1024, 1024), (2048, 2048))
 
 _PROVIDER_ALIASES = {
     "dry": "dry-run",
@@ -70,6 +71,28 @@ class ImageGenerationProvider(Protocol):
 
     def generate(self, request: GenerationRequest) -> GenerationResult:
         """Generate one raster image and return its local output path."""
+
+
+def _requested_output_size(request: GenerationRequest) -> tuple[int, int]:
+    """Return the canonical square size requested by the AI Render job."""
+    raw_size = request.metadata.get("output_size", [2048, 2048])
+    if not isinstance(raw_size, (list, tuple)) or len(raw_size) != 2:
+        raise ValueError("output_size deve ser 1024x1024 ou 2048x2048")
+    dimensions: list[int] = []
+    for value in raw_size:
+        if isinstance(value, bool):
+            raise ValueError("output_size deve ser 1024x1024 ou 2048x2048")
+        try:
+            dimension = int(value)
+        except (TypeError, ValueError):
+            raise ValueError("output_size deve ser 1024x1024 ou 2048x2048") from None
+        if isinstance(value, float) and dimension != value:
+            raise ValueError("output_size deve ser 1024x1024 ou 2048x2048")
+        dimensions.append(dimension)
+    output_size = (dimensions[0], dimensions[1])
+    if output_size not in SUPPORTED_OUTPUT_SIZES:
+        raise ValueError("output_size deve ser 1024x1024 ou 2048x2048")
+    return output_size
 
 
 def _write_request(
@@ -206,6 +229,7 @@ class OpenAIImageProvider:
             input_images=input_images,
         )
         client = OpenAI(api_key=self.api_key)
+        output_width, output_height = _requested_output_size(request)
         handles = [path.open("rb") for path in input_images]
         try:
             image_argument: Any = handles[0] if len(handles) == 1 else handles
@@ -217,7 +241,7 @@ class OpenAIImageProvider:
                 # remain transparent for direct use as a game sprite asset.
                 background="transparent",
                 output_format="png",
-                size="2048x2048",
+                size=f"{output_width}x{output_height}",
             )
         finally:
             for handle in handles:
@@ -271,6 +295,7 @@ class GoogleImageProvider:
             raise RuntimeError("instale google-genai para usar o provider google") from exc
         if not request.input_images:
             raise ValueError("o provider google exige ao menos uma imagem de referência")
+        output_width, _ = _requested_output_size(request)
         _write_request(request, self.name)
         client = genai.Client(api_key=self.api_key)
         contents: list[Any] = [request.prompt]
@@ -285,7 +310,7 @@ class GoogleImageProvider:
                 top_k=int(request.metadata.get("gemini_top_k", GEMINI_TOP_K)),
                 image_config=types.ImageConfig(
                     aspect_ratio="1:1",
-                    image_size="2K",
+                    image_size="1K" if output_width == 1024 else "2K",
                 ),
             ),
         )
@@ -355,14 +380,8 @@ class QwenImageProvider:
                 {"text": request.prompt},
             ],
         }]
-        output_size = request.metadata.get("output_size", [2048, 2048])
-        if (
-            not isinstance(output_size, (list, tuple))
-            or len(output_size) != 2
-            or any(int(value) <= 0 for value in output_size)
-        ):
-            raise ValueError("output_size inválido para o provider qwen")
-        size = f"{int(output_size[0])}*{int(output_size[1])}"
+        output_width, output_height = _requested_output_size(request)
+        size = f"{output_width}*{output_height}"
         negative_prompt = str(
             request.metadata.get(
                 "qwen_negative_prompt",

@@ -1,0 +1,33 @@
+name: sprite-lab tests
+
+on:
+  push:
+    paths:
+      - "generation/**"
+      - ".github/workflows/sprite-lab-tests.yml"
+  pull_request:
+    paths:
+      - "generation/**"
+
+jobs:
+  unittest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: install test dependencies
+        run: python3 -m pip install numpy Pillow
+      - name: generation tests
+        working-directory: generation
+        run: python3 -m unittest discover -s tests
+      - name: sprite-lab tests
+        working-directory: generation/sprite-lab
+        # Optional-dependency suites (cv2/scipy) self-skip; Blender-backed
+        # routes are covered by unit tests with mocks, never live Blender.
+        run: |
+          python3 -m unittest discover -s tests
+      - name: frontend syntax
+        working-directory: generation/sprite-lab
+        run: node --check web/app.js && node --check web/viewer.js

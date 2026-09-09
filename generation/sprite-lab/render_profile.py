@@ -124,8 +124,11 @@ def normalize_manifest(value: Any) -> dict[str, Any]:
         raise ValueError("vertical_margin_px deve ficar dentro da célula")
     directions = int(value.get("directions", 8))
     phases = int(value.get("phases", 8))
-    if directions not in {5, 8}:
-        raise ValueError("directions deve ser 5 ou 8 no contrato atual")
+    # Tiles/static props render a single direction; characters use 5 or 8.
+    # tile_reference_v1.json ships directions=1 and list_profiles() must not
+    # crash on it (it broke GET /api/render-profiles entirely).
+    if directions not in {1, 5, 8}:
+        raise ValueError("directions deve ser 1, 5 ou 8 no contrato atual")
     if not 1 <= phases <= 32:
         raise ValueError("phases deve ficar entre 1 e 32")
     camera_preset = str(value.get("camera_preset") or "").strip().casefold() or None

@@ -86,11 +86,24 @@ export DASHSCOPE_API_KEY="..."
 
 Os modelos disponíveis são `gpt-image-2` para OpenAI e
 `qwen-image-3.0-pro` (padrão) ou `qwen-image-3.0` para Qwen. O formulário permite escolher quais referências Blender
-(`beauty`, `bones` e `lineart`) serão enviadas. A referência de identidade é
-enviada separadamente; no Qwen, podem ser selecionadas até duas referências
-Blender para respeitar o limite de três imagens por chamada. O output retornado
+(`beauty`, `bones` e `lineart`) serão enviadas. Antes da chamada, a pipeline
+gera automaticamente uma imagem `lineart_standard` da referência de identidade
+com o `controlnet_aux.LineartDetector`; ela é enviada como a segunda imagem,
+logo depois do conceito original. A imagem original continua sendo a autoridade
+para aparência, cores, materiais e estilo, enquanto a lineart guia apenas
+contorno e silhueta. No Qwen, pode ser selecionada até uma referência Blender
+para respeitar o limite de três imagens por chamada. O output retornado
 pela URL temporária da Qwen Cloud é baixado imediatamente e validado como PNG
-2048×2048.
+1024×1024 ou 2048×2048. A grade permanece 8×8: a opção 1K usa células de
+128×128, enquanto a opção 2K usa células de 256×256. Quando um output 1K entra
+no pós-processamento, cada célula é ampliada isoladamente para 256×256 antes
+do passe de máscara e do upscale neural final, mantendo a saída de jogo em
+512×512 por frame.
+
+O AI Render permite escolher o preprocessamento do segundo input derivado do
+concept: `lineart_standard` ou `canny_edges`. O teste atual usa `canny_edges`,
+com thresholds 100/200, mantendo o concept original como primeiro input e
+autoridade visual.
 
 Se o token começar com `sk-sp-` (Token Plan), o provider seleciona
 automaticamente `https://token-plan.ap-southeast-1.maas.aliyuncs.com/api/v1`.
@@ -286,11 +299,16 @@ uma relação v2 para não quebrar clientes legados.
 - `GET /api/asset-contract`
 - `POST /api/annotate`
 - `POST /api/annotate-action`
-- `POST /api/relationships`
+- `POST /api/relationships` (202 + job; poll em `GET /api/maintenance/jobs/<job-id>`; `{"mode": "sync"}` mantém o 201 bloqueante legado)
+- `POST /api/relationships/delete` (202 + job; mesmo poll)
+- `GET /api/maintenance/jobs`, `GET /api/maintenance/jobs/<job-id>`
 - `GET /composition-exports/<arquivo>.glb`
 - `POST /api/sprite-render`
 - `GET /api/sprite-jobs/<job-id>/download`
-- `POST /api/reindex`
+- `POST /api/reindex` (202 + job; mesmo poll; `{"mode": "sync"}` legado)
+- `POST /api/env-atlas` (202 + job por padrão; poll em `GET /api/env-atlas/jobs/<job-id>`; `{"mode": "sync"}` legado)
+- `GET /api/health` (probe p/ load balancer: status, uptime, contadores, cache)
+- `POST /api/events` (telemetria de navegação do frontend, 202; rate-limit 30/min/IP, 429 com `Retry-After`)
 
 As renderizações de sprites ficam em
 `tools/generation/sprite-lab/work/sprite-renders/<job-id>/` e incluem as células,
@@ -548,3 +566,10 @@ centraliza o personagem pelo movimento dos quadris e preserva os componentes
 anexados na composição. O contrato `sprite_lab.sprite_render/v1` não depende de
 uma engine de jogo; adaptadores podem consumir as células ou o manifesto
 gerado.
+
+O canal `bones` é gerado pelo próprio Blender a partir da armature projetada
+na câmera. Apenas bones de deformação da cadeia corporal são exportados:
+tronco, pescoço/cabeça, clavículas, braços/mãos e pernas/pés. `root`, dedos,
+ossos terminais e controladores de rig ficam fora do canal por meio de
+`skeleton_filter.py`. O PNG resultante é uma imagem em escala de cinza com
+linhas brancas, e o metadata registra `blender_armature_deform`.

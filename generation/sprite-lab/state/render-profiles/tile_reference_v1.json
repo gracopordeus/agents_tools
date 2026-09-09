@@ -16,7 +16,7 @@
   "directions": 1,
   "phases": 1,
   "ground_z": 0.0,
-  "camera_preset": "top_down",
+  "camera_preset": null,
   "tile_config": {
     "description": "Configuração específica para tiles — 1 nav-cell ≈ 1m, ortho_scale calibrado para costura perfeita.",
     "nav_cell_world_size": 1.0,

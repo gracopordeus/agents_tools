@@ -52,6 +52,7 @@ const IMAGE_PROVIDER_DEFAULT_BACKGROUNDS = Object.freeze({
   qwen: "transparent",
 });
 const AI_RENDER_REFERENCE_CHANNELS = Object.freeze(["beauty", "bones", "lineart", "frame_control"]);
+const IDENTITY_GUIDE_MODES = Object.freeze(["lineart_standard", "canny_edges"]);
 const DEFAULT_GEMINI_TEMPERATURE = 1;
 const DEFAULT_GEMINI_TOP_K = 64;
 
@@ -92,6 +93,15 @@ function selectedIdentityReferenceName() {
     || "identity reference";
 }
 
+function selectedIdentityGuideMode() {
+  const mode = $("#gemini-identity-lineart-mode")?.value;
+  return IDENTITY_GUIDE_MODES.includes(mode) ? mode : "canny_edges";
+}
+
+function identityGuideLabel(mode) {
+  return mode === "canny_edges" ? "Canny edges" : "Lineart standard";
+}
+
 function isLegacyFixedAiPrompt(value) {
   const prompt = String(value || "");
   return /spritesheetContract:|Use the uploaded 8x8|Blender row contract|\bR1\s*=|\bROW\s*1\s*=/i.test(prompt);
@@ -114,13 +124,38 @@ function updateReferenceChannelControls() {
   const provider = selectedImageProvider();
   const count = $("#gemini-channel-count");
   const help = $("#gemini-channel-help");
-  if (count) count.textContent = `${selected.length}/${provider === "qwen" ? 2 : 4} selecionadas`;
+  if (count) count.textContent = `${selected.length}/${provider === "qwen" ? 1 : 4} selecionadas`;
   if (help) {
     help.textContent = provider === "qwen"
-      ? "Qwen: a identidade ocupa uma entrada; selecione até duas referências estruturais, incluindo opcionalmente Frame Control."
+      ? "Qwen: a identidade e o guia derivado ocupam duas entradas; selecione até uma referência estrutural."
       : "Selecione as referências estruturais que o provider deve receber junto com a identidade. Frame Control delimita cada box de 256×256 e não aparece no output.";
   }
   updateAiRenderSummary();
+}
+
+function selectedAiRenderOutputSize() {
+  return Number($("#gemini-output-size")?.value || 2048) === 1024 ? 1024 : 2048;
+}
+
+function aiRenderOutputSize(value) {
+  const output = value?.output;
+  const reportSize = value?.report?.output_size;
+  const payloadSize = value?.payload?.output_size;
+  const renderSpecSize = value?.payload?.render_spec?.output;
+  const candidate = Array.isArray(value)
+    ? value[0]
+    : reportSize?.[0] ?? payloadSize?.[0] ?? renderSpecSize?.width ?? output?.width;
+  return Number(candidate) === 1024 ? 1024 : 2048;
+}
+
+function aiRenderOutputLabel(value) {
+  const size = aiRenderOutputSize(value);
+  return `${size}×${size}`;
+}
+
+function updateAiRenderOutputSizeStatus() {
+  const status = $("#gemini-output-size-status");
+  if (status) status.textContent = aiRenderOutputLabel({ output: { width: selectedAiRenderOutputSize() } });
 }
 
 function updateAiRenderSummary() {
@@ -132,11 +167,12 @@ function updateAiRenderSummary() {
   if (!$("#gemini-reference")?.files?.length && !$("#gemini-reference-cache")?.value) issues.push("referência de identidade");
   const channels = selectedReferenceChannels();
   if (!channels.length) issues.push("referência estrutural");
-  if (selectedImageProvider() === "qwen" && channels.length > 2) issues.push("limite de 2 referências do Qwen");
+  if (selectedImageProvider() === "qwen" && channels.length > 1) issues.push("limite de 1 referência estrutural do Qwen");
   summary.classList.toggle("error", issues.length > 0);
   summary.textContent = issues.length
     ? `${issues.length} ${issues.length === 1 ? "item precisa" : "itens precisam"} de atenção: ${issues.join(", ")}.`
-    : `${channels.length + 1} referências · 64 células · ${imageProviderLabel(selectedImageProvider())}`;
+    : `${channels.length + 2} referências · 64 células · ${aiRenderOutputLabel({ output: { width: selectedAiRenderOutputSize() } })} · ${imageProviderLabel(selectedImageProvider())}`;
+  updateAiRenderOutputSizeStatus();
 }
 
 function updateImageProviderControls() {
@@ -166,6 +202,7 @@ function updateImageProviderControls() {
       ? "Gemini: verde-limão puro #00FF00, aplicado automaticamente pelo provider."
       : "Background off: áreas vazias transparentes, aplicado automaticamente pelo provider.";
   }
+  updateAiRenderOutputSizeStatus();
   if (button && !button.disabled) button.textContent = "Gerar spritesheet";
   updateReferenceChannelControls();
 }
@@ -222,6 +259,7 @@ function aiRenderSpecFormValues(spec) {
   const style = asset.style || {};
   const camera = spec.camera || {};
   const framing = spec.framing || {};
+  const output = spec.output || {};
   const set = (id, value) => {
     const field = $(`#${id}`);
     if (field && value != null) field.value = value;
@@ -231,6 +269,7 @@ function aiRenderSpecFormValues(spec) {
   set("gemini-global-description", asset.global_description || "");
   set("gemini-style-preset", style.preset || "");
   set("gemini-style-description", style.description || "");
+  set("gemini-output-size", Number(output.width) === 1024 && Number(output.height) === 1024 ? 1024 : 2048);
   set("gemini-background", selectedImageBackground());
   set("gemini-camera-projection", camera.projection || "orthographic");
   set("gemini-camera-preset", camera.preset || "isometric");
@@ -302,12 +341,16 @@ function renderAiRenderRows() {
 
 function readAiRenderSpecFromForm() {
   const spec = cloneValue(state.aiRenderSpec || aiRenderDefaultSpec());
+  spec.output = spec.output || {};
   const value = (id, fallback = "") => $(`#${id}`)?.value ?? fallback;
   const numberValue = (id, fallback) => {
     const parsed = Number(value(id, fallback));
     return Number.isFinite(parsed) ? parsed : fallback;
   };
   spec.version = "2.0";
+  const outputSize = selectedAiRenderOutputSize();
+  spec.output.width = outputSize;
+  spec.output.height = outputSize;
   spec.output.background = selectedImageBackground();
   spec.output.draw_grid = false;
   spec.asset.mode = value("gemini-asset-mode", "character_animation");
@@ -409,6 +452,7 @@ async function refreshCompiledPrompt() {
         render_spec: spec,
         provider: selectedImageProvider(),
         reference_name: selectedIdentityReferenceName(),
+        identity_lineart_mode: selectedIdentityGuideMode(),
         reference_channels: selectedReferenceChannels(),
         blender_channels: selectedReferenceChannels().filter((channel) => channel !== "frame_control"),
         additional_instructions: $("#gemini-prompt")?.value.trim() || "",
@@ -556,6 +600,24 @@ async function api(path, options = {}) {
   const data = await response.json();
   if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
   return data;
+}
+
+// Poll a 202-accepted background job until done/error/timeout. Used by the
+// maintenance queue (reindex, relationships) and env-atlas: POST returns the
+// queued job, GET .../jobs/{id} reports its lifecycle.
+async function pollJobStatus(url, { intervalMs = 1500, timeoutMs = 600000 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const job = await api(url);
+    if (job.status === "done") return job;
+    if (job.status === "error") throw new Error(job.error || "job falhou");
+    if (Date.now() > deadline) throw new Error("tempo esgotado aguardando o job");
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+}
+
+function isQueuedJob(value) {
+  return Boolean(value) && (value.status === "queued" || value.status === "running") && typeof value.id === "string";
 }
 
 function esc(value) {
@@ -718,6 +780,25 @@ function toast(message, error = false) {
   box.style.borderColor = error ? "var(--red)" : "var(--green)";
   box.style.color = error ? "var(--red)" : "var(--green)";
   setTimeout(() => { box.hidden = true; }, 2800);
+}
+
+// Telemetry beacon: navigation/interaction events for POST /api/events.
+// Fire-and-forget on purpose — telemetry must never break the UI. See
+// observability.FRONTEND_EVENTS for the shared event taxonomy.
+function emitLabEvent(name, props = {}) {
+  try {
+    const body = JSON.stringify({ name, props });
+    if (navigator.sendBeacon) {
+      const blob = new Blob([body], { type: "application/json" });
+      if (navigator.sendBeacon("/api/events", blob)) return;
+    }
+    fetch("/api/events", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+      keepalive: true,
+    }).catch(() => {});
+  } catch (error) { /* ignore */ }
 }
 
 function closeSettingsMenu() {
@@ -1190,6 +1271,7 @@ function switchPage(pageId, { updateHistory = true } = {}) {
     renderPostprocessJobs();
     if (state.selectedPostprocessJob) renderPostprocessJob(state.selectedPostprocessJob);
   }
+  emitLabEvent("page_view", { page: nextPageId });
 }
 
 function uiComponent(value = {}, index = 0) {
@@ -1698,12 +1780,17 @@ async function confirmDeleteComposition() {
   const button = $("#confirm-delete-composition");
   button.disabled = true;
   try {
-    await api("/api/relationships/delete", { method: "POST", body: { relationship_id: id } });
+    const submitted = await api("/api/relationships/delete", { method: "POST", body: { relationship_id: id } });
+    const completed = isQueuedJob(submitted)
+      ? await pollJobStatus(`/api/maintenance/jobs/${submitted.id}`)
+      : { status: "done", result: submitted };
+    if (completed.status === "error") throw new Error(completed.error || "falha ao deletar composição");
     state.relationships = state.relationships.filter((row) => row.id !== id);
     closeDeleteCompositionPopup();
     populateSpriteCompositions();
     openComposition();
     toast("Composição deletada");
+    emitLabEvent("composition_deleted", { id });
   } catch (error) {
     toast(error.message, true);
   } finally {
@@ -2473,7 +2560,7 @@ function renderGeminiJobs() {
     const provider = imageProviderLabel(job.payload?.provider);
     return `<div class="pipeline-job-card ${state.selectedGeminiJob?.id === job.id ? "selected" : ""}" data-gemini-job-id="${esc(job.id)}">
       <div class="pipeline-job-head"><b>${esc(name)} · ${esc(provider)}</b><span class="job-status ${esc(job.status)}">${esc(pipelineStatusLabel(job.status))}</span></div>
-      <div class="pipeline-job-sub">${esc(source?.label || job.payload?.source_id || "Fonte estrutural")} · ${esc(job.id)}</div>
+      <div class="pipeline-job-sub">${esc(source?.label || job.payload?.source_id || "Fonte estrutural")} · ${esc(aiRenderOutputLabel(job))} · ${esc(job.id)}</div>
     </div>`;
   }).join("") || `<p class="muted">Nenhum render iniciado.</p>`;
   list.querySelectorAll("[data-gemini-job-id]").forEach((card) => {
@@ -2488,18 +2575,21 @@ function renderGeminiJob(job) {
   state.selectedGeminiJob = job;
   const provider = imageProviderLabel(job.payload?.provider);
   const renderName = job.payload?.render_name || job.payload?.reference_name || job.id;
+  const outputSize = aiRenderOutputSize(job);
+  const outputLabel = aiRenderOutputLabel(job);
   if (job.status === "done" && job.outputs?.image) {
     const image = geminiOutputUrl(job.outputs.image);
     const validationImage = job.outputs?.validation ? geminiOutputUrl(job.outputs.validation) : "";
+    const identityLineart = job.outputs?.identity_lineart ? geminiOutputUrl(job.outputs.identity_lineart) : "";
     const previewImage = validationImage || image;
     const source = state.geminiSources.find((item) => item.id === job.payload?.source_id);
     empty.hidden = true;
     detail.hidden = false;
     detail.innerHTML = `
-      <div class="pipeline-output-head"><div><h2>${esc(renderName)}</h2><p>Output ${esc(provider)} · ${esc(source?.label || job.payload?.source_id || "Fonte estrutural")} · 2048×2048</p></div><span class="job-status done">${esc(pipelineStatusLabel(job.status))}</span></div>
-      <figure class="pipeline-main-preview"><div class="ai-render-grid-preview"><button class="sprite-media-trigger pipeline-zoom-trigger" type="button" data-media-open data-media-src="${esc(previewImage)}" data-media-title="Output ${esc(provider)} · 2048×2048" data-media-alt="Spritesheet gerado pelo ${esc(provider)} com grade de validação"><img src="${esc(previewImage)}" alt="Spritesheet gerado pelo ${esc(provider)} com grade de validação"></button></div><figcaption>${validationImage ? "Grade e alertas persistidos apenas para inspeção do AI Render. O PNG original permanece intacto para o restante da pipeline." : "Output original; a validação visual ainda não está disponível para este job."}</figcaption></figure>
-      <div class="pipeline-output-actions"><a class="button-link" href="${esc(image)}" download="${esc(job.id)}_${esc(job.payload?.provider || "openai")}_original_2048.png">Baixar original 2048×2048</a>${validationImage ? `<a class="button-link" href="${esc(validationImage)}" download="${esc(job.id)}_${esc(job.payload?.provider || "openai")}_validation_2048.png">Baixar validação</a>` : ""}<button type="button" class="button-link" data-duplicate-ai-render>Duplicar configuração</button><button type="button" class="primary" data-open-postprocess="${esc(job.id)}">Abrir pós-processamento</button></div>
-      <div class="pipeline-metadata"><span>Nome: ${esc(job.payload?.render_name || job.payload?.reference_name || job.id)}</span><span>64 frames</span><span>8 direções × 8 fases</span><span>Referência: ${esc(job.payload?.reference_name || "não informada")}</span><span>Validated: ${job.validated ? "true" : "false"}</span></div>`;
+      <div class="pipeline-output-head"><div><h2>${esc(renderName)}</h2><p>Output ${esc(provider)} · ${esc(source?.label || job.payload?.source_id || "Fonte estrutural")} · ${esc(outputLabel)}</p></div><span class="job-status done">${esc(pipelineStatusLabel(job.status))}</span></div>
+      <figure class="pipeline-main-preview"><div class="ai-render-grid-preview"><button class="sprite-media-trigger pipeline-zoom-trigger" type="button" data-media-open data-media-src="${esc(previewImage)}" data-media-title="Output ${esc(provider)} · ${esc(outputLabel)}" data-media-alt="Spritesheet gerado pelo ${esc(provider)} com grade de validação"><img src="${esc(previewImage)}" alt="Spritesheet gerado pelo ${esc(provider)} com grade de validação"></button></div><figcaption>${validationImage ? "Grade e alertas persistidos apenas para inspeção do AI Render. O PNG original permanece intacto para o restante da pipeline." : "Output original; a validação visual ainda não está disponível para este job."}</figcaption></figure>
+      <div class="pipeline-output-actions"><a class="button-link" href="${esc(image)}" download="${esc(job.id)}_${esc(job.payload?.provider || "openai")}_original_${outputSize}.png">Baixar original ${esc(outputLabel)}</a>${validationImage ? `<a class="button-link" href="${esc(validationImage)}" download="${esc(job.id)}_${esc(job.payload?.provider || "openai")}_validation_${outputSize}.png">Baixar validação</a>` : ""}${identityLineart ? `<a class="button-link" href="${esc(identityLineart)}" download="${esc(job.id)}_identity_${esc(job.payload?.identity_lineart_mode || "lineart_standard")}.png">Baixar guia da identidade</a>` : ""}<button type="button" class="button-link" data-duplicate-ai-render>Duplicar configuração</button><button type="button" class="primary" data-open-postprocess="${esc(job.id)}">Abrir pós-processamento</button></div>
+      <div class="pipeline-metadata"><span>Nome: ${esc(job.payload?.render_name || job.payload?.reference_name || job.id)}</span><span>64 frames</span><span>8 direções × 8 fases</span><span>Referência: ${esc(job.payload?.reference_name || "não informada")}</span><span>Guia da identidade: ${esc(identityGuideLabel(job.payload?.identity_lineart_mode))} · ${job.payload?.identity_lineart?.cache_hit ? "cache" : "GPU local"}</span><span>Validated: ${job.validated ? "true" : "false"}</span></div>`;
     detail.querySelector("[data-duplicate-ai-render]")?.addEventListener("click", () => duplicateAiRenderJob(job));
     detail.querySelector("[data-open-postprocess]")?.addEventListener("click", () => {
       switchPage("postprocess-page");
@@ -2516,7 +2606,7 @@ function renderGeminiJob(job) {
   empty.hidden = false;
   detail.hidden = true;
   const failed = job.status === "error";
-  empty.innerHTML = `<div class="empty-icon">${failed ? "!" : "◌"}</div><h2>${failed ? `Falha no ${esc(provider)} Render` : "Gerando spritesheet…"}</h2><p>${failed ? esc(imageProviderErrorMessage(job.error, job.payload?.provider)) : `Status: ${esc(pipelineStatusLabel(job.status))}. O output será validado como PNG 2048×2048.`}</p>${failed ? "" : pipelineProgressMarkup(job)}<button type="button" class="button-link" data-duplicate-ai-render>Duplicar configuração</button>`;
+  empty.innerHTML = `<div class="empty-icon">${failed ? "!" : "◌"}</div><h2>${failed ? `Falha no ${esc(provider)} Render` : "Gerando spritesheet…"}</h2><p>${failed ? esc(imageProviderErrorMessage(job.error, job.payload?.provider)) : `Status: ${esc(pipelineStatusLabel(job.status))}. O output será validado como PNG ${esc(outputLabel)}.`}</p>${failed ? "" : pipelineProgressMarkup(job)}<button type="button" class="button-link" data-duplicate-ai-render>Duplicar configuração</button>`;
   empty.querySelector("[data-duplicate-ai-render]")?.addEventListener("click", () => duplicateAiRenderJob(job));
 }
 
@@ -2575,6 +2665,8 @@ function duplicateAiRenderJob(job) {
   if (temperature) temperature.value = payload.gemini_temperature ?? DEFAULT_GEMINI_TEMPERATURE;
   const topK = $("#gemini-top-k");
   if (topK) topK.value = payload.gemini_top_k ?? DEFAULT_GEMINI_TOP_K;
+  const identityGuide = $("#gemini-identity-lineart-mode");
+  if (identityGuide) identityGuide.value = payload.identity_lineart_mode || "lineart_standard";
 
   const legacyChannels = Array.isArray(payload.blender_channels) ? payload.blender_channels : [];
   const selectedChannels = new Set(Array.isArray(payload.reference_channels) ? payload.reference_channels : legacyChannels);
@@ -2697,8 +2789,8 @@ async function generateGemini() {
     toast("Selecione ao menos uma referência estrutural", true);
     return;
   }
-  if (provider === "qwen" && referenceChannels.length > 2) {
-    toast("No Qwen, selecione no máximo duas referências estruturais", true);
+  if (provider === "qwen" && referenceChannels.length > 1) {
+    toast("No Qwen, selecione no máximo uma referência estrutural", true);
     return;
   }
   if (!file && !referenceId) {
@@ -2729,12 +2821,14 @@ async function generateGemini() {
         prompt,
         additional_instructions: prompt,
         render_spec: renderSpec,
+        output_size: [renderSpec.output.width, renderSpec.output.height],
         model,
         qwen_seed: provider === "qwen" && seedValue !== "" ? Number(seedValue) : null,
         gemini_temperature: provider === "google" ? geminiTemperature : null,
         gemini_top_k: provider === "google" ? geminiTopK : null,
         reference_id: referenceId || null,
         reference_name: state.geminiReferences.find((reference) => reference.id === referenceId)?.name || file?.name || "identity reference",
+        identity_lineart_mode: selectedIdentityGuideMode(),
         reference_data: "",
       },
     });
@@ -2775,6 +2869,16 @@ function initializeGemini() {
   };
   $("#gemini-provider").onchange = () => {
     updateImageProviderControls();
+    scheduleCompiledPromptRefresh();
+  };
+  $("#gemini-output-size").onchange = () => {
+    state.aiRenderSpec = readAiRenderSpecFromForm();
+    updateAiRenderOutputSizeStatus();
+    updateAiRenderSummary();
+    scheduleCompiledPromptRefresh();
+  };
+  $("#gemini-identity-lineart-mode").onchange = () => {
+    updateAiRenderSummary();
     scheduleCompiledPromptRefresh();
   };
   $("#gemini-channel-options")?.addEventListener("change", () => {
@@ -2905,11 +3009,13 @@ function renderPostprocessGeminiPreview(jobIds) {
     return;
   }
   const name = aiRenderDisplayName(job);
+  const outputLabels = new Set(selectedJobs.map((item) => aiRenderOutputLabel(item)));
+  const outputLabel = outputLabels.size === 1 ? [...outputLabels][0] : "múltiplas resoluções";
   image.src = geminiOutputUrl(job.outputs.image);
   image.alt = `AI Render selecionado · ${name}`;
   label.textContent = selectedJobs.length > 1
-    ? `${name} + ${selectedJobs.length - 1} spritesheet(s) · PNG 2048×2048`
-    : `${name} · PNG 2048×2048`;
+    ? `${name} + ${selectedJobs.length - 1} spritesheet(s) · PNG ${outputLabel}`
+    : `${name} · PNG ${outputLabel}`;
   preview.hidden = false;
 }
 
@@ -2967,11 +3073,14 @@ function renderPostprocessJob(job) {
     const title = POSTPROCESS_VARIANT_LABELS[selectedVariant] || selectedVariant;
     const sheet = postprocessOutputUrl(output.spritesheet);
     const gif = postprocessOutputUrl(output.gif);
+    const lineart = job.outputs.lineart;
+    const lineartSheet = lineart ? postprocessOutputUrl(lineart.spritesheet) : "";
+    const lineartGif = lineart ? postprocessOutputUrl(lineart.gif) : "";
     detail.innerHTML = `
-      <div class="pipeline-output-head"><div><h2>Output final · ${esc(sourceAiRenderName)}</h2><p>Spritesheet 512×512 por frame · GIF unificado na ordem 1→2→5→4→3→8→7→6</p></div><span class="job-status done">${esc(pipelineStatusLabel(job.status))}</span></div>
+      <div class="pipeline-output-head"><div><h2>Output final · ${esc(sourceAiRenderName)}</h2><p>Spritesheet de cores 512×512 por frame, sem lineart · GIF unificado na ordem 1→2→5→4→3→8→7→6</p></div><span class="job-status done">${esc(pipelineStatusLabel(job.status))}</span></div>
       <div class="postprocess-variant-selector"><label for="postprocess-variant-select">Variante exibida</label><select id="postprocess-variant-select">${Object.keys(variants).map((name) => `<option value="${esc(name)}"${name === selectedVariant ? " selected" : ""}>${esc(POSTPROCESS_VARIANT_LABELS[name] || name)}</option>`).join("")}</select></div>
-      <div class="postprocess-output-preview"><figure class="postprocess-preview-card"><button class="sprite-media-trigger pipeline-variant-preview" type="button" data-media-open data-media-src="${esc(gif)}" data-media-title="${esc(title)} · GIF" data-media-alt="${esc(title)} · GIF animado"><img src="${esc(gif)}" alt="${esc(title)} · GIF animado"></button><figcaption>GIF giratório · clique para ampliar</figcaption></figure><figure class="postprocess-preview-card"><button class="sprite-media-trigger pipeline-variant-preview" type="button" data-media-open data-media-src="${esc(sheet)}" data-media-title="${esc(title)} · spritesheet" data-media-alt="${esc(title)} · spritesheet"><img src="${esc(sheet)}" alt="${esc(title)} · spritesheet"></button><figcaption>Spritesheet · clique para ampliar</figcaption></figure></div>
-      <div class="pipeline-output-actions"><button class="button-link" type="button" data-media-open data-media-src="${esc(gif)}" data-media-title="${esc(title)} · GIF" data-media-alt="${esc(title)} · GIF animado">Visualizar GIF</button><button class="button-link" type="button" data-media-open data-media-src="${esc(sheet)}" data-media-title="${esc(title)} · spritesheet" data-media-alt="${esc(title)} · spritesheet">Visualizar spritesheet</button>${job.outputs.asset_manifest ? `<a class="button-link" href="${esc(postprocessOutputUrl(job.outputs.asset_manifest))}" target="_blank" rel="noopener">Manifesto JSON</a>` : ""}</div>`;
+      <div class="postprocess-output-preview"><figure class="postprocess-preview-card"><button class="sprite-media-trigger pipeline-variant-preview" type="button" data-media-open data-media-src="${esc(gif)}" data-media-title="${esc(title)} · GIF" data-media-alt="${esc(title)} · GIF animado"><img src="${esc(gif)}" alt="${esc(title)} · GIF animado"></button><figcaption>GIF de cores · clique para ampliar</figcaption></figure><figure class="postprocess-preview-card"><button class="sprite-media-trigger pipeline-variant-preview" type="button" data-media-open data-media-src="${esc(sheet)}" data-media-title="${esc(title)} · spritesheet" data-media-alt="${esc(title)} · spritesheet"><img src="${esc(sheet)}" alt="${esc(title)} · spritesheet"></button><figcaption>Spritesheet de cores · clique para ampliar</figcaption></figure>${lineart ? `<figure class="postprocess-preview-card"><button class="sprite-media-trigger pipeline-variant-preview" type="button" data-media-open data-media-src="${esc(lineartGif)}" data-media-title="Lineart · GIF" data-media-alt="Lineart branca · GIF animado"><img src="${esc(lineartGif)}" alt="Lineart branca · GIF animado"></button><figcaption>GIF lineart branca · runtime</figcaption></figure><figure class="postprocess-preview-card"><button class="sprite-media-trigger pipeline-variant-preview" type="button" data-media-open data-media-src="${esc(lineartSheet)}" data-media-title="Lineart · spritesheet" data-media-alt="Lineart branca · spritesheet"><img src="${esc(lineartSheet)}" alt="Lineart branca · spritesheet"></button><figcaption>Spritesheet lineart branca · runtime</figcaption></figure>` : ""}</div>
+      <div class="pipeline-output-actions"><button class="button-link" type="button" data-media-open data-media-src="${esc(gif)}" data-media-title="${esc(title)} · GIF" data-media-alt="${esc(title)} · GIF animado">Visualizar GIF de cores</button><button class="button-link" type="button" data-media-open data-media-src="${esc(sheet)}" data-media-title="${esc(title)} · spritesheet" data-media-alt="${esc(title)} · spritesheet">Visualizar spritesheet de cores</button>${lineart ? `<button class="button-link" type="button" data-media-open data-media-src="${esc(lineartSheet)}" data-media-title="Lineart · spritesheet" data-media-alt="Lineart branca · spritesheet">Visualizar lineart runtime</button>` : ""}${job.outputs.asset_manifest ? `<a class="button-link" href="${esc(postprocessOutputUrl(job.outputs.asset_manifest))}" target="_blank" rel="noopener">Manifesto JSON</a>` : ""}</div>`;
     detail.querySelector("#postprocess-variant-select").onchange = (event) => {
       state.selectedPostprocessVariantByJob[job.id] = event.target.value;
       renderPostprocessJob(job);
@@ -3031,7 +3140,7 @@ async function runPostprocess() {
   try {
     const response = await api("/api/postprocess", {
       method: "POST",
-      body: { gemini_job_ids: selectedIds, fps: Number($("#postprocess-fps")?.value || 10), model_profile: $("#postprocess-model-profile")?.value || "anime_x4plus_6b" },
+      body: { gemini_job_ids: selectedIds, fps: Number($("#postprocess-fps")?.value || 10), model_profile: $("#postprocess-model-profile")?.value || "anime_x4plus_6b", lineart_mode: $("#postprocess-lineart-mode")?.value || "lineart_standard" },
     });
     const jobs = Array.isArray(response?.jobs) ? response.jobs : [response];
     state.postprocessJobs = [...state.postprocessJobs, ...jobs];
@@ -3143,8 +3252,16 @@ function renderViewport() {
   $("#viewport-detail").innerHTML = `
     ${is3D ? `<div class="sprite-viewer"><div id="sprite-viewer"><div class="viewer-loading">Carregando viewer 3D…</div></div></div>` : `<div class="image-preview-placeholder">Este asset não possui um modelo 3D compatível com o renderer.</div>`}`;
   if (is3D) {
-    if (window.SpriteLabViewer) state.viewer = window.SpriteLabViewer.mount($("#sprite-viewer"), viewerConfig());
-    else $("#sprite-viewer").innerHTML = `<div class="viewer-loading">Aguardando o módulo 3D…</div>`;
+    if (window.SpriteLabViewer) {
+      state.viewer = window.SpriteLabViewer.mount($("#sprite-viewer"), viewerConfig());
+      // Report viewer load failures as navigation events without touching
+      // viewer.js: setStatus(message, isError) is its single error channel.
+      const reportStatus = state.viewer.setStatus.bind(state.viewer);
+      state.viewer.setStatus = (message, isError = false) => {
+        reportStatus(message, isError);
+        if (isError) emitLabEvent("viewer_model_error", { asset_id: asset.id, message: String(message).slice(0, 300) });
+      };
+    } else $("#sprite-viewer").innerHTML = `<div class="viewer-loading">Aguardando o módulo 3D…</div>`;
   }
 }
 
@@ -3183,14 +3300,23 @@ async function saveComposition() {
       tags: $("#composition-tags").value.split(",").map((value) => value.trim()).filter(Boolean),
       notes: $("#composition-notes").value,
     };
-    const result = await api("/api/relationships", { method: "POST", body: payload });
+    const submitted = await api("/api/relationships", { method: "POST", body: payload });
+    // POST /api/relationships answers 202 + queued job (async default) or the
+    // historical 201 payload when mode:"sync" is used. Both end up as result.
+    const completed = isQueuedJob(submitted)
+      ? await pollJobStatus(`/api/maintenance/jobs/${submitted.id}`)
+      : { status: "done", result: submitted };
+    if (completed.status === "error") throw new Error(completed.error || "falha ao salvar composição");
+    const result = completed.result || {};
+    if (result.export_error) toast(`Composição salva, mas a exportação GLB falhou: ${result.export_error}`, true);
     state.relationships = [...state.relationships.filter((row) => row.id !== result.relationship.id), result.relationship];
     populateSpriteCompositions();
     renderCompositions();
     openComposition(result.relationship.id);
     state.compositionPreviewRequested = true;
     refreshCompositionViewer();
-    toast(`${saveAsNew ? "Nova composição criada" : "Composição atualizada"} e GLB exportado`);
+    toast(`${saveAsNew ? "Nova composição criada" : "Composição atualizada"}${result.export ? " e GLB exportado" : ""}`);
+    emitLabEvent("composition_saved", { id: result.relationship.id });
   } catch (error) { toast(error.message, true); }
   finally {
     saveButton.disabled = false;
@@ -3429,8 +3555,20 @@ $("#sidebar-toggle").addEventListener("click", () => {
   $("#sidebar-toggle").textContent = collapsed ? "›" : "‹";
 });
 $("#btn-reindex").addEventListener("click", async () => {
-  try { await api("/api/reindex", { method: "POST", body: {} }); await load(); toast("Índice atualizado"); }
-  catch (error) { toast(error.message, true); }
+  const button = $("#btn-reindex");
+  try {
+    if (button) { button.disabled = true; button.textContent = "Reindexando…"; }
+    const submitted = await api("/api/reindex", { method: "POST", body: {} });
+    const job = isQueuedJob(submitted)
+      ? await pollJobStatus(`/api/maintenance/jobs/${submitted.id}`)
+      : { status: "done", result: submitted };
+    if (job.status === "error") throw new Error(job.error || "reindex falhou");
+    await load();
+    toast("Índice atualizado");
+    emitLabEvent("reindex_done", {});
+  }
+  catch (error) { toast(error.message, true); emitLabEvent("reindex_error", { error: String(error.message).slice(0, 200) }); }
+  finally { if (button) { button.disabled = false; button.textContent = "Atualizar índice"; } }
 });
 function formatUploadBytes(bytes) {
   const value = Number(bytes || 0);
@@ -3475,18 +3613,22 @@ $("#btn-upload-zip").addEventListener("click", () => {
     if (xhr.status === 201) {
       if (status) status.textContent = `Recebido ${data.file} — indexação automática em segundos.`;
       toast("ZIP enviado para o catálogo");
+      emitLabEvent("catalog_upload_done", { file: data.file || file.name, bytes: file.size });
       input.value = "";
       await refreshUploadList();
       await load();
     } else {
       toast(data.error || `Falha no upload (HTTP ${xhr.status})`, true);
+      emitLabEvent("catalog_upload_error", { file: file.name, status: xhr.status, error: data.error || "" });
     }
   };
   xhr.onerror = () => {
     if (progress) progress.hidden = true;
     toast("Erro de rede no upload", true);
+    emitLabEvent("catalog_upload_error", { file: file.name, status: 0, error: "network" });
   };
   if (status) status.textContent = `Enviando ${file.name}…`;
+  emitLabEvent("catalog_upload_started", { file: file.name, bytes: file.size });
   xhr.send(file);
 });
 window.addEventListener("sprite-viewer-ready", () => {
@@ -3515,7 +3657,24 @@ async function runEnvAtlas() {
   const directions = $("#env-atlas-directions")?.value || "8";
   const profileId = $("#env-atlas-render-profile")?.value || "env_atlas_v1";
 
-  const selectedAssets = ENV_ATLAS_ASSETS.filter((a) => selectedEnvAtlasAssets.has(a.col));
+  // Resolve curated slots to catalog assets at send time: the server turns
+  // asset_id into a local fbx_path. Stale absolute cache paths are never
+  // sent (they change whenever the source ZIP is re-extracted).
+  const selectedAssets = [];
+  for (const entry of ENV_ATLAS_ASSETS.filter((a) => selectedEnvAtlasAssets.has(a.col))) {
+    const assetId = findEnvAtlasAssetId(entry.name);
+    if (!assetId) {
+      toast(`Asset não encontrado no catálogo: ${entry.name}`, true);
+      return;
+    }
+    selectedAssets.push({
+      col: entry.col,
+      name: entry.name,
+      tile_key: entry.tile_key,
+      category: entry.category,
+      asset_id: assetId,
+    });
+  }
 
   try {
     toast("Iniciando renderização do Environment Atlas...");
@@ -3532,11 +3691,24 @@ async function runEnvAtlas() {
 
     if (!response.ok) {
       const error = await response.json();
-      throw new Error(error.message || "Falha na renderização");
+      throw new Error(error.message || error.error || "Falha na renderização");
     }
 
-    const result = await response.json();
+    const submitted = await response.json();
+    // POST /api/env-atlas answers 202 + queued job (async default). The
+    // historical sync 200 shape {atlas_path} is still tolerated.
+    const finished = isQueuedJob(submitted)
+      ? await pollJobStatus(`/api/env-atlas/jobs/${submitted.id}`, { timeoutMs: 600000 })
+      : { status: "done", outputs: { atlas_path: submitted.atlas_path }, cells: submitted.cells, size: submitted.size };
+    if (finished.status === "error") throw new Error(finished.error || "Falha na renderização");
+    const outputs = finished.outputs || {};
+    const result = {
+      atlas_path: outputs.atlas_path,
+      cells: finished.cells || 64,
+      size: finished.size || "2048×2048",
+    };
     toast("Environment Atlas renderizado com sucesso!");
+    emitLabEvent("env_atlas_done", {});
 
     if (result.atlas_path) {
       const detail = $("#env-atlas-detail");
@@ -3550,19 +3722,31 @@ async function runEnvAtlas() {
     }
   } catch (error) {
     toast(error.message, true);
+    emitLabEvent("env_atlas_error", { error: String(error.message).slice(0, 200) });
   }
 }
 
 const ENV_ATLAS_ASSETS = [
-  { col: 0, name: "FloorTile_Basic", tile_key: "floor", category: "floor", fbx_path: "/home/ggnp/tools/source-assets/catalog/web-source-cache/6bf218a67329cca12cc32a5d/Ultimate Modular Sci-Fi - Feb 2021/FBX/FloorTile_Basic.fbx" },
-  { col: 1, name: "Wall_1", tile_key: "solid", category: "wall", fbx_path: "/home/ggnp/tools/source-assets/catalog/web-source-cache/6bf218a67329cca12cc32a5d/Ultimate Modular Sci-Fi - Feb 2021/FBX/Walls/Wall_1.fbx" },
-  { col: 2, name: "Door_Single", tile_key: "doorway", category: "door", fbx_path: "/home/ggnp/tools/source-assets/catalog/web-source-cache/6bf218a67329cca12cc32a5d/Ultimate Modular Sci-Fi - Feb 2021/FBX/Door_Single.fbx" },
-  { col: 3, name: "Column_1", tile_key: "pillar", category: "pillar", fbx_path: "/home/ggnp/tools/source-assets/catalog/web-source-cache/6bf218a67329cca12cc32a5d/Ultimate Modular Sci-Fi - Feb 2021/FBX/Column_1.fbx" },
-  { col: 4, name: "Brick", tile_key: "ruin", category: "ruin", fbx_path: "/home/ggnp/tools/source-assets/catalog/web-source-cache/bb5effea805a1a640e591fe4/Ultimate Modular Ruins Pack - Aug 2021/FBX/Brick.fbx" },
-  { col: 5, name: "BridgeSection", tile_key: "bridge", category: "bridge", fbx_path: "/home/ggnp/tools/source-assets/catalog/web-source-cache/bb5effea805a1a640e591fe4/Ultimate Modular Ruins Pack - Aug 2021/FBX/BridgeSection.fbx" },
-  { col: 6, name: "Crate", tile_key: "low_cover", category: "cover", fbx_path: "/home/ggnp/tools/source-assets/catalog/web-source-cache/bb5effea805a1a640e591fe4/Ultimate Modular Ruins Pack - Aug 2021/FBX/Crate.fbx" },
-  { col: 7, name: "FloorTile_Basic2", tile_key: "rough", category: "floor", fbx_path: "/home/ggnp/tools/source-assets/catalog/web-source-cache/6bf218a67329cca12cc32a5d/Ultimate Modular Sci-Fi - Feb 2021/FBX/FloorTile_Basic2.fbx" },
+  { col: 0, name: "Floor_4x4", tile_key: "floor", category: "floor" },
+  { col: 1, name: "Brick_InteriorWall_1", tile_key: "solid", category: "wall" },
+  { col: 2, name: "Door_1", tile_key: "doorway", category: "door" },
+  { col: 3, name: "Brick_Column_Small", tile_key: "pillar", category: "pillar" },
+  { col: 4, name: "Brick_Plain_1", tile_key: "ruin", category: "ruin" },
+  { col: 5, name: "Stairs_Entrance_Concrete", tile_key: "bridge", category: "bridge" },
+  { col: 6, name: "Prop_Bollard", tile_key: "low_cover", category: "cover" },
+  { col: 7, name: "Sidewalk_Straight_3m", tile_key: "rough", category: "floor" },
 ];
+
+function findEnvAtlasAssetId(name) {
+  const wanted = String(name).toLowerCase();
+  const same = state.assets.filter((asset) =>
+    String(asset.name).toLowerCase() === wanted
+    && ["fbx", "glb", "gltf"].includes(String(asset.format).toLowerCase()));
+  const rank = { gltf: 0, glb: 1, fbx: 2 };
+  same.sort((first, second) =>
+    (rank[String(first.format).toLowerCase()] ?? 9) - (rank[String(second.format).toLowerCase()] ?? 9));
+  return same[0]?.id || "";
+}
 
 let selectedEnvAtlasAssets = new Set(ENV_ATLAS_ASSETS.map((a) => a.col));
 
@@ -3626,6 +3810,7 @@ function initializeEnvAtlas() {
   $("#env-atlas-query")?.addEventListener("input", renderEnvAtlasAssets);
   $("#run-env-atlas")?.addEventListener("click", runEnvAtlas);
 }
+
 window.addEventListener("resize", positionSemanticPanel);
 window.setInterval(refreshProgressClocks, 1000);
 const initialPage = pageForRoute();

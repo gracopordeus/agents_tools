@@ -13,6 +13,7 @@ from PIL import Image
 import chroma_despill
 import huggingface_realesrgan
 import sprite_render
+from postprocess_runtime import add_runtime_arguments
 
 
 def _run(command: list[str], label: str) -> dict[str, Any]:
@@ -106,6 +107,7 @@ def _apply_chroma_cleanup(
     }
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    add_runtime_arguments(parser)
     parser.add_argument("source", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--rows", type=int, default=8)
@@ -180,6 +182,8 @@ def main() -> None:
                 str(Path(__file__).with_name("realesrgan_anime_scale.py")),
                 str(raw_dir),
                 str(upscaled_dir),
+                "--device", args.device,
+                "--precision", args.precision,
                 "--realesrgan-repo",
                 str(args.realesrgan_repo),
                 "--model-profile",
@@ -214,6 +218,8 @@ def main() -> None:
                 str(Path(__file__).with_name("birefnet_lite_remove.py")),
                 str(upscaled_dir),
                 str(args.output),
+                "--device", args.device,
+                "--precision", args.precision,
                 "--mask-output",
                 str(masks_dir),
                 "--model",

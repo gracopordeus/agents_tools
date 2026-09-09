@@ -9,9 +9,15 @@ from PIL import Image
 SPRITE_LAB = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SPRITE_LAB))
 
-import chroma_despill as subject  # noqa: E402
+try:
+    import chroma_despill as subject  # noqa: E402
+    HAS_SCIPY = True
+except ImportError:
+    subject = None  # type: ignore[assignment]
+    HAS_SCIPY = False
 
 
+@unittest.skipUnless(HAS_SCIPY, "requires scipy")
 class ChromaDespillTests(unittest.TestCase):
     def test_despill_changes_only_green_edge_and_preserves_alpha(self) -> None:
         rgba = np.zeros((16, 16, 4), dtype=np.uint8)

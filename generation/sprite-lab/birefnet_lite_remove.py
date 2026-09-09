@@ -11,6 +11,7 @@ import torch
 from PIL import Image
 from torchvision import transforms
 from transformers import AutoModelForImageSegmentation
+from postprocess_runtime import GPULease, add_runtime_arguments, resolve_device, resolve_dtype
 
 
 def _decontaminate(
@@ -34,6 +35,7 @@ def _decontaminate(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    add_runtime_arguments(parser)
     parser.add_argument("source", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--mask-output", type=Path, required=True)
@@ -52,11 +54,14 @@ def main() -> None:
         raise ValueError("threshold deve estar entre 0 e 1")
 
     torch.set_float32_matmul_precision("high")
+    device = resolve_device(args.device)
+    dtype = resolve_dtype(device, args.precision)
+    gpu_lease = GPULease(device)
     model = AutoModelForImageSegmentation.from_pretrained(
         args.model,
         trust_remote_code=True,
         revision=args.revision,
-    ).to("cpu")
+    ).to(device=device, dtype=dtype)
     model.eval()
     transform = transforms.Compose(
         [
@@ -68,14 +73,21 @@ def main() -> None:
     args.output.mkdir(parents=True, exist_ok=True)
     args.mask_output.mkdir(parents=True, exist_ok=True)
     inputs = sorted(args.source.glob("row*_col*.png"))
+    if not inputs:
+        raise ValueError("Nenhuma célula de entrada")
+    if device == "cuda":
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
     started = time.monotonic()
 
     for source in inputs:
         with Image.open(source) as opened:
             image = opened.convert("RGB")
-        tensor = transform(image).unsqueeze(0).to("cpu", dtype=torch.float32)
+        tensor = transform(image).unsqueeze(0).to(device, dtype=dtype)
         with torch.inference_mode():
-            prediction = model(tensor)[-1].sigmoid()[0].squeeze().cpu().numpy()
+            prediction = model(tensor)[-1].float().sigmoid()[0].squeeze().cpu().numpy()
+        if not np.isfinite(prediction).all():
+            raise RuntimeError("BiRefNet produziu máscara não finita")
         soft_mask = Image.fromarray(
             np.round(prediction * 255).astype(np.uint8), mode="L"
         ).resize(image.size, Image.Resampling.NEAREST)
@@ -99,8 +111,9 @@ def main() -> None:
                 "implementation": "ZhengPeng7/BiRefNet",
                 "model": args.model,
                 "revision": args.revision,
-                "device": "cpu",
-                "precision": "fp32",
+                "device": device,
+                "precision": args.precision,
+                "peak_vram_bytes": torch.cuda.max_memory_allocated() if device == "cuda" else 0,
                 "input_size": [args.input_size, args.input_size],
                 "mask_resize": "nearest-neighbor",
                 "alpha": "binary",

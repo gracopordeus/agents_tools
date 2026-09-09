@@ -10,10 +10,11 @@ from direction_contract import DIRECTION_LABELS, DIRECTION_ROWS, DIRECTION_VECTO
 
 
 SCHEMA = "sprite_lab.render_spec/v2"
-PROMPT_SCHEMA = "sprite_lab.prompt_contract/v13"
+PROMPT_SCHEMA = "sprite_lab.prompt_contract/v14"
 GRID_ROWS = 8
 GRID_COLUMNS = 8
 OUTPUT_SIZE = 2048
+SUPPORTED_OUTPUT_SIZES = (1024, 2048)
 DEFAULT_BACKGROUND = "transparent"
 
 ASSET_MODES = (
@@ -52,6 +53,17 @@ REFERENCE_ROLES = {
             "visual language in every output cell"
         ),
         "does_not_control": "pose, animation timing, camera, grid location or cell boundaries",
+    },
+    "identity_lineart": {
+        "role": "identity_contour_guide",
+        "controls": (
+            "the contour, silhouette and separation of visible parts from the same identity "
+            "shown in the identity reference"
+        ),
+        "does_not_control": (
+            "colors, materials, shading, texture, pose, animation timing, camera, grid "
+            "location or cell boundaries"
+        ),
     },
     "beauty": {
         "role": "volume_depth_occlusion",
@@ -243,6 +255,27 @@ def normalize_render_spec(
     spec = copy.deepcopy(baseline)
 
     output = incoming.get("output") if isinstance(incoming.get("output"), dict) else {}
+    requested_width = output.get("width", OUTPUT_SIZE)
+    requested_height = output.get("height", OUTPUT_SIZE)
+    if requested_width is None:
+        requested_width = OUTPUT_SIZE
+    if requested_height is None:
+        requested_height = OUTPUT_SIZE
+    try:
+        width = int(requested_width)
+        height = int(requested_height)
+    except (TypeError, ValueError):
+        raise ValueError(
+            "output.width e output.height devem ser 1024 ou 2048, em formato quadrado"
+        ) from None
+    if (width != requested_width and not isinstance(requested_width, str)) or (
+        height != requested_height and not isinstance(requested_height, str)
+    ) or width != height or width not in SUPPORTED_OUTPUT_SIZES:
+        raise ValueError(
+            "a resolução do output deve ser 1024x1024 ou 2048x2048"
+        )
+    spec["output"]["width"] = width
+    spec["output"]["height"] = height
     spec["output"]["background"] = _clean_text(
         output.get("background") or spec["output"]["background"],
         spec["output"]["background"],
@@ -371,17 +404,36 @@ def build_reference_manifest(
     channels: list[str] | tuple[str, ...],
     *,
     identity_name: str = "identity reference",
+    include_identity_lineart: bool = False,
+    identity_lineart_mode: str = "lineart_standard",
 ) -> list[dict[str, Any]]:
     """Build the ordered image-role contract used by every provider."""
+    identity_label = _clean_text(identity_name, "identity reference")
     manifest = [
         {
             "index": 1,
             "type": "identity",
-            "name": _clean_text(identity_name, "identity reference"),
+            "name": identity_label,
             **REFERENCE_ROLES["identity"],
         }
     ]
-    for index, channel in enumerate(channels, start=2):
+    next_index = 2
+    if include_identity_lineart:
+        guide_label = {
+            "lineart_standard": "lineart standard",
+            "canny_edges": "canny edges",
+        }.get(str(identity_lineart_mode).strip().casefold(), "identity contour guide")
+        manifest.append(
+            {
+                "index": next_index,
+                "type": "identity_lineart",
+                "name": f"{identity_label} · {guide_label}",
+                "guide_mode": str(identity_lineart_mode).strip().casefold(),
+                **REFERENCE_ROLES["identity_lineart"],
+            }
+        )
+        next_index += 1
+    for index, channel in enumerate(channels, start=next_index):
         if channel not in REFERENCE_ROLES or channel == "identity":
             continue
         manifest.append({"index": index, "type": channel, **REFERENCE_ROLES[channel]})
@@ -547,6 +599,7 @@ def _compile_character_prompt(
     image_by_type = {str(item.get("type")): item for item in reference_manifest}
     identity_index = identity["index"]
     beauty = image_by_type.get("beauty")
+    identity_lineart = image_by_type.get("identity_lineart")
     bones = image_by_type.get("bones")
     lineart = image_by_type.get("lineart")
     frame_control_item = image_by_type.get("frame_control")
@@ -554,6 +607,13 @@ def _compile_character_prompt(
         f"Use IMAGE {beauty['index']}, the uploaded 8x8 beauty spritesheet, as the exact composition and layout source."
         if beauty
         else "Use the selected structural spritesheets as the exact composition and layout source."
+    )
+    identity_lineart_line = (
+        f"Use IMAGE {identity_lineart['index']}, "
+        f"the {'Canny edge map' if identity_lineart.get('guide_mode') == 'canny_edges' else 'lineart'} "
+        f"derived from the identity reference, only to reinforce the identity contour, silhouette and separation of visible parts. It is a guide paired with IMAGE {identity_index}; IMAGE {identity_index} remains authoritative for colors, materials, shading, texture and every other visible design choice."
+        if identity_lineart
+        else ""
     )
     bones_line = (
         f"Use IMAGE {bones['index']} bones spritesheet only to preserve the exact pose, joint positions, limb articulation and animation phase of each cell."
@@ -673,7 +733,7 @@ def _compile_character_prompt(
 }}"""
 
     optional_lines = "\n\n".join(
-        line for line in (bones_line, lineart_line, frame_control) if line
+        line for line in (identity_lineart_line, bones_line, lineart_line, frame_control) if line
     )
     extra = ""
     if additional_instructions:
@@ -878,15 +938,28 @@ def compile_provider_prompt(
     """Compile the exact prompt sent to a provider, including physical input order."""
     provider_name = _clean_text(provider, "openai").casefold()
     normalized = normalize_render_spec(spec)
+    output_size = (
+        normalized["output"]["width"],
+        normalized["output"]["height"],
+    )
     prompt = compile_prompt(normalized, reference_manifest, additional_instructions)
     if normalized["asset"]["mode"] == "character_animation":
         role_descriptions = {
             "identity": "the authoritative character reference",
+            "identity_lineart": "the lineart derived from the authoritative character reference",
             "beauty": "the aligned beauty spritesheet",
             "bones": "the aligned bones guide",
             "lineart": "the aligned lineart guide",
             "frame_control": "the aligned 8x8 frame-control grid",
         }
+        identity_lineart_item = next(
+            (item for item in reference_manifest if item.get("type") == "identity_lineart"),
+            None,
+        )
+        if identity_lineart_item and identity_lineart_item.get("guide_mode") == "canny_edges":
+            role_descriptions["identity_lineart"] = (
+                "the Canny edge guide derived from the authoritative character reference"
+            )
         ordered_inputs = []
         ordinals = ("first", "second", "third", "fourth", "fifth", "sixth")
         for position, item in enumerate(reference_manifest):
@@ -908,7 +981,8 @@ def compile_provider_prompt(
             + input_contract
             + ". Preserve the 8x8 grid, cell boundaries, camera, pose, direction, "
             "animation phase, scale and foot anchor. Structural guides must not appear "
-            "in the final artwork. Return exactly one 2048x2048 PNG spritesheet with "
+            f"in the final artwork. Return exactly one {output_size[0]}x{output_size[1]} PNG "
+            "spritesheet with "
             "no labels, borders, grid lines or extra panels.\n"
         )
     provider_label = {
@@ -943,6 +1017,21 @@ def compile_provider_prompt(
                 "Do not reproduce its lines in the output.",
             ]
         )
+    identity_lineart_item = next(
+        (item for item in reference_manifest if item.get("type") == "identity_lineart"),
+        None,
+    )
+    if identity_lineart_item:
+        guide_description = (
+            "Canny edge guide"
+            if identity_lineart_item.get("guide_mode") == "canny_edges"
+            else "lineart guide"
+        )
+        lines.extend(
+            [
+                f"IMAGE {identity_lineart_item['index']} is a derived {guide_description} from IMAGE 1. Use it only for the identity contour and silhouette; IMAGE 1 remains authoritative for appearance, colors, materials and style.",
+            ]
+        )
     if provider_name == "openai":
         lines.extend(
             [
@@ -951,7 +1040,7 @@ def compile_provider_prompt(
         )
     lines.extend(
         [
-            "Return exactly one 2048x2048 PNG spritesheet with 8 rows, 8 columns and no labels, borders, grid lines or extra panels.",
+            f"Return exactly one {output_size[0]}x{output_size[1]} PNG spritesheet with 8 rows, 8 columns and no labels, borders, grid lines or extra panels.",
         ]
     )
     return prompt.rstrip() + "\n\n" + "\n".join(lines) + "\n"

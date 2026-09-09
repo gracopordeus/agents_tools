@@ -15,11 +15,37 @@ class AiRenderSpecTests(unittest.TestCase):
 
         self.assertEqual(spec["version"], "2.0")
         self.assertEqual(spec["output"]["grid"], {"rows": 8, "columns": 8})
+        self.assertEqual((spec["output"]["width"], spec["output"]["height"]), (2048, 2048))
         self.assertEqual(spec["output"]["background"], "transparent")
         self.assertEqual([row["id"] for row in spec["rows"]], [
             "north", "north_east", "east", "south_east",
             "south", "south_west", "west", "north_west",
         ])
+
+    def test_output_size_accepts_1024_and_is_dynamic_in_provider_prompt(self) -> None:
+        spec = ai_render_spec.default_render_spec(name="hero")
+        spec["output"]["width"] = 1024
+        spec["output"]["height"] = 1024
+
+        normalized = ai_render_spec.normalize_render_spec(spec)
+        self.assertEqual((normalized["output"]["width"], normalized["output"]["height"]), (1024, 1024))
+        prompt = ai_render_spec.compile_provider_prompt(
+            spec,
+            ai_render_spec.build_reference_manifest(["beauty", "bones"]),
+            provider="google",
+        )
+        self.assertIn("1024x1024 PNG spritesheet", prompt)
+        self.assertNotIn("2048x2048 PNG spritesheet", prompt)
+
+    def test_output_size_rejects_non_square_or_unsupported_dimensions(self) -> None:
+        for width, height in ((512, 512), (1024, 2048), (4096, 4096)):
+            spec = ai_render_spec.default_render_spec(name="hero")
+            spec["output"]["width"] = width
+            spec["output"]["height"] = height
+            with self.subTest(width=width, height=height), self.assertRaisesRegex(
+                ValueError, "1024x1024 ou 2048x2048"
+            ):
+                ai_render_spec.normalize_render_spec(spec)
 
     def test_reference_manifest_preserves_provider_input_order(self) -> None:
         manifest = ai_render_spec.build_reference_manifest(
@@ -41,6 +67,53 @@ class AiRenderSpecTests(unittest.TestCase):
         self.assertIn("black guide lines", manifest[3]["does_not_control"])
         self.assertEqual(manifest[0]["name"], "concept.jpeg")
         self.assertEqual(manifest[0]["role"], "authoritative_visual_identity")
+
+    def test_identity_lineart_is_inserted_after_identity_and_is_explicit(self) -> None:
+        spec = ai_render_spec.default_render_spec(name="hero")
+        manifest = ai_render_spec.build_reference_manifest(
+            ["beauty", "bones"],
+            identity_name="concept.png",
+            include_identity_lineart=True,
+        )
+
+        self.assertEqual(
+            [(item["index"], item["type"]) for item in manifest],
+            [
+                (1, "identity"),
+                (2, "identity_lineart"),
+                (3, "beauty"),
+                (4, "bones"),
+            ],
+        )
+        self.assertEqual(manifest[1]["role"], "identity_contour_guide")
+        prompt = ai_render_spec.compile_provider_prompt(
+            spec,
+            manifest,
+            provider="google",
+        )
+        self.assertIn("Use IMAGE 2, the lineart derived from the identity reference", prompt)
+        self.assertIn("IMAGE 1 remains authoritative for colors", prompt)
+        self.assertIn("second is the lineart derived from the authoritative character reference", prompt)
+
+    def test_canny_identity_guide_is_named_in_manifest_and_prompt(self) -> None:
+        spec = ai_render_spec.default_render_spec(name="hero")
+        manifest = ai_render_spec.build_reference_manifest(
+            ["beauty"],
+            identity_name="concept.png",
+            include_identity_lineart=True,
+            identity_lineart_mode="canny_edges",
+        )
+
+        self.assertEqual(manifest[1]["type"], "identity_lineart")
+        self.assertEqual(manifest[1]["guide_mode"], "canny_edges")
+        self.assertIn("canny edges", manifest[1]["name"])
+        prompt = ai_render_spec.compile_provider_prompt(
+            spec,
+            manifest,
+            provider="google",
+        )
+        self.assertIn("second is the Canny edge guide derived from the authoritative character reference", prompt)
+        self.assertIn("the Canny edge map derived from the identity reference", prompt)
 
     def test_compiler_contains_fixed_contract_and_cell_overrides(self) -> None:
         spec = ai_render_spec.default_render_spec(mode="prop_catalog", name="props")

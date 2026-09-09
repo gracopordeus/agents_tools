@@ -190,9 +190,12 @@ Na tela **AI Sprite Render**, a mesma chave pode ser salva no menu de
 configurações. O provider envia as imagens em Base64 e baixa imediatamente a
 URL temporária retornada pela API para o output local. A tela permite escolher
 quais referências Blender (`beauty`, `bones` e `lineart`) serão enviadas. A
-referência de identidade é enviada separadamente; no Qwen, podem ser escolhidas
-até duas referências Blender para respeitar o limite de três imagens por
-chamada.
+referência de identidade recebe automaticamente uma imagem complementar
+`lineart_standard`, produzida pelo `controlnet_aux.LineartDetector` e enviada
+como a segunda entrada física. A identidade original continua autorizando
+aparência, cores, materiais e estilo; a lineart complementar orienta somente
+contorno e silhueta. No Qwen, pode ser escolhida até uma referência Blender
+adicional para respeitar o limite de três imagens por chamada.
 
 Tokens do Token Plan com prefixo `sk-sp-` usam automaticamente o endpoint
 `https://token-plan.ap-southeast-1.maas.aliyuncs.com/api/v1`. Para outras

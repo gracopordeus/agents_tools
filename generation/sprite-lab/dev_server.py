@@ -31,12 +31,25 @@ def start_server(host: str, port: int) -> subprocess.Popen[bytes]:
     )
 
 
+def drain_timeout() -> float:
+    """Grace period for in-flight background jobs on reload (seconds)."""
+    import os
+
+    try:
+        return max(1.0, float(os.environ.get("SPRITE_LAB_DRAIN_TIMEOUT", "") or 15))
+    except (TypeError, ValueError):
+        return 15.0
+
+
 def stop_server(process: subprocess.Popen[bytes]) -> None:
     if process.poll() is not None:
         return
+    # SIGTERM first: server.py stops accepting and finishes the current
+    # poll cycle, letting bounded background jobs drain. SIGKILL only after
+    # the grace period so Blender conversions are not orphaned mid-write.
     process.terminate()
     try:
-        process.wait(timeout=3)
+        process.wait(timeout=drain_timeout())
     except subprocess.TimeoutExpired:
         process.kill()
         process.wait()

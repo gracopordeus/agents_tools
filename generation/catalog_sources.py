@@ -274,6 +274,21 @@ def _iter_source_items(
     return direct, archives
 
 
+def _word_hit(lowered: str, keyword: str) -> bool:
+    """Match a keyword on word boundaries with common English suffixes.
+
+    Substring matching misfires on static meshes: ``walk`` in ``sidewalk``,
+    ``turn`` in ``arrowturnleft``, ``guard`` in ``wall_guard``. The lookarounds
+    treat only a-z as word characters (so ``_``, spaces, parens, camelCase
+    transitions after lowercasing all act as boundaries) and tolerate
+    ``ing``/``ed``/``s`` inflections (``blocking`` -> ``block``).
+    """
+    return re.search(
+        rf"(?<![a-z]){re.escape(keyword)}(?:ing|ed|s|es)?(?![a-z])",
+        lowered,
+    ) is not None
+
+
 def _category(source: dict[str, Any], name: str, extension: str) -> str:
     by_extension = source.get("category_by_extension", {})
     if isinstance(by_extension, dict) and extension in by_extension:
@@ -284,17 +299,82 @@ def _category(source: dict[str, Any], name: str, extension: str) -> str:
     if extension == "fbx":
         if any(token in lowered for token in ("character", "outfit", "body", "mannequin")):
             return "character"
+        # Weapon props (ex.: "Maria WProp") ship a prop mesh, not a
+        # body: keep them as weapon components even if the pack is
+        # animation-driven.
+        if "wprop" in lowered or "weapon_prop" in lowered:
+            return "weapon"
+        # Token set aligned with animation_catalog.classify_action plus
+        # locomotion verbs seen in packs like the Great Sword Pack
+        # (crouch, draw, turn, strafe, slide, slash, kick, ...). Animation
+        # wins over weapon so action files like "great sword walk.fbx"
+        # are indexed as animation even though they mention a weapon.
+        # NOTE: callers must pass the ZIP member name (not the archive
+        # name) so per-file classification works for auto-discovered
+        # archives; see _record_base. Matching is word-based (see
+        # _word_hit) so "sidewalk" does not trigger "walk".
+        # NOTE: "guard" deliberately excluded: it matches architectural
+        # pieces like "Trim_Wall_Guard" more often than block animations
+        # ("blocking" already covers the Great Sword guards via block+ing).
         if any(
-            token in lowered
+            _word_hit(lowered, token)
             for token in (
                 "animation",
                 "animations",
                 "locomotion",
                 "motion",
                 "attack",
+                "slash",
+                "strike",
+                "swing",
+                "combo",
+                "melee",
+                "stab",
+                "thrust",
+                "punch",
+                "shoot",
+                "throw",
+                "chop",
                 "idle",
+                "stand",
+                "breath",
+                "rest",
                 "walk",
                 "run",
+                "jog",
+                "sprint",
+                "move",
+                "slide",
+                "strafe",
+                "turn",
+                "jump",
+                "leap",
+                "crouch",
+                "block",
+                "parry",
+                "dodge",
+                "roll",
+                "evade",
+                "dash",
+                "hit",
+                "hurt",
+                "damage",
+                "stagger",
+                "flinch",
+                "death",
+                "die",
+                "dead",
+                "dying",
+                "cast",
+                "spell",
+                "magic",
+                "charge",
+                "summon",
+                "power",
+                "impact",
+                "kick",
+                "spin",
+                "draw",
             )
         ):
             return "animation"
@@ -317,8 +397,16 @@ def _kind(category: str, name: str = "") -> str:
     if category in {"animation", "animation_reference"}:
         normalized_name = name.casefold()
         filename = Path(name).name.casefold()
-        is_ual2_mannequin = filename in {"ual2_standard.fbx", "ual2_standard_rm.fbx"}
-        if "mannequin" in normalized_name or is_ual2_mannequin:
+        # UAL1 and UAL2 base files ship the mannequin mesh together with
+        # every action, so they are usable as mesh principal even though
+        # the source is registered as an animation pack.
+        is_ual_mannequin = filename in {
+            "ual1_standard.fbx",
+            "ual1_standard_rm.fbx",
+            "ual2_standard.fbx",
+            "ual2_standard_rm.fbx",
+        }
+        if "mannequin" in normalized_name or is_ual_mannequin:
             return "character"
         return "animation"
     if category in {"character", "character_base"}:
@@ -349,7 +437,12 @@ def _record_base(
     member: str | None = None,
 ) -> dict[str, Any]:
     source_id = str(source["id"])
-    category = _category(source, reference, extension)
+    # For ZIP members classify by the member filename, not the archive
+    # name: otherwise every file in "Great Sword Pack.zip" inherits
+    # category weapon from the word "sword" in the zip name, even when
+    # the member is an animation like "great sword walk.fbx".
+    classification_name = member or reference
+    category = _category(source, classification_name, extension)
     source_reference = f"{_relative_path(archive, catalog_root)}!{member}" if archive and member else reference
     tags = {str(tag) for tag in _as_list(source.get("tags"))}
     tags.update({f"category:{category}", f"format:{extension}"})

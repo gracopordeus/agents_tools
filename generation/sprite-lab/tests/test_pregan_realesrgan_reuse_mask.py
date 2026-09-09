@@ -9,10 +9,50 @@ from PIL import Image
 SPRITE_LAB = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SPRITE_LAB))
 
-import pregan_realesrgan_reuse_mask_pipeline as subject  # noqa: E402
+try:
+    import pregan_realesrgan_reuse_mask_pipeline as subject  # noqa: E402
+    HAS_SCIPY = True
+except ImportError:
+    subject = None  # type: ignore[assignment]
+    HAS_SCIPY = False
 
 
+def _lineart_module():
+    if subject is None:
+        raise unittest.SkipTest("requires scipy")
+    return subject
+
+
+@unittest.skipUnless(HAS_SCIPY, "requires scipy")
 class PreganPrecleanTests(unittest.TestCase):
+    def test_lineart_is_white_and_separate_from_beauty(self) -> None:
+        module = _lineart_module()
+        image = Image.new("RGBA", (8, 8), (180, 120, 60, 0))
+        image.putalpha(Image.new("L", (8, 8), 255))
+        lineart = Image.new("RGBA", (4, 4), (255, 255, 255, 255))
+        original = np.asarray(image).copy()
+        result = module.build_lineart_layer(image, lineart, 1.0)
+        output = np.asarray(result)
+        self.assertEqual(tuple(output[4, 4]), (255, 255, 255, 255))
+        self.assertEqual(tuple(output[0, 0]), (255, 255, 255, 255))
+        np.testing.assert_array_equal(np.asarray(image), original)
+        result.close()
+        image.close()
+        lineart.close()
+
+    def test_lineart_alpha_is_intersected_with_approved_alpha(self) -> None:
+        module = _lineart_module()
+        alpha = np.zeros((8, 8), dtype=np.uint8)
+        alpha[2:6, 2:6] = 255
+        image = Image.fromarray(np.dstack([np.full((8, 8, 3), 100, dtype=np.uint8), alpha]), "RGBA")
+        lineart = Image.new("RGBA", (8, 8), (255, 255, 255, 200))
+        result = module.build_lineart_layer(image, lineart, 0.85)
+        expected = np.minimum(alpha, round(200 * 0.85)).astype(np.uint8)
+        np.testing.assert_array_equal(np.asarray(result.getchannel("A")), expected)
+        self.assertTrue(np.all(np.asarray(result)[expected > 0, :3] == 255))
+        result.close()
+        image.close()
+        lineart.close()
     def test_preclean_skips_despill_for_neutral_black_background(self) -> None:
         image = Image.new("RGB", (16, 16), (0, 0, 0))
         image.paste((120, 80, 40), (4, 4, 12, 12))

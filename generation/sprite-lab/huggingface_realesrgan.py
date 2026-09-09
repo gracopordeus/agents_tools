@@ -2,7 +2,12 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import io
 import os
+import tempfile
+import urllib.request
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -24,6 +29,41 @@ MODEL_PROFILES: dict[str, dict[str, Any]] = {
         "num_block": 6,
         "network_scale": 4,
         "source": "Hugging Face · AMD mirror of the official checkpoint",
+        "revision": "b14ff5f8ecb5a4b56ce4049a58d0bca1f8814690",
+    },
+    "swinir_light_x2": {
+        "label": "POC · SwinIR Lightweight 2×",
+        "architecture": "swinir", "network_scale": 2,
+        "local_file": "swinir_light_x2.pth",
+        "url": "https://github.com/JingyunLiang/SwinIR/releases/download/v0.0/002_lightweightSR_DIV2K_s64w8_SwinIR-S_x2.pth",
+        "sha256": "193b229909ca89cd8b55de9c9e7fce146ae759d59dfcd78d8feb9dd1d6fa0fd7",
+        "source": "JingyunLiang/SwinIR · official v0.0 release",
+    },
+    "swinir_m_classical_df2k_x2": {
+        "label": "POC · SwinIR-M ClassicalSR DF2K 2×",
+        "architecture": "swinir", "network_scale": 2,
+        "local_file": "swinir_m_classical_df2k_x2.pth",
+        "url": "https://github.com/JingyunLiang/SwinIR/releases/download/v0.0/001_classicalSR_DF2K_s64w8_SwinIR-M_x2.pth",
+        "sha256": "2032ebf8f401dd3ce2fae5f3852117cb72101ec6ed8358faa64c2a3fa09ed4ac",
+        "source": "JingyunLiang/SwinIR · official v0.0 release",
+    },
+    "realcugan_x2": {
+        "label": "POC · Real-CUGAN 2× sem denoise",
+        "architecture": "realcugan", "network_scale": 2,
+        "local_file": "updated_weights/up2x-latest-no-denoise.pth",
+        "archive_member": "updated_weights/up2x-latest-no-denoise.pth",
+        "url": "https://github.com/bilibili/ailab/releases/download/Real-CUGAN/updated_weights.zip",
+        "sha256": "f491f9ecf6964ead9f3a36bf03e83527f32c6a341b683f7378ac6c1e2a5f0d16",
+        "source": "bilibili/ailab · official Real-CUGAN release",
+    },
+    "realcugan_conservative_x2": {
+        "label": "POC · Real-CUGAN 2× conservador",
+        "architecture": "realcugan", "network_scale": 2,
+        "local_file": "updated_weights/up2x-latest-conservative.pth",
+        "archive_member": "updated_weights/up2x-latest-conservative.pth",
+        "url": "https://github.com/bilibili/ailab/releases/download/Real-CUGAN/updated_weights.zip",
+        "sha256": "6cfe3b23687915d08ba96010f25198d9cfe8a683aa4131f1acf7eaa58ee1de93",
+        "source": "bilibili/ailab · official Real-CUGAN release",
     },
     "bicubic": {
         "label": "Conservador · Bicubic 2×",
@@ -102,6 +142,23 @@ def download_weight(profile_id: str) -> Path:
     selected = profile(profile_id)
     if selected["architecture"] == "traditional":
         raise ValueError(f"o perfil {profile_id} não possui pesos para baixar")
+    if "local_file" in selected:
+        target = BASE / "work" / "upscale-models" / selected["local_file"]
+        if not target.is_file():
+            with urllib.request.urlopen(selected["url"], timeout=120) as response:
+                data = response.read()
+            if "archive_member" in selected:
+                with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                    data = archive.read(selected["archive_member"])
+            if hashlib.sha256(data).hexdigest() != selected["sha256"]:
+                raise RuntimeError(f"Hash inválido para {profile_id}")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as temporary:
+                temporary.write(data)
+            os.replace(temporary.name, target)
+        if hashlib.sha256(target.read_bytes()).hexdigest() != selected["sha256"]:
+            raise RuntimeError(f"Checkpoint local alterado: {target}")
+        return target
     try:
         from huggingface_hub import hf_hub_download
     except ImportError as error:
@@ -110,7 +167,7 @@ def download_weight(profile_id: str) -> Path:
         path = hf_hub_download(
             repo_id=str(selected["repo_id"]),
             filename=str(selected["filename"]),
-            revision="main",
+            revision=selected.get("revision", "main"),
             cache_dir=HF_CACHE_DIR,
             token=api_token() or None,
         )

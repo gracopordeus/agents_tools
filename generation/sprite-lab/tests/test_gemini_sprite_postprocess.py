@@ -11,9 +11,36 @@ SPRITE_LAB = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SPRITE_LAB))
 
 import gemini_sprite_postprocess as subject  # noqa: E402
+import server  # noqa: E402
 
 
 class GeminiSpritePostprocessTests(unittest.TestCase):
+    def test_server_normalizes_1k_sheet_per_cell_for_512_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            generated = root / "generated_1k.png"
+            source = Image.new("RGBA", (1024, 1024), (0, 0, 0, 0))
+            for row in range(8):
+                for column in range(8):
+                    color = (row * 24, column * 24, 120, 255)
+                    cell = Image.new("RGBA", (128, 128), color)
+                    source.alpha_composite(cell, (column * 128, row * 128))
+                    cell.close()
+            source.save(generated, format="PNG")
+            source.close()
+
+            prepared, report = server._prepare_gemini_postprocess_sheet(
+                generated,
+                root / "postprocess",
+            )
+
+            self.assertTrue(report["applied"])
+            self.assertEqual(report["method"], "per_cell_lanczos_2x")
+            with Image.open(prepared) as output:
+                self.assertEqual(output.size, (2048, 2048))
+                self.assertEqual(output.getpixel((256, 256)), (24, 24, 120, 255))
+                self.assertEqual(output.getpixel((512, 256)), (24, 48, 120, 255))
+
     def test_resumes_masks_when_chroma_cleanup_failed_after_birefnet(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -80,6 +107,7 @@ class GeminiSpritePostprocessTests(unittest.TestCase):
                     source_cell=256,
                     realesrgan_repo=root / "Real-ESRGAN",
                     python_executable="python",
+                    lineart_mode="lineart_coarse",
                 )
 
             self.assertIn("realesrgan_birefnet_pipeline.py", commands[0][1])
@@ -100,6 +128,10 @@ class GeminiSpritePostprocessTests(unittest.TestCase):
             self.assertEqual(
                 Path(commands[1][3]),
                 output / "mask_pass_realesrgan_birefnet" / "foreground_cleanup_masks",
+            )
+            self.assertEqual(
+                commands[1][commands[1].index("--lineart-mode") + 1],
+                "lineart_coarse",
             )
             self.assertIn("approved_birefnet_mask_512", report["pipeline"])
             self.assertNotIn("structural_alpha_and_alignment", report["pipeline"])

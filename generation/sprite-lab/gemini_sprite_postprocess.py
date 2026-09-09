@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -16,6 +17,7 @@ import semantic_preview
 import sprite_render
 import asset_manifest
 from direction_contract import direction_contract_for
+from postprocess_runtime import add_runtime_arguments
 
 
 MASK_CACHE_ROOT = Path(__file__).resolve().parent / "work" / "mask-cache"
@@ -213,9 +215,10 @@ def _runtime_asset_contract(
     foot_anchor: list[int] | list[float],
     timing: dict[str, Any],
     texture: str,
+    lineart_texture: str | None = None,
 ) -> dict[str, Any]:
     """Build the engine-neutral runtime section consumed by game adapters."""
-    return {
+    runtime = {
         "schema": "sprite_lab.runtime_asset/v1",
         "representation": asset_spec["representation"],
         "atlas": {
@@ -240,6 +243,18 @@ def _runtime_asset_contract(
         },
         "background": {"mode": "transparent"},
     }
+    if lineart_texture:
+        runtime["lineart"] = {
+            "texture": lineart_texture,
+            "rows": rows,
+            "columns": phases,
+            "cell_size": [cell_size, cell_size],
+            "phase_order": "columns_0_to_phases_minus_1",
+            "color": "white",
+            "background": "transparent",
+            "composite": "runtime_layer",
+        }
+    return runtime
 
 
 def _write_postprocess_asset_manifest(
@@ -256,6 +271,7 @@ def _write_postprocess_asset_manifest(
     direction_contract = _direction_contract(rows)
     timing = source_render["animation_timing"]
     asset_spec = source_render.get("asset_spec") or asset_manifest.normalize_asset_spec({})
+    lineart_export = root_report.get("lineart_export") or {}
     runtime = _runtime_asset_contract(
         asset_spec,
         direction_contract,
@@ -265,6 +281,11 @@ def _write_postprocess_asset_manifest(
         foot_anchor=foot_anchor,
         timing=timing,
         texture="variants/original/spritesheet.png",
+        lineart_texture=(
+            lineart_export.get("spritesheet")
+            if lineart_export.get("enabled")
+            else None
+        ),
     )
     artifact_entries: list[tuple[str, Path | str | None]] = [
         ("generated_sheet", root_report.get("generated_sheet")),
@@ -279,6 +300,17 @@ def _write_postprocess_asset_manifest(
                 (f"{variant_name}_spritesheet", variant / "spritesheet.png"),
                 (f"{variant_name}_ordered_gif", variant / "animation_all_directions_1-2-5-4-3-8-7-6.gif"),
                 (f"{variant_name}_metadata", variant / "render_metadata.json"),
+            ]
+        )
+    if lineart_export.get("enabled"):
+        lineart = output / str(lineart_export.get("directory") or "lineart")
+        artifact_entries.extend(
+            [
+                ("lineart_spritesheet", lineart / "spritesheet.png"),
+                (
+                    "lineart_ordered_gif",
+                    lineart / "animation_all_directions_1-2-5-4-3-8-7-6.gif",
+                ),
             ]
         )
     manifest = asset_manifest.build_manifest(
@@ -359,6 +391,7 @@ def enrich_postprocess_exports(output: Path, structural_dir: Path) -> None:
     output_cell = int(root_report.get("output_cell", source_cell * 2))
     foot_anchor = root_report.get("foot_anchor") or [128, 220]
     direction_contract = _direction_contract(rows)
+    lineart_export = root_report.get("lineart_export") or {}
     shared = {
         "asset_spec": source_render["asset_spec"],
         "animation_source": source_render["animation_source"],
@@ -393,9 +426,26 @@ def enrich_postprocess_exports(output: Path, structural_dir: Path) -> None:
             foot_anchor=foot_anchor,
             timing=source_render["animation_timing"],
             texture="variants/original/spritesheet.png",
+            lineart_texture=(
+                lineart_export.get("spritesheet")
+                if lineart_export.get("enabled")
+                else None
+            ),
         ),
         "asset_manifest": "asset_manifest.json",
+        "lineart_export": lineart_export,
     }
+    if lineart_export.get("enabled"):
+        shared["runtime_contract"]["lineart"] = {
+            "texture": lineart_export.get("spritesheet"),
+            "rows": rows,
+            "columns": int(root_report.get("phases", 8)),
+            "cell_size": [output_cell, output_cell],
+            "phase_order": "columns_0_to_phases_minus_1",
+            "color": "white",
+            "background_mode": "transparent",
+            "composite": "runtime_layer",
+        }
     root_report.update(shared)
     sprite_render.write_json_atomic(root_path, root_report)
     for variant_path in sorted((output / "variants").glob("*/render_metadata.json")):
@@ -527,10 +577,18 @@ def process(
     realesrgan_repo: Path,
     python_executable: str,
     model_profile: str = "anime_x4plus_6b",
+    lineart_mode: str = "blender",
+    device: str | None = None,
+    precision: str = "fp32",
     progress_callback: Callable[[str, int, int | None], None] | None = None,
 ) -> dict[str, Any]:
     if not generated_sheet.is_file() or not structural_dir.is_dir():
         raise FileNotFoundError("generated_sheet ou structural_dir ausente")
+    device = device or os.environ.get("SPRITE_LAB_POSTPROCESS_DEVICE", "auto")
+    if device not in ("auto", "cpu", "cuda") or precision not in ("fp32", "fp16"):
+        raise ValueError("Dispositivo/precisão inválidos")
+    if lineart_mode not in ("blender", "lineart_standard", "lineart_coarse", "lineart_anime", "none"):
+        raise ValueError("Modo de lineart inválido")
     output.mkdir(parents=True, exist_ok=True)
     source_render = _source_render_info(structural_dir)
     started = time.monotonic()
@@ -547,6 +605,8 @@ def process(
             str(Path(__file__).with_name("realesrgan_birefnet_pipeline.py")),
             str(generated_sheet),
             str(mask_pass),
+            "--device", device,
+            "--precision", precision,
             "--rows",
             str(rows),
             "--phases",
@@ -611,6 +671,8 @@ def process(
             str(generated_sheet),
             str(mask_source),
             str(official),
+            "--device", device,
+            "--precision", precision,
             "--realesrgan-repo",
             str(realesrgan_repo),
             "--model-profile",
@@ -633,10 +695,43 @@ def process(
             str(foot_anchor[0]),
             str(foot_anchor[1]),
         ]
+    if lineart_mode == "blender":
+        pregan_command.extend(
+            [
+                "--lineart-mode",
+                "blender",
+                "--lineart-dir",
+                str(structural_dir),
+                "--lineart-strength",
+                "0.85",
+            ]
+        )
+    elif lineart_mode in ("lineart_standard", "lineart_coarse", "lineart_anime"):
+        pregan_command.extend(
+            [
+                "--lineart-mode",
+                lineart_mode,
+                "--lineart-strength",
+                "0.85",
+            ]
+        )
+    else:
+        pregan_command.extend(["--lineart-mode", "none"])
     official_report = _run(
         pregan_command,
         "pipeline original",
     )
+    lineart_export = official_report.get("lineart_export") or {
+        "enabled": False,
+        "mode": lineart_mode,
+        "color": "white",
+        "background": "transparent",
+        "composite": "separate_runtime_layer",
+        "directory": None,
+        "spritesheet": None,
+        "gifs": {},
+        "legacy_gif": None,
+    }
     _build_ordered_gif(official, rows, phases, fps)
     if progress_callback:
         progress_callback("building_color_variants", 90, 240)
@@ -700,6 +795,17 @@ def process(
         "render": source_render["render_properties"],
         "background_mode": "transparent",
     }
+    if lineart_export.get("enabled"):
+        runtime_contract["lineart"] = {
+            "texture": lineart_export.get("spritesheet"),
+            "rows": rows,
+            "columns": phases,
+            "cell_size": [source_cell * 2, source_cell * 2],
+            "phase_order": "columns_0_to_phases_minus_1",
+            "color": "white",
+            "background_mode": "transparent",
+            "composite": "runtime_layer",
+        }
     metadata = {
         "schema": "sprite_lab.gemini_sprite_postprocess/v1",
         "generated_sheet": str(generated_sheet.resolve()),
@@ -719,6 +825,11 @@ def process(
             foot_anchor=[foot_anchor[0] * 2, foot_anchor[1] * 2],
             timing=source_render["animation_timing"],
             texture="variants/original/spritesheet.png",
+            lineart_texture=(
+                lineart_export.get("spritesheet")
+                if lineart_export.get("enabled")
+                else None
+            ),
         ),
         "source_render_properties": source_render["render_properties"],
         "rows": rows,
@@ -732,12 +843,12 @@ def process(
             name: f"variants/{name}" for name in variants
         },
         "pipeline": [
-            "realesrgan_2x_mask_pass_cpu",
+            "realesrgan_2x_mask_pass",
             "birefnet_lite_512_binary_threshold_0.5",
             "foreground_chroma_cleanup_and_island_removal",
             "approved_birefnet_mask_512",
             "pregan_chroma_cleanup",
-            "realesrgan_2x_quality_pass_cpu",
+            "super_resolution_2x_quality_pass",
             "reapply_exact_approved_birefnet_mask",
             "four_output_variants",
         ],
@@ -747,6 +858,9 @@ def process(
         "official_report": official_report,
         "mask_model_profile": "anime_x4plus_6b",
         "model_profile": model_profile,
+        "lineart_mode": lineart_mode,
+        "lineart_export": lineart_export,
+        "runtime_requested": {"device": device, "precision": precision},
         "elapsed_seconds": round(time.monotonic() - started, 3),
         "asset_manifest": "asset_manifest.json",
     }
@@ -759,6 +873,7 @@ def process(
         "runtime_contract": runtime_contract,
         "runtime_asset_contract": metadata["runtime_asset_contract"],
         "source_render_properties": source_render["render_properties"],
+        "lineart_export": lineart_export,
     }
     for variant in variants.values():
         variant_path = variant / "render_metadata.json"
@@ -777,6 +892,7 @@ def process(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    add_runtime_arguments(parser)
     parser.add_argument("generated_sheet", type=Path)
     parser.add_argument("structural_dir", type=Path)
     parser.add_argument("output", type=Path)
@@ -788,6 +904,11 @@ def main() -> int:
     )
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--fps", type=float, default=10.0)
+    parser.add_argument(
+        "--lineart-mode",
+        choices=("blender", "lineart_standard", "lineart_coarse", "lineart_anime", "none"),
+        default="blender",
+    )
     parser.add_argument("--foot-anchor", type=int, nargs=2, default=(128, 220))
     args = parser.parse_args()
     report = process(
@@ -799,6 +920,9 @@ def main() -> int:
         realesrgan_repo=args.realesrgan_repo,
         python_executable=args.python,
         model_profile=args.model_profile,
+        lineart_mode=args.lineart_mode,
+        device=args.device,
+        precision=args.precision,
     )
     print(json.dumps(report, indent=2, ensure_ascii=False))
     return 0

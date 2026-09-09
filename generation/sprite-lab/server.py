@@ -13,8 +13,10 @@ import mimetypes
 import os
 import re
 import shutil
+import subprocess
 import sys
 import threading
+import time
 import uuid
 import zipfile
 from datetime import datetime, timezone
@@ -36,6 +38,8 @@ if LOCAL_VENV_SITE.is_dir() and str(LOCAL_VENV_SITE) not in sys.path:
     sys.path.insert(0, str(LOCAL_VENV_SITE))
 
 import relationship_catalog as rel
+import observability as obs
+import job_queue as jq
 import ai_render_spec
 import composition_export
 import gemini_sprite_postprocess
@@ -62,9 +66,12 @@ SPRITE_JOBS_PATH = STATE / "sprite_jobs.json"
 ACTION_ANNOTATIONS_PATH = rel.DEFAULT_ANNOTATIONS.with_name("action_annotations.json")
 SPRITE_WORK = BASE / "work" / "sprite-renders"
 GEMINI_WORK = BASE / "work" / "gemini-renders"
+GEMINI_IDENTITY_LINEART_CACHE = BASE / "work" / "gemini-identity-lineart"
 POSTPROCESS_WORK = BASE / "work" / "gemini-postprocess"
+POSTPROCESS_BENCHMARK_WORK = BASE / "work" / "postprocess-benchmark"
 GEMINI_JOBS_PATH = STATE / "gemini_jobs.json"
 POSTPROCESS_JOBS_PATH = STATE / "postprocess_jobs.json"
+ENV_ATLAS_JOBS_PATH = STATE / "env_atlas_jobs.json"
 GEMINI_CONFIG_PATH = STATE / "gemini_config.json"
 OPENAI_CONFIG_PATH = STATE / "openai_config.json"
 QWEN_CONFIG_PATH = STATE / "qwen_config.json"
@@ -79,6 +86,7 @@ GEMINI_CHANNEL_FILES = {
 }
 AI_RENDER_REFERENCE_CHANNELS = (*GEMINI_CHANNEL_FILES, "frame_control")
 DEFAULT_GEMINI_CHANNELS = tuple(GEMINI_CHANNEL_FILES)
+IDENTITY_GUIDE_MODES = ("lineart_standard", "canny_edges")
 JOB_LOCK = threading.Lock()
 BUG_TYPES = {
     "render_failure": "Falha em renderizar",
@@ -488,11 +496,200 @@ def get_postprocess_job(job_id: str) -> dict | None:
     return next((job for job in read_postprocess_jobs() if job.get("id") == job_id), None)
 
 
+def read_env_atlas_jobs() -> list[dict]:
+    return _read_jobs(ENV_ATLAS_JOBS_PATH)
+
+
+def get_env_atlas_job(job_id: str) -> dict | None:
+    return next((job for job in read_env_atlas_jobs() if job.get("id") == job_id), None)
+
+
+def _create_env_atlas_job(payload: dict) -> dict:
+    job = {
+        "id": f"env_atlas_{uuid.uuid4().hex[:12]}",
+        "status": "queued",
+        "created_at": utc_now(),
+        "payload": payload,
+    }
+    with JOB_LOCK:
+        jobs = read_env_atlas_jobs()
+        jobs.append(job)
+        write_json_atomic(ENV_ATLAS_JOBS_PATH, jobs)
+    return job
+
+
+def _run_env_atlas_job(
+    job_id: str,
+    cmd: list[str],
+    output_dir: Path,
+    *,
+    cwd: str,
+    timeout: float = 300.0,
+) -> None:
+    """Execute one env-atlas render in a background thread (SaaS-safe).
+
+    The historical sync ``POST /api/env-atlas`` path blocked the HTTP handler
+    thread for up to 5 minutes. Async jobs reuse this worker; the sync path
+    stays available for the current frontend.
+    """
+    _update_job_file(
+        ENV_ATLAS_JOBS_PATH,
+        job_id,
+        {"status": "running", "started_at": utc_now()},
+    )
+    obs.log_event("env_atlas_started", job_id=job_id)
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=cwd,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"Blender falhou: {(result.stderr or '')[-500:]}")
+        atlas_path = output_dir / "env_atlas.png"
+        if not atlas_path.exists():
+            raise RuntimeError("Atlas não foi gerado")
+        _update_job_file(
+            ENV_ATLAS_JOBS_PATH,
+            job_id,
+            {
+                "status": "done",
+                "finished_at": utc_now(),
+                "outputs": {"atlas_path": "/env-atlas/output/env_atlas.png"},
+            },
+        )
+        obs.log_event("env_atlas_finished", job_id=job_id, status="done")
+    except Exception as exc:  # noqa: BLE001 - job errors are returned to the UI.
+        _update_job_file(
+            ENV_ATLAS_JOBS_PATH,
+            job_id,
+            {"status": "error", "finished_at": utc_now(), "error": str(exc)},
+        )
+        obs.log_event("env_atlas_finished", job_id=job_id, status="error", error=str(exc)[:300])
+
+
+def _wants_sync(payload: dict) -> bool:
+    """Backwards-compat escape hatch: ``{"mode": "sync"}`` runs inline.
+
+    New clients (the web UI) use the async default: 202 + poll. Old scripts
+    may opt into the historical blocking behaviour explicitly.
+    """
+    return isinstance(payload, dict) and str(payload.get("mode", "")).lower() == "sync"
+
+
+def build_env_atlas_selection(payload: dict) -> dict:
+    """Translate a ``POST /api/env-atlas`` payload into a selection document.
+
+    Entries carry ``asset_id`` (resolved via ``model_cache.source_path`` to a
+    local ``fbx_path``) or a legacy absolute ``fbx_path``. Every path is
+    verified up-front so a typo fails fast with 400 instead of burning a
+    5-minute Blender job. Raises ``ValueError`` on any problem.
+    """
+    selected = payload.get("selected_assets", None)
+    if not isinstance(selected, list) or not selected:
+        raise ValueError("selecione ao menos um asset")
+    if len(selected) > 64:
+        raise ValueError("no máximo 64 assets por atlas")
+    assets: list[dict] = []
+    for index, entry in enumerate(selected):
+        if not isinstance(entry, dict):
+            raise ValueError(f"asset #{index} inválido")
+        asset_id = str(entry.get("asset_id") or "").strip()
+        if asset_id:
+            try:
+                fbx_path = str(model_cache.source_path(asset_id))
+            except (KeyError, ValueError, FileNotFoundError) as exc:
+                raise ValueError(f"asset {asset_id}: {exc}") from exc
+        else:
+            fbx_path = str(entry.get("fbx_path") or "")
+            if not fbx_path or not Path(fbx_path).is_file():
+                raise ValueError(f"asset #{index}: fbx_path inexistente")
+        try:
+            col = int(entry.get("col", index))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"asset #{index}: col inválida") from exc
+        assets.append(
+            {
+                "col": col,
+                "name": str(entry.get("name") or Path(fbx_path).stem),
+                "tile_key": str(entry.get("tile_key") or "prop"),
+                "category": str(entry.get("category") or "prop"),
+                "fbx_path": fbx_path,
+            }
+        )
+    return {
+        "schema": "sprite_lab.asset_selection/v1",
+        "render_profile": str(payload.get("render_profile", "env_atlas_v1")),
+        "assets": assets,
+    }
+    """Backwards-compat escape hatch: ``{"mode": "sync"}`` runs inline.
+
+    New clients (the web UI) use the async default: 202 + poll. Old scripts
+    may opt into the historical blocking behaviour explicitly.
+    """
+    return isinstance(payload, dict) and str(payload.get("mode", "")).lower() == "sync"
+
+
+def _maintenance_reindex_worker() -> dict:
+    manifest = rel.build_relationship_catalog()
+    result = {
+        "ok": True,
+        "asset_count": manifest["asset_count"],
+        "animation_count": manifest["animation_count"],
+    }
+    obs.log_event(
+        "maintenance_reindex_done",
+        asset_count=result["asset_count"],
+        animation_count=result["animation_count"],
+    )
+    return result
+
+
+def _relationships_save_worker(body: dict) -> dict:
+    relationship = rel.add_relationship(body)
+    try:
+        export = composition_export.export_relationship(relationship)
+    except (OSError, ValueError, RuntimeError, KeyError) as exc:
+        # Historical behaviour answered 500 *after* persisting. As a job we
+        # persist that nuance in the result instead of failing the job: the
+        # composition exists, only the GLB export failed.
+        manifest = rel.build_relationship_catalog()
+        result = {
+            "relationship": relationship,
+            "export": None,
+            "export_error": str(exc),
+            "catalog_generated_at": manifest["generated_at"],
+        }
+        obs.log_event("maintenance_relationship_saved", export="failed")
+        return result
+    manifest = rel.build_relationship_catalog()
+    result = {
+        "relationship": {**relationship, "export": export},
+        "export": export,
+        "catalog_generated_at": manifest["generated_at"],
+    }
+    obs.log_event("maintenance_relationship_saved", export="ok")
+    return result
+
+
+def _relationships_delete_worker(relationship_id: str) -> dict:
+    relationship = rel.delete_relationship(relationship_id)
+    manifest = rel.build_relationship_catalog()
+    result = {"relationship": relationship, "catalog_generated_at": manifest["generated_at"]}
+    obs.log_event("maintenance_relationship_deleted")
+    return result
+
+
 def pipeline_python_executable() -> str:
-    """Use the dependency-complete CPU environment for worker subprocesses."""
+    """Prefer the local CUDA-capable runtime; explicit configuration wins."""
     configured = os.environ.get("SPRITE_LAB_PYTHON", "").strip()
     if configured:
         return configured
+    gpu_python = Path.home() / "pose-venv" / "bin" / "python"
+    if gpu_python.is_file():
+        return str(gpu_python)
     local = BASE / "work" / "teed-venv" / "bin" / "python"
     return str(local) if local.is_file() else sys.executable
 
@@ -540,6 +737,17 @@ def normalize_gemini_channels(value) -> list[str]:
     if not channels:
         raise ValueError("selecione ao menos uma referência estrutural")
     return channels
+
+
+def normalize_identity_guide_mode(value) -> str:
+    """Validate the detector used for the derived identity guide input."""
+    mode = str(value or "lineart_standard").strip().casefold()
+    if mode not in IDENTITY_GUIDE_MODES:
+        raise ValueError(
+            f"identity_lineart_mode inválido: {value!r}; "
+            f"use um de {', '.join(IDENTITY_GUIDE_MODES)}"
+        )
+    return mode
 
 
 def list_gemini_sources() -> list[dict]:
@@ -642,6 +850,17 @@ class UploadTooLargeError(ValueError):
     """Raised when a catalog upload exceeds UPLOAD_MAX_BYTES."""
 
 
+class BodyTooLargeError(ValueError):
+    """Raised when a JSON body exceeds MAX_BODY_BYTES."""
+
+
+# Global ceiling for JSON request bodies. Large but bounded: Gemini identity
+# references (data URLs of ~25MB images ≈ 33MB base64) must pass, while
+# unbounded reads cannot exhaust RAM. The ZIP upload and /api/events paths
+# enforce their own stricter limits before reaching _body.
+MAX_BODY_BYTES = 64 * 1024 * 1024
+
+
 def catalog_upload_root() -> Path:
     """Inbox directory watched by the catalog indexer (auto_discover)."""
     root = rel.DEFAULT_OUTPUT.parent.parent
@@ -697,6 +916,12 @@ def save_catalog_upload(handler: BaseHTTPRequestHandler, filename: str) -> dict:
     except (OSError, ValueError):
         temporary.unlink(missing_ok=True)
         raise
+    obs.log_event(
+        "catalog_upload_received",
+        file=destination.name,
+        bytes=total,
+        source_id_hint=incoming_source_id(destination.name),
+    )
     return {
         "file": destination.name,
         "bytes": total,
@@ -724,6 +949,19 @@ def list_catalog_uploads() -> list[dict]:
     return rows
 
 
+def _model_cache_stats() -> dict:
+    """Lightweight cache counters for ``GET /api/health`` (never runs Blender)."""
+    try:
+        cached = sum(1 for item in model_cache.MODEL_CACHE_PATH.iterdir() if item.suffix == ".glb")
+    except OSError:
+        cached = 0
+    try:
+        sources = sum(1 for item in model_cache.SOURCE_CACHE_PATH.iterdir() if item.is_dir())
+    except OSError:
+        sources = 0
+    return {"converted_glb": cached, "extracted_sources": sources}
+
+
 def update_sprite_job(job_id: str, patch: dict) -> dict | None:
     with JOB_LOCK:
         jobs = read_sprite_jobs()
@@ -739,8 +977,8 @@ def get_sprite_job(job_id: str) -> dict | None:
     return next((job for job in read_sprite_jobs() if job.get("id") == job_id), None)
 
 
-def build_sprite_download(job_id: str) -> tuple[bytes, str]:
-    """Package every deliverable from a completed sprite job in one archive."""
+def _sprite_download_files(job_id: str) -> tuple[list[tuple[Path, str]], str]:
+    """Collect deliverables for the sprite-job ZIP download."""
     job = get_sprite_job(job_id)
     if job is None:
         raise KeyError("renderização de sprites não encontrada")
@@ -771,12 +1009,35 @@ def build_sprite_download(job_id: str) -> tuple[bytes, str]:
             files.append((path, name if name == "spritesheet.png" else f"metadata/{name}"))
     if not files:
         raise FileNotFoundError("nenhum artefato encontrado para download")
+    return files, f"sprites_{job_id}.zip"
 
+
+def build_sprite_download(job_id: str) -> tuple[bytes, str]:
+    """Package every deliverable from a completed sprite job in one archive."""
+    files, filename = _sprite_download_files(job_id)
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for path, archive_name in files:
             archive.write(path, archive_name)
-    return buffer.getvalue(), f"sprites_{job_id}.zip"
+    return buffer.getvalue(), filename
+
+
+def build_sprite_download_file(job_id: str, directory: Path | None = None) -> tuple[Path, str]:
+    """Same archive as :func:`build_sprite_download` but spooled to disk.
+
+    Preferred for the HTTP layer: the ZIP is streamed from the file instead
+    of being held whole in RAM (see ``_download_path``).
+    """
+    files, filename = _sprite_download_files(job_id)
+    target_dir = directory or SPRITE_WORK
+    target_dir.mkdir(parents=True, exist_ok=True)
+    temporary = target_dir / f".{filename}.tmp.zip"
+    with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for path, archive_name in files:
+            archive.write(path, archive_name)
+    destination = target_dir / filename
+    temporary.replace(destination)
+    return destination, filename
 
 
 def read_bug_reports() -> list[dict]:
@@ -1190,6 +1451,80 @@ def build_ai_render_frame_control(output_path: Path) -> None:
     image.close()
 
 
+def _prepare_identity_lineart(
+    source_path: Path,
+    output_path: Path,
+    mode: str = "lineart_standard",
+) -> dict[str, object]:
+    """Create the selected line/edge companion for an identity reference.
+
+    The detector lives in the CUDA-capable pipeline environment, so the HTTP
+    server does not need to import ControlNet annotators into its own runtime.
+    Results are cached by the exact identity image hash and detector mode
+    because each deterministic detector produces a different input guide.
+    """
+    mode = normalize_identity_guide_mode(mode)
+    source_hash = sha256_file(source_path)
+    cache_path = GEMINI_IDENTITY_LINEART_CACHE / f"{source_hash}_{mode}.png"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if cache_path.is_file():
+        shutil.copy2(cache_path, output_path)
+        return {
+            "mode": mode,
+            "detector": (
+                "controlnet_aux.LineartDetector"
+                if mode == "lineart_standard"
+                else "controlnet_aux.CannyDetector"
+            ),
+            "cache_hit": True,
+            "source_sha256": source_hash,
+            "path": str(output_path),
+        }
+
+    completed = subprocess.run(
+        [
+            pipeline_python_executable(),
+            str(BASE / "identity_lineart.py"),
+            str(source_path),
+            str(output_path),
+            "--mode",
+            mode,
+            "--device",
+            os.environ.get("SPRITE_LAB_IDENTITY_LINEART_DEVICE", "auto"),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(BASE),
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"pré-processamento {mode} falhou:\n"
+            f"{completed.stdout}\n{completed.stderr}"
+        )
+    try:
+        lines = completed.stdout.splitlines()
+        json_start = next(
+            index for index, line in enumerate(lines) if line.strip().startswith("{")
+        )
+        report = json.loads("\n".join(lines[json_start:]))
+    except (StopIteration, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            f"pré-processamento {mode} não produziu relatório JSON"
+        ) from error
+    if not output_path.is_file():
+        raise RuntimeError(f"pré-processamento {mode} não produziu a imagem")
+    GEMINI_IDENTITY_LINEART_CACHE.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(output_path, cache_path)
+    return {
+        **(report if isinstance(report, dict) else {}),
+        "mode": mode,
+        "cache_hit": False,
+        "source_sha256": source_hash,
+        "path": str(output_path),
+    }
+
+
 def run_gemini_job(job: dict) -> None:
     started_at = utc_now()
     update_gemini_job(
@@ -1205,6 +1540,9 @@ def run_gemini_job(job: dict) -> None:
         provider_name = image_generation_provider.normalize_provider(
             str(job["payload"].get("provider", "openai"))
         )
+        identity_lineart_mode = normalize_identity_guide_mode(
+            job["payload"].get("identity_lineart_mode")
+        )
         output = GEMINI_WORK / job["id"] / "gemini_output.png"
         reference_channels = normalize_gemini_channels(
             job["payload"].get(
@@ -1215,6 +1553,18 @@ def run_gemini_job(job: dict) -> None:
         reference_id = str(job["payload"].get("reference_id", "")).strip()
         if reference_id:
             shutil.copy2(gemini_reference_path(reference_id), input_paths[0])
+        identity_lineart_path = GEMINI_WORK / job["id"] / "identity_lineart.png"
+        update_pipeline_progress(
+            GEMINI_JOBS_PATH,
+            job["id"],
+            stage="preprocessing_identity_lineart",
+            percent=8,
+            eta_seconds=120,
+        )
+        identity_lineart_report = _prepare_identity_lineart(
+            input_paths[0], identity_lineart_path, mode=identity_lineart_mode
+        )
+        input_paths.append(identity_lineart_path)
         frame_control_path = None
         if "frame_control" in reference_channels:
             frame_control_path = GEMINI_WORK / job["id"] / "frame_control.png"
@@ -1230,6 +1580,7 @@ def run_gemini_job(job: dict) -> None:
         input_paths.extend(reference_paths[channel] for channel in reference_channels)
         reference_hashes = {
             "identity": sha256_file(input_paths[0]),
+            "identity_lineart": sha256_file(identity_lineart_path),
             **{
                 channel: sha256_file(path)
                 for channel, path in reference_paths.items()
@@ -1239,11 +1590,17 @@ def run_gemini_job(job: dict) -> None:
             with_ai_render_source_contract(job["payload"].get("render_spec"), source),
             name=str(job["payload"].get("render_name") or "").strip(),
         )
+        output_size = [
+            int(render_spec["output"]["width"]),
+            int(render_spec["output"]["height"]),
+        ]
         reference_manifest = ai_render_spec.build_reference_manifest(
             reference_channels,
             identity_name=str(job["payload"].get("reference_name") or "identity reference"),
+            include_identity_lineart=True,
+            identity_lineart_mode=identity_lineart_mode,
         )
-        expected_roles = ["identity", *reference_channels]
+        expected_roles = ["identity", "identity_lineart", *reference_channels]
         actual_roles = [str(item.get("type")) for item in reference_manifest]
         if actual_roles != expected_roles or len(input_paths) != len(reference_manifest):
             raise RuntimeError(
@@ -1274,6 +1631,8 @@ def run_gemini_job(job: dict) -> None:
             "compiled_prompt": prompt,
             "prompt_contract_schema": ai_render_spec.PROMPT_SCHEMA,
             "reference_manifest": reference_manifest,
+            "output_size": output_size,
+            "identity_lineart": identity_lineart_report,
         }
         job["payload"] = runtime_payload
         update_gemini_job(
@@ -1296,8 +1655,9 @@ def run_gemini_job(job: dict) -> None:
             model=str(job["payload"]["model"]),
             metadata={
                 "source_id": job["payload"]["source_id"],
-                "channels": ["identity", *reference_channels],
-                "output_size": [2048, 2048],
+                "channels": ["identity", "identity_lineart", *reference_channels],
+                "output_size": output_size,
+                "identity_lineart": identity_lineart_report,
                 "qwen_seed": job["payload"].get("qwen_seed"),
                 "gemini_temperature": job["payload"].get("gemini_temperature", 1.0),
                 "gemini_top_k": job["payload"].get("gemini_top_k", 64),
@@ -1343,9 +1703,9 @@ def run_gemini_job(job: dict) -> None:
             eta_seconds=5,
         )
         with Image.open(result.output_path) as image:
-            if image.size != (2048, 2048):
+            if image.size != tuple(output_size):
                 raise RuntimeError(
-                    f"{provider_name} retornou {image.size}; esperado (2048, 2048)"
+                    f"{provider_name} retornou {image.size}; esperado {tuple(output_size)}"
                 )
         # Keep this as a separate persisted artifact for visual inspection.
         # `gemini_output.png` remains the only canonical pipeline input.
@@ -1353,6 +1713,7 @@ def run_gemini_job(job: dict) -> None:
         validation_report = build_ai_render_validation_overlay(
             result.output_path,
             validation_output,
+            cell_size=output_size[0] // ai_render_spec.GRID_COLUMNS,
         )
         validation_report.update(
             {
@@ -1377,6 +1738,7 @@ def run_gemini_job(job: dict) -> None:
             ),
             "prompt_contract_schema": ai_render_spec.PROMPT_SCHEMA,
             "reference_hashes": reference_hashes,
+            "identity_lineart": job["payload"].get("identity_lineart"),
         }
         update_gemini_job(
             job["id"],
@@ -1388,7 +1750,8 @@ def run_gemini_job(job: dict) -> None:
                 "report": {
                     "provider": result.provider,
                     "model": result.model,
-                    "output_size": [2048, 2048],
+                    "output_size": output_size,
+                    "identity_lineart": job["payload"].get("identity_lineart"),
                     "response_metadata": result.response_metadata,
                     "validation": validation_report,
                 },
@@ -1396,6 +1759,7 @@ def run_gemini_job(job: dict) -> None:
                     "image": f"{job['id']}/gemini_output.png",
                     "validation": f"{job['id']}/gemini_validation.png",
                     "reference": f"{job['id']}/reference.png",
+                    "identity_lineart": f"{job['id']}/identity_lineart.png",
                     "frame_control": (
                         f"{job['id']}/frame_control.png"
                         if frame_control_path is not None
@@ -1429,6 +1793,70 @@ def run_gemini_job(job: dict) -> None:
         )
 
 
+def _prepare_gemini_postprocess_sheet(
+    generated_sheet: Path,
+    output: Path,
+    *,
+    rows: int = 8,
+    phases: int = 8,
+    target_cell: int = 256,
+) -> tuple[Path, dict[str, object]]:
+    """Normalize a 1K AI Render sheet to the postprocess 2K working grid.
+
+    AI Render can intentionally produce 1024×1024 (128px cells) to reduce
+    generation cost. The established postprocess contract starts at 256px per
+    cell and finishes at 512px, so each cell is enlarged independently before
+    the mask and neural upscale passes. Resizing cells independently prevents
+    pixels from bleeding across animation boundaries.
+    """
+    from PIL import Image
+
+    output.mkdir(parents=True, exist_ok=True)
+    with Image.open(generated_sheet) as opened:
+        source_size = opened.size
+        if source_size == (target_cell * phases, target_cell * rows):
+            return generated_sheet, {
+                "applied": False,
+                "source_size": list(source_size),
+                "working_size": list(source_size),
+                "method": "none",
+            }
+        expected_source = (128 * phases, 128 * rows)
+        if source_size != expected_source:
+            raise ValueError(
+                "o pós-processamento aceita AI Render em 1024×1024 ou 2048×2048; "
+                f"recebido {source_size}"
+            )
+        source_cell = source_size[0] // phases
+        source = opened.convert("RGBA")
+    working_size = (target_cell * phases, target_cell * rows)
+    working = Image.new("RGBA", working_size, (0, 0, 0, 0))
+    for row in range(rows):
+        for column in range(phases):
+            box = (
+                column * source_cell,
+                row * source_cell,
+                (column + 1) * source_cell,
+                (row + 1) * source_cell,
+            )
+            cell = source.crop(box)
+            enlarged = cell.resize((target_cell, target_cell), Image.Resampling.LANCZOS)
+            working.alpha_composite(enlarged, (column * target_cell, row * target_cell))
+            cell.close()
+            enlarged.close()
+    target = output / "postprocess_input_2048.png"
+    working.save(target, format="PNG")
+    source.close()
+    working.close()
+    return target, {
+        "applied": True,
+        "source_size": list(source_size),
+        "working_size": list(working_size),
+        "method": "per_cell_lanczos_2x",
+        "path": str(target),
+    }
+
+
 def run_postprocess_job(job: dict) -> None:
     update_postprocess_job(
         job["id"],
@@ -1440,6 +1868,7 @@ def run_postprocess_job(job: dict) -> None:
     )
     try:
         model_profile = str(job.get("payload", {}).get("model_profile", "anime_x4plus_6b"))
+        lineart_mode = str(job.get("payload", {}).get("lineart_mode", "blender"))
         huggingface_realesrgan.profile(model_profile)
         gemini_job = get_gemini_job(str(job["payload"]["gemini_job_id"]))
         if gemini_job is None or gemini_job.get("status") != "done":
@@ -1453,6 +1882,11 @@ def run_postprocess_job(job: dict) -> None:
             f"{gemini_job['id']}/gemini_output.png",
         )
         output = _safe_work_child(POSTPROCESS_WORK, job["id"])
+        output.mkdir(parents=True, exist_ok=True)
+        postprocess_sheet, input_normalization = _prepare_gemini_postprocess_sheet(
+            generated_sheet,
+            output,
+        )
         update_pipeline_progress(
             POSTPROCESS_JOBS_PATH,
             job["id"],
@@ -1461,7 +1895,7 @@ def run_postprocess_job(job: dict) -> None:
             eta_seconds=1800,
         )
         report = gemini_sprite_postprocess.process(
-            generated_sheet,
+            postprocess_sheet,
             structural_dir,
             output,
             rows=8,
@@ -1472,6 +1906,7 @@ def run_postprocess_job(job: dict) -> None:
             realesrgan_repo=BASE / "work" / "Real-ESRGAN",
             python_executable=pipeline_python_executable(),
             model_profile=model_profile,
+            lineart_mode=lineart_mode,
             progress_callback=lambda stage, percent, eta: update_pipeline_progress(
                 POSTPROCESS_JOBS_PATH,
                 job["id"],
@@ -1480,6 +1915,10 @@ def run_postprocess_job(job: dict) -> None:
                 eta_seconds=eta,
             ),
         )
+        report["generated_sheet"] = str(generated_sheet.resolve())
+        report["postprocess_input_sheet"] = str(postprocess_sheet.resolve())
+        report["input_normalization"] = input_normalization
+        lineart_export = report.get("lineart_export") or {}
         variant_outputs = {
             name: {
                 "spritesheet": f"{job['id']}/variants/{name}/spritesheet.png",
@@ -1487,6 +1926,13 @@ def run_postprocess_job(job: dict) -> None:
             }
             for name in ("original", "frame_adjustment", "color_cohesion_256", "color_cohesion_128")
         }
+        lineart_outputs = None
+        if lineart_export.get("enabled"):
+            lineart_outputs = {
+                "mode": lineart_export.get("mode", lineart_mode),
+                "spritesheet": f"{job['id']}/lineart/spritesheet.png",
+                "gif": f"{job['id']}/lineart/animation_all_directions_1-2-5-4-3-8-7-6.gif",
+            }
         update_postprocess_job(
             job["id"],
             {
@@ -1495,6 +1941,7 @@ def run_postprocess_job(job: dict) -> None:
                 "report": report,
                 "outputs": {
                     "variants": variant_outputs,
+                    "lineart": lineart_outputs,
                     "asset_manifest": f"{job['id']}/asset_manifest.json",
                     "metadata": f"{job['id']}/render_metadata.json",
                 },
@@ -1551,6 +1998,8 @@ def _json(handler: BaseHTTPRequestHandler, data, status: int = 200) -> None:
 
 def _body(handler: BaseHTTPRequestHandler) -> dict:
     length = int(handler.headers.get("Content-Length", 0) or 0)
+    if length > MAX_BODY_BYTES:
+        raise BodyTooLargeError(f"corpo acima do limite de {MAX_BODY_BYTES // (1024 * 1024)} MB")
     raw = handler.rfile.read(length) if length else b"{}"
     try:
         value = json.loads(raw.decode("utf-8"))
@@ -1564,13 +2013,17 @@ def _file(handler: BaseHTTPRequestHandler, path: Path) -> None:
         _json(handler, {"error": "not found"}, 404)
         return
     mime = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
-    data = path.read_bytes()
+    size = path.stat().st_size
     handler.send_response(200)
     handler.send_header("Content-Type", mime)
-    handler.send_header("Content-Length", str(len(data)))
+    handler.send_header("Content-Length", str(size))
     handler.send_header("Cache-Control", "no-store")
     handler.end_headers()
-    handler.wfile.write(data)
+    # Stream in chunks: the previous read_bytes() held whole GLBs (~11MB),
+    # atlases and GIFs in RAM per request.
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            handler.wfile.write(chunk)
 
 
 def _download(handler: BaseHTTPRequestHandler, data: bytes, filename: str, content_type: str) -> None:
@@ -1583,10 +2036,60 @@ def _download(handler: BaseHTTPRequestHandler, data: bytes, filename: str, conte
     handler.wfile.write(data)
 
 
+def _download_path(handler: BaseHTTPRequestHandler, path: Path, filename: str, content_type: str) -> None:
+    """Stream a file as an attachment without loading it into RAM."""
+    size = path.stat().st_size
+    handler.send_response(200)
+    handler.send_header("Content-Type", content_type)
+    handler.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+    handler.send_header("Content-Length", str(size))
+    handler.send_header("Cache-Control", "no-store")
+    handler.end_headers()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            handler.wfile.write(chunk)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "SpriteLabSemantic/1.0"
 
+    def handle_one_request(self):  # noqa: N802
+        """Attach a request ID and structured timing to every request.
+
+        This wraps ``do_GET``/``do_POST`` without touching their bodies: the
+        ID is propagated via ``X-Request-Id`` (see ``end_headers``) and every
+        response is logged as one JSON line (see ``log_message``).
+        """
+        self._request_id = obs.new_request_id()
+        self._request_started = time.monotonic()
+        try:
+            super().handle_one_request()
+        finally:
+            duration_ms = round((time.monotonic() - self._request_started) * 1000, 2)
+            obs.log_event(
+                "http_access",
+                method=self.command,
+                path=self.path,
+                status=getattr(self, "_logged_status", 0),
+                duration_ms=duration_ms,
+                request_id=self._request_id,
+            )
+
+    def send_response(self, code, message=None):  # noqa: N802
+        self._logged_status = code
+        super().send_response(code, message)
+
+    def end_headers(self):  # noqa: N802
+        request_id = getattr(self, "_request_id", None)
+        if request_id and not getattr(self, "_request_id_sent", False):
+            self.send_header("X-Request-Id", request_id)
+            self._request_id_sent = True
+        super().end_headers()
+
     def log_message(self, fmt, *args):
+        # Access telemetry is emitted once per request in handle_one_request
+        # (event ``http_access`` with duration). Keep stdout clean: it is
+        # reserved for the boot banner; structured logs go to stderr.
         return
 
     def do_GET(self):  # noqa: N802
@@ -1594,6 +2097,9 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path
         query = parse_qs(parsed.query)
         try:
+            if path == "/api/health":
+                _json(self, obs.health_snapshot({"cache": _model_cache_stats()}))
+                return
             if path == "/api/state":
                 manifest = ensure_relationship_catalog()
                 _json(
@@ -1689,6 +2195,20 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/postprocess-jobs":
                 _json(self, {"jobs": read_postprocess_jobs()})
                 return
+            if path == "/api/env-atlas/jobs":
+                _json(self, {"jobs": read_env_atlas_jobs()})
+                return
+            if path == "/api/maintenance/jobs":
+                _json(self, {"jobs": jq.list_jobs()})
+                return
+            if path.startswith("/api/maintenance/jobs/"):
+                job = jq.get_job(unquote(path.removeprefix("/api/maintenance/jobs/")))
+                _json(self, job or {"error": "not found"}, 200 if job else 404)
+                return
+            if path.startswith("/api/env-atlas/jobs/"):
+                job = get_env_atlas_job(unquote(path.removeprefix("/api/env-atlas/jobs/")))
+                _json(self, job or {"error": "not found"}, 200 if job else 404)
+                return
             if path == "/api/render-profiles":
                 _json(self, {"render_profiles": render_profile.list_profiles()})
                 return
@@ -1700,8 +2220,14 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path.startswith("/api/sprite-jobs/") and path.endswith("/download"):
                 job_id = unquote(path.removeprefix("/api/sprite-jobs/").removesuffix("/download").strip("/"))
-                data, filename = build_sprite_download(job_id)
-                _download(self, data, filename, "application/zip")
+                archive_path, filename = build_sprite_download_file(job_id)
+                try:
+                    _download_path(self, archive_path, filename, "application/zip")
+                finally:
+                    try:
+                        archive_path.unlink()
+                    except OSError:
+                        pass
                 return
             if path == "/api/bug-reports":
                 _json(self, {"reports": read_bug_reports()})
@@ -1762,6 +2288,19 @@ class Handler(BaseHTTPRequestHandler):
                 target = (SPRITE_WORK / relative).resolve()
                 if not target.is_relative_to(SPRITE_WORK.resolve()):
                     _json(self, {"error": "invalid sprite output path"}, 400)
+                    return
+                _file(self, target)
+                return
+            if path.startswith("/postprocess-benchmark/"):
+                # Read-only, explicitly scoped publication of local POC
+                # artifacts. Do not expose the wider work directory.
+                relative = Path(unquote(path.removeprefix("/postprocess-benchmark/")))
+                target = (POSTPROCESS_BENCHMARK_WORK / relative).resolve()
+                if not target.is_relative_to(POSTPROCESS_BENCHMARK_WORK.resolve()):
+                    _json(self, {"error": "invalid benchmark path"}, 400)
+                    return
+                if not target.is_file():
+                    _json(self, {"error": "benchmark artifact not found"}, 404)
                     return
                 _file(self, target)
                 return
@@ -1841,11 +2380,47 @@ class Handler(BaseHTTPRequestHandler):
                 return
             _json(self, result, 201)
             return
-        body = _body(self)
+        if path == "/api/events":
+            client_ip = self.client_address[0] if self.client_address else "unknown"
+            if not obs.check_events_rate_limit(client_ip):
+                obs.log_event("events_rate_limited", client_ip=client_ip)
+                self.send_response(429)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Retry-After", "60")
+                self.end_headers()
+                self.wfile.write(b'{"error": "muitas requisicoes, tente em um minuto"}')
+                return
+            try:
+                total = int(self.headers.get("Content-Length", 0) or 0)
+            except (TypeError, ValueError):
+                total = 0
+            if total <= 0 or total > obs.MAX_INGEST_BODY_BYTES:
+                _json(self, {"error": "corpo deve ter entre 1 byte e 64 KB"}, 413)
+                return
+            try:
+                name, props = obs.validate_frontend_event(_body(self))
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                _json(self, {"error": str(exc)}, 400)
+                return
+            entry = obs.ingest_frontend_event(
+                name, props, request_id=getattr(self, "_request_id", None)
+            )
+            _json(self, {"ok": True, "event": entry["event"], "ts": entry["ts"]}, 202)
+            return
+        try:
+            body = _body(self)
+        except BodyTooLargeError as exc:
+            _json(self, {"error": str(exc)}, 413)
+            return
         try:
             if path == "/api/reindex":
-                manifest = rel.build_relationship_catalog()
-                _json(self, {"ok": True, "asset_count": manifest["asset_count"], "animation_count": manifest["animation_count"]})
+                if _wants_sync(body):
+                    manifest = rel.build_relationship_catalog()
+                    _json(self, {"ok": True, "asset_count": manifest["asset_count"], "animation_count": manifest["animation_count"]})
+                    return
+                job = jq.submit("reindex", {}, _maintenance_reindex_worker)
+                obs.log_event("maintenance_enqueued", kind="reindex", job_id=job["id"])
+                _json(self, job, 202)
                 return
             if path == "/api/annotate":
                 asset_id = str(body.get("asset_id", ""))
@@ -1867,38 +2442,59 @@ class Handler(BaseHTTPRequestHandler):
                 _json(self, {"annotation": annotation})
                 return
             if path == "/api/relationships":
-                relationship = rel.add_relationship(body)
-                try:
-                    export = composition_export.export_relationship(relationship)
-                except (OSError, ValueError, RuntimeError, KeyError) as exc:
+                if not isinstance(body, dict):
+                    _json(self, {"error": "payload inválido"}, 400)
+                    return
+                if _wants_sync(body):
+                    relationship = rel.add_relationship(body)
+                    try:
+                        export = composition_export.export_relationship(relationship)
+                    except (OSError, ValueError, RuntimeError, KeyError) as exc:
+                        _json(
+                            self,
+                            {
+                                "error": f"Composição salva, mas a exportação GLB falhou: {exc}",
+                                "relationship": relationship,
+                            },
+                            500,
+                        )
+                        return
+                    manifest = rel.build_relationship_catalog()
                     _json(
                         self,
                         {
-                            "error": f"Composição salva, mas a exportação GLB falhou: {exc}",
-                            "relationship": relationship,
+                            "relationship": {**relationship, "export": export},
+                            "export": export,
+                            "catalog_generated_at": manifest["generated_at"],
                         },
-                        500,
+                        201,
                     )
                     return
-                manifest = rel.build_relationship_catalog()
-                _json(
-                    self,
-                    {
-                        "relationship": {**relationship, "export": export},
-                        "export": export,
-                        "catalog_generated_at": manifest["generated_at"],
-                    },
-                    201,
+                job = jq.submit(
+                    "relationship_save",
+                    {"semantic_name": body.get("semantic_name")},
+                    lambda: _relationships_save_worker(body),
                 )
+                obs.log_event("maintenance_enqueued", kind="relationship_save", job_id=job["id"])
+                _json(self, job, 202)
                 return
             if path == "/api/relationships/delete":
-                relationship_id = str(body.get("relationship_id", ""))
+                relationship_id = str(body.get("relationship_id", "")) if isinstance(body, dict) else ""
                 if not relationship_id:
                     _json(self, {"error": "relationship_id é obrigatório"}, 400)
                     return
-                relationship = rel.delete_relationship(relationship_id)
-                manifest = rel.build_relationship_catalog()
-                _json(self, {"relationship": relationship, "catalog_generated_at": manifest["generated_at"]})
+                if _wants_sync(body):
+                    relationship = rel.delete_relationship(relationship_id)
+                    manifest = rel.build_relationship_catalog()
+                    _json(self, {"relationship": relationship, "catalog_generated_at": manifest["generated_at"]})
+                    return
+                job = jq.submit(
+                    "relationship_delete",
+                    {"relationship_id": relationship_id},
+                    lambda: _relationships_delete_worker(relationship_id),
+                )
+                obs.log_event("maintenance_enqueued", kind="relationship_delete", job_id=job["id"])
+                _json(self, job, 202)
                 return
             if path == "/api/sprite-render":
                 payload = body.get("payload", body)
@@ -1942,7 +2538,7 @@ class Handler(BaseHTTPRequestHandler):
                     jobs = read_sprite_jobs()
                     jobs.append(job)
                     write_json_atomic(SPRITE_JOBS_PATH, jobs)
-                threading.Thread(target=run_sprite_job, args=(job,), daemon=True).start()
+                jq.run_in_background(run_sprite_job, job)
                 _json(self, job, 202)
                 return
             if path in {"/api/tile-render", "/api/prop-render", "/api/vfx-render"}:
@@ -1985,11 +2581,7 @@ class Handler(BaseHTTPRequestHandler):
                     jobs = read_sprite_jobs()
                     jobs.append(job)
                     write_json_atomic(SPRITE_JOBS_PATH, jobs)
-                threading.Thread(
-                    target=run_asset_job,
-                    args=(job, tile_render_mod),
-                    daemon=True,
-                ).start()
+                jq.run_in_background(run_asset_job, job, tile_render_mod)
                 _json(self, job, 202)
                 return
             if path == "/api/env-atlas":
@@ -1998,16 +2590,21 @@ class Handler(BaseHTTPRequestHandler):
                     _json(self, {"error": "payload inválido"}, 400)
                     return
                 blender_path = payload.get("blender_path", "/usr/bin/blender")
-                directions = payload.get("directions", 8)
                 render_profile_id = payload.get("render_profile", "env_atlas_v1")
-                selected_assets = payload.get("selected_assets", None)
-
-                import subprocess
-                import time
+                try:
+                    selection = build_env_atlas_selection(payload)
+                except ValueError as exc:
+                    _json(self, {"error": str(exc)}, 400)
+                    return
 
                 env_atlas_dir = BASE / "env_atlas"
                 output_dir = env_atlas_dir / "output"
                 output_dir.mkdir(parents=True, exist_ok=True)
+                selection_path = output_dir / "selection.json"
+                selection_path.write_text(
+                    json.dumps(selection, indent=2, ensure_ascii=False) + "\n",
+                    encoding="utf-8",
+                )
 
                 render_script = BASE / "render_env_atlas.py"
                 cmd = [
@@ -2015,7 +2612,28 @@ class Handler(BaseHTTPRequestHandler):
                     str(render_script),
                     "--blender", blender_path,
                     "--output", str(output_dir),
+                    "--assets", str(selection_path),
                 ]
+
+                wants_async = not _wants_sync(payload)
+                if wants_async:
+                    job = _create_env_atlas_job(
+                        {
+                            "blender_path": blender_path,
+                            "render_profile": render_profile_id,
+                            "selected_assets": selection["assets"],
+                        }
+                    )
+                    jq.run_in_background(
+                        _run_env_atlas_job,
+                        job["id"],
+                        cmd,
+                        output_dir,
+                        cwd=str(BASE),
+                    )
+                    obs.log_event("env_atlas_enqueued", job_id=job["id"])
+                    _json(self, job, 202)
+                    return
 
                 try:
                     result = subprocess.run(
@@ -2040,8 +2658,10 @@ class Handler(BaseHTTPRequestHandler):
                         "cells": 64,
                         "size": "2048×2048",
                     }, 200)
+                    obs.log_event("env_atlas_finished", status="done", mode="sync")
                 except subprocess.TimeoutExpired:
                     _json(self, {"error": "Timeout na renderização"}, 500)
+                    obs.log_event("env_atlas_finished", status="error", mode="sync", error="timeout")
                 except Exception as exc:
                     _json(self, {"error": str(exc)}, 500)
                 return
@@ -2059,6 +2679,9 @@ class Handler(BaseHTTPRequestHandler):
                     channels = normalize_gemini_channels(
                         body.get("reference_channels", body.get("blender_channels"))
                     )
+                    identity_lineart_mode = normalize_identity_guide_mode(
+                        body.get("identity_lineart_mode")
+                    )
                 except ValueError as error:
                     _json(self, {"error": str(error)}, 400)
                     return
@@ -2069,10 +2692,14 @@ class Handler(BaseHTTPRequestHandler):
                     if source is not None
                     else body.get("render_spec")
                 )
-                render_spec = ai_render_spec.normalize_render_spec(
-                    render_spec_input,
-                    name=str(body.get("render_name", "")).strip(),
-                )
+                try:
+                    render_spec = ai_render_spec.normalize_render_spec(
+                        render_spec_input,
+                        name=str(body.get("render_name", "")).strip(),
+                    )
+                except ValueError as error:
+                    _json(self, {"error": str(error)}, 400)
+                    return
                 additional_instructions = str(
                     body.get("additional_instructions", body.get("prompt", ""))
                 ).strip()
@@ -2093,6 +2720,8 @@ class Handler(BaseHTTPRequestHandler):
                 reference_manifest = ai_render_spec.build_reference_manifest(
                     channels,
                     identity_name=str(body.get("reference_name") or "identity reference"),
+                    include_identity_lineart=True,
+                    identity_lineart_mode=identity_lineart_mode,
                 )
                 try:
                     compiled_prompt = ai_render_spec.compile_provider_prompt(
@@ -2125,6 +2754,9 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     provider = image_generation_provider.normalize_provider(
                         str(body.get("provider", "openai"))
+                    )
+                    identity_lineart_mode = normalize_identity_guide_mode(
+                        body.get("identity_lineart_mode")
                     )
                 except ValueError as error:
                     _json(self, {"error": str(error)}, 400)
@@ -2162,14 +2794,14 @@ class Handler(BaseHTTPRequestHandler):
                 except ValueError as error:
                     _json(self, {"error": str(error)}, 400)
                     return
-                if provider == "qwen" and len(reference_channels) > 2:
+                if provider == "qwen" and len(reference_channels) > 1:
                     _json(
                         self,
                         {
                             "error": (
                                 "O Qwen aceita até três imagens por chamada: "
-                                "a referência de identidade e no máximo duas "
-                                "referências estruturais selecionadas."
+                                "a referência de identidade, o guia derivado e "
+                                "no máximo uma referência estrutural selecionada."
                             )
                         },
                         400,
@@ -2223,15 +2855,25 @@ class Handler(BaseHTTPRequestHandler):
                 elif not reference_data:
                     _json(self, {"error": "selecione ou envie uma referência"}, 400)
                     return
-                render_spec = ai_render_spec.normalize_render_spec(
-                    with_ai_render_source_contract(
-                        body.get("render_spec"), structural_source
-                    ),
-                    name=render_name,
-                )
+                try:
+                    render_spec = ai_render_spec.normalize_render_spec(
+                        with_ai_render_source_contract(
+                            body.get("render_spec"), structural_source
+                        ),
+                        name=render_name,
+                    )
+                except ValueError as error:
+                    _json(self, {"error": str(error)}, 400)
+                    return
+                output_size = [
+                    int(render_spec["output"]["width"]),
+                    int(render_spec["output"]["height"]),
+                ]
                 reference_manifest = ai_render_spec.build_reference_manifest(
                     reference_channels,
                     identity_name=reference_name,
+                    include_identity_lineart=True,
+                    identity_lineart_mode=identity_lineart_mode,
                 )
                 try:
                     compiled_prompt = ai_render_spec.compile_provider_prompt(
@@ -2267,6 +2909,7 @@ class Handler(BaseHTTPRequestHandler):
                         "compiled_prompt": compiled_prompt,
                         "prompt_contract_schema": ai_render_spec.PROMPT_SCHEMA,
                         "render_spec": render_spec,
+                        "output_size": output_size,
                         "direction_rows": copy.deepcopy(render_spec.get("rows", [])),
                         "reference_manifest": reference_manifest,
                         "provider": provider,
@@ -2274,6 +2917,7 @@ class Handler(BaseHTTPRequestHandler):
                         "reference_name": reference_name,
                         "reference_id": reference_id or None,
                         "reference_channels": reference_channels,
+                        "identity_lineart_mode": identity_lineart_mode,
                         # Keep the legacy field for older clients and saved jobs.
                         "blender_channels": [
                             channel
@@ -2299,7 +2943,7 @@ class Handler(BaseHTTPRequestHandler):
                         return
                     jobs.append(job)
                     write_json_atomic(GEMINI_JOBS_PATH, jobs)
-                threading.Thread(target=run_gemini_job, args=(job,), daemon=True).start()
+                jq.run_in_background(run_gemini_job, job)
                 _json(self, job, 202)
                 return
             if path == "/api/config/gemini":
@@ -2368,6 +3012,10 @@ class Handler(BaseHTTPRequestHandler):
                 except ValueError as error:
                     _json(self, {"error": str(error)}, 400)
                     return
+                lineart_mode = str(body.get("lineart_mode", "blender")).strip() or "blender"
+                if lineart_mode not in {"blender", "lineart_standard", "lineart_coarse", "lineart_anime", "none"}:
+                    _json(self, {"error": "modo de lineart inválido"}, 400)
+                    return
                 fps = max(1.0, min(60.0, float(body.get("fps", 10.0))))
                 batch_id = f"post_batch_{uuid.uuid4().hex[:16]}" if len(source_jobs) > 1 else None
                 created_jobs = []
@@ -2384,6 +3032,7 @@ class Handler(BaseHTTPRequestHandler):
                         ).strip(),
                         "fps": fps,
                         "model_profile": model_profile,
+                        "lineart_mode": lineart_mode,
                     }
                     if batch_id:
                         payload.update(
@@ -2406,22 +3055,14 @@ class Handler(BaseHTTPRequestHandler):
                     jobs.extend(created_jobs)
                     write_json_atomic(POSTPROCESS_JOBS_PATH, jobs)
                 if batch_id:
-                    threading.Thread(
-                        target=run_postprocess_batch,
-                        args=(created_jobs,),
-                        daemon=True,
-                    ).start()
+                    jq.run_in_background(run_postprocess_batch, created_jobs)
                     _json(
                         self,
                         {"batch_id": batch_id, "jobs": created_jobs, "count": len(created_jobs)},
                         202,
                     )
                 else:
-                    threading.Thread(
-                        target=run_postprocess_job,
-                        args=(created_jobs[0],),
-                        daemon=True,
-                    ).start()
+                    jq.run_in_background(run_postprocess_job, created_jobs[0])
                     _json(self, created_jobs[0], 202)
                 return
             if path == "/api/bug-reports":
@@ -2442,6 +3083,19 @@ def main() -> int:
     ensure_relationship_catalog()
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"Sprite Lab semantic catalog em http://{args.host}:{args.port}/", flush=True)
+    try:
+        import signal
+
+        def _handle_sigterm(signum, frame):  # noqa: ARG001
+            # dev_server.py sends SIGTERM on reload: stop accepting new
+            # connections; bounded background jobs drain (up to their own
+            # timeouts) before the process exits. dev_server SIGKILLs after
+            # SPRITE_LAB_DRAIN_TIMEOUT if anything wedges.
+            raise SystemExit(0)
+
+        signal.signal(signal.SIGTERM, _handle_sigterm)
+    except (AttributeError, OSError, ValueError):
+        pass
     try:
         server.serve_forever()
     except KeyboardInterrupt:

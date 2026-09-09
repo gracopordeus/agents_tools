@@ -43,9 +43,11 @@ from blender_conditioning_export import (  # noqa: E402
     _render_depth_material,
     _material,
     _render_with_overrides,
+    _render_neutral_beauty,
     _render_vertex_segmentation,
     _role,
     ROLE_COLORS,
+    DEPTH_RANGE_DEFAULT,
     _write_skeleton,
     _write_pose_heatmap,
 )
@@ -747,8 +749,8 @@ def main() -> int:
         role: _material(f"__generation_seg_{role}", color)
         for role, color in ROLE_COLORS.items()
     }
-    depth_enabled = bool(request.get("depth", False))
-    depth_near, depth_far = (float(value) for value in request.get("depth_range", [0.1, 20.0]))
+    depth_enabled = bool(request.get("depth", True))
+    depth_near, depth_far = (float(value) for value in request.get("depth_range", DEPTH_RANGE_DEFAULT))
     if depth_near >= depth_far:
         raise RuntimeError("depth_range inválido")
     depth_mode = None
@@ -771,8 +773,11 @@ def main() -> int:
             path = output / f"row{row}_col{column}.png"
             if depth_enabled:
                 scene.use_nodes = False
-            scene.render.filepath = str(path)
-            bpy.ops.render.render(write_still=True)
+            if str(request.get("beauty_mode", "neutral")).casefold() == "original":
+                scene.render.filepath = str(path)
+                bpy.ops.render.render(write_still=True)
+            else:
+                _render_neutral_beauty(scene, semantic_objects, path)
             segmentation_path = output / "segmentation" / f"row{row}_col{column}.png"
             _render_vertex_segmentation(
                 scene,
@@ -802,6 +807,8 @@ def main() -> int:
                 "bones_path": str(bones_path),
                 "heatmap_path": str(heatmap_path),
                 "bones": bones_meta["bones"],
+                "bones_source": "blender_armature_deform",
+                "skeleton_format": bones_meta["format"],
             }
             if depth_enabled:
                 depth_path = output / "depth" / f"row{row}_col{column}.png"
