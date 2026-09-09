@@ -116,6 +116,36 @@ function legHeight(rest, roles) {
   return p('thigh_l').distanceTo(p('calf_l')) + p('calf_l').distanceTo(p('foot_l'));
 }
 
+const TRUNK_ROLES = new Set(["spine_01", "spine_02", "spine_03", "neck_01", "head"]);
+
+function boneRestDirection(bone, mappedNames, restMatrices) {
+  const children = bone.children.filter(child => child.isBone && mappedNames.has(child.name));
+  const trunk = children.filter(child => TRUNK_ROLES.has(boneRole(child.name)));
+  const candidates = trunk.length ? trunk : children;
+  if (candidates.length) {
+    const bonePosition = position(restMatrices.get(bone));
+    const direction = candidates.reduce(
+      (sum, child) => sum.add(position(restMatrices.get(child)).sub(bonePosition)),
+      new THREE.Vector3(),
+    );
+    if (direction.lengthSq() > 1e-12) return direction.normalize();
+  }
+  if (bone.parent?.isBone) {
+    const direction = position(restMatrices.get(bone))
+      .sub(position(restMatrices.get(bone.parent)));
+    if (direction.lengthSq() > 1e-12) return direction.normalize();
+  }
+  const direction = new THREE.Vector3(0, 1, 0)
+    .applyQuaternion(rotation(restMatrices.get(bone)))
+    .normalize();
+  return direction.lengthSq() > 1e-12 ? direction : new THREE.Vector3(0, 0, 1);
+}
+
+function axisCorrection(sourceRest, targetRest, sourceDirection, targetDirection) {
+  const swing = new THREE.Quaternion().setFromUnitVectors(sourceDirection, targetDirection);
+  return sourceRest.clone().invert().multiply(swing.invert()).multiply(targetRest);
+}
+
 export function createRuntimeRetarget(sourceRoot, targetRoot, options = {}) {
   const sb = rigBones(sourceRoot), tb = rigBones(targetRoot);
   const sr = matrices(sourceRoot, sb), tr = matrices(targetRoot, tb);
@@ -130,86 +160,112 @@ export function createRuntimeRetarget(sourceRoot, targetRoot, options = {}) {
   sb.forEach(b => { const r = boneRole(b.name); if(r && !sourceRoles.has(r)) sourceRoles.set(r,b); });
   tb.forEach(b => { const r = boneRole(b.name); if(r && !targetRoles.has(r)) targetRoles.set(r,b); });
   const mapping = new Map();
-  targetRoles.forEach((t,r) => { if(sourceRoles.has(r)) mapping.set(t,sourceRoles.get(r)); });
+  targetRoles.forEach((t,r) => {
+    // Keep the target root static. Mixamo/FBX root tracks often carry an
+    // importer axis conversion rather than gameplay motion.
+    if (r !== "root" && sourceRoles.has(r)) mapping.set(t,sourceRoles.get(r));
+  });
   for (const [targetName, sourceName] of Object.entries(options.mapping || {})) {
     const s = sb.find(b => b.name === sourceName);
     const t = targetRoot.getObjectByName(targetName);
     if (!s?.isBone || !t?.isBone) throw new Error('Osso inexistente no mapeamento: ' + targetName + ' → ' + sourceName);
     if (!tr.has(t)) tr.set(t, targetRoot.matrixWorld.clone().invert().multiply(t.matrixWorld));
-    mapping.set(t,s);
+    if (boneRole(t.name) !== "root") mapping.set(t,s);
     const role = boneRole(s.name);
     if (role) targetRoles.set(role,t);
   }
   const missing = [...CRITICAL_RETARGET_ROLES].filter(r => !sourceRoles.has(r) || !targetRoles.has(r));
   if (missing.length) throw new Error('Mapeamento humanoide incompleto: ' + missing.join(', '));
-  const align = bodyFrame(tr,targetRoles).multiply(bodyFrame(sr,sourceRoles).invert());
-  const correction = new Map([...mapping.keys()].map(t => [t, rotation(tr.get(t))]));
-  // Calibrate against a direct mapped child. A long Spine1→Head vector would
-  // incorrectly include Spine2/Spine3/Neck rotations on rigs with extra joints.
-  const preferredChildren = {
-    pelvis: ['spine_01'],
-    spine_01: ['spine_02', 'neck_01', 'head'],
-    spine_02: ['spine_03', 'neck_01', 'head'],
-    spine_03: ['neck_01', 'head'],
-    neck_01: ['head'],
-    clavicle_l: ['upperarm_l'], clavicle_r: ['upperarm_r'],
-    upperarm_l: ['lowerarm_l'], upperarm_r: ['lowerarm_r'],
-    lowerarm_l: ['hand_l'], lowerarm_r: ['hand_r'],
-    thigh_l: ['calf_l'], thigh_r: ['calf_r'],
-    calf_l: ['foot_l'], calf_r: ['foot_r'],
-  };
-  for (const [t,s] of mapping) {
-    const role = boneRole(t.name);
-    let tc = null;
-    for (const childRole of preferredChildren[role] || []) {
-      const candidate = targetRoles.get(childRole);
-      if (candidate?.parent === t && mapping.get(candidate)?.parent === s) {
-        tc = candidate;
-        break;
-      }
-    }
-    if (!tc) {
-      tc = t.children.find(candidate => mapping.has(candidate) && mapping.get(candidate)?.parent === s) || null;
-    }
-    if (!tc) continue;
-    const sc = mapping.get(tc);
-    const tv = position(tr.get(tc)).sub(position(tr.get(t))).normalize();
-    const sv = position(sr.get(sc)).sub(position(sr.get(s))).applyQuaternion(align).normalize();
-    correction.set(t, new THREE.Quaternion().setFromUnitVectors(tv,sv).multiply(correction.get(t)));
-  }
+  // Mixamo FBX and UAL GLB can carry different object-level axis/scale
+  // transforms. Convert source rest matrices into target-root space before
+  // deriving the body alignment; comparing raw bone-local matrices makes a
+  // vertical spine appear horizontal.
+  targetRoot.updateMatrixWorld(true);
+  sourceRoot.updateMatrixWorld(true);
+  const targetInverse = targetRoot.matrixWorld.clone().invert();
+  const sourceToTarget = targetInverse.clone().multiply(sourceRoot.matrixWorld);
+  const sourceCommonRest = new Map(sb.map(b => [b, sourceToTarget.clone().multiply(sr.get(b))]));
+  const align = bodyFrame(tr, targetRoles).multiply(bodyFrame(
+    sourceCommonRest,
+    sourceRoles,
+  ).invert());
+  // boneRestDirection receives names, not Bone objects. Keeping this as a
+  // semantic-name set is important for Mixamo FBX hierarchies, where the
+  // object identity differs from the target GLB even when the role matches.
+  const sourceMapped = new Set([...mapping.values()].map(b => b.name));
+  const targetMapped = new Set([...mapping.keys()].map(b => b.name));
+  const sourceRest = new Map(sb.map(b => [
+    b,
+    align.clone().multiply(rotation(sourceCommonRest.get(b))),
+  ]));
+  const correction = new Map([...mapping.keys()].map(t => {
+    const s = mapping.get(t);
+    // sourceCommonRest is already expressed in target-root space. Applying
+    // sourceToTarget a second time rotates/scales Mixamo limbs again and is
+    // the typical cause of detached arms and toe-standing poses.
+    const sourceDirection = boneRestDirection(s, sourceMapped, sourceCommonRest)
+      .applyQuaternion(align)
+      .normalize();
+    const targetDirection = boneRestDirection(t, targetMapped, tr).normalize();
+    return [t, axisCorrection(
+      sourceRest.get(s),
+      rotation(tr.get(t)),
+      sourceDirection,
+      targetDirection,
+    )];
+  }));
   const depth = b => { let n=0; while(b.parent) {n++; b=b.parent;} return n; };
   const order = [...mapping.keys()].sort((a,b) => depth(a)-depth(b));
-  return { sourceRoot,targetRoot,mapping,order,sr,tr,align,correction,
+  const fullOrder = [...tb].sort((a,b) => depth(a)-depth(b));
+  const targetRestLocal = new Map(tb.map(b => [b, b.quaternion.clone()]));
+  const targetRestPosition = new Map(tb.map(b => [b, b.position.clone()]));
+  const targetPelvis = targetRoles.get('pelvis');
+  const sourcePelvis = sourceRoles.get('pelvis');
+  return { sourceRoot,targetRoot,mapping,order,fullOrder,sr,tr,align,correction,
+    sourceCommonRest,targetRestLocal,targetRestPosition,
     sourcePelvis:sourceRoles.get('pelvis'), targetPelvis:targetRoles.get('pelvis'),
-    heightScale:legHeight(tr,targetRoles)/Math.max(legHeight(sr,sourceRoles),1e-8),
-    up:new THREE.Vector3(0,0,1).applyQuaternion(bodyFrame(tr,targetRoles)),
+    heightScale:legHeight(tr,targetRoles)/Math.max(legHeight(sourceCommonRest,sourceRoles),1e-8),
+    up:new THREE.Vector3(0,0,1),
     first:null, inPlace:options.inPlace !== false };
 }
 
 export function applyRuntimeRetarget(state) {
-  const {sourceRoot,targetRoot,mapping,sr,tr,align,correction} = state;
+  const {sourceRoot,targetRoot,mapping,fullOrder,sr,tr,align,correction} = state;
   sourceRoot.updateMatrixWorld(true);
   targetRoot.updateMatrixWorld(true);
-  const sourceInverse = sourceRoot.matrixWorld.clone().invert();
-  const targetRootRotation = rotation(targetRoot.matrixWorld);
-  const sourcePelvisPosition = position(sourceInverse.clone().multiply(state.sourcePelvis.matrixWorld));
+  const targetInverse = targetRoot.matrixWorld.clone().invert();
+  const sourcePelvisPosition = position(targetInverse.clone().multiply(state.sourcePelvis.matrixWorld));
   if (!state.first) state.first = sourcePelvisPosition.clone();
-  const displacement = sourcePelvisPosition.clone().sub(position(sr.get(state.sourcePelvis))).applyQuaternion(align).multiplyScalar(state.heightScale);
-  if(state.inPlace) {
-    const travel = sourcePelvisPosition.clone().sub(state.first).applyQuaternion(align).multiplyScalar(state.heightScale);
-    displacement.sub(travel.clone().addScaledVector(state.up,-travel.dot(state.up)));
+  const displacement = sourcePelvisPosition.clone().sub(state.first)
+    .applyQuaternion(align).multiplyScalar(state.heightScale);
+  const restGlobal = new Map([...tr.keys()].map(b => [b, rotation(tr.get(b))]));
+  const poseGlobal = new Map();
+  for (const bone of fullOrder) {
+    bone.position.copy(state.targetRestPosition.get(bone));
+    bone.quaternion.copy(state.targetRestLocal.get(bone));
   }
-  for(const t of state.order) {
-    const s=mapping.get(t);
-    const animated=rotation(sourceInverse.clone().multiply(s.matrixWorld));
-    const desired=targetRootRotation.clone().multiply(align).multiply(animated)
-      .multiply(rotation(sr.get(s)).invert()).multiply(align.clone().invert()).multiply(correction.get(t));
-    // Parent first: remove its newly solved world rotation to obtain local q.
-    t.parent?.updateWorldMatrix(true,false);
-    const parentRotation=t.parent ? rotation(t.parent.matrixWorld) : new THREE.Quaternion();
-    t.quaternion.copy(parentRotation.invert().multiply(desired)).normalize();
+  if(state.inPlace) {
+    displacement.copy(state.up).multiplyScalar(displacement.dot(state.up));
+  }
+  for(const t of fullOrder) {
+    const parent = t.parent?.isBone ? t.parent : null;
+    const targetRest = restGlobal.get(t);
+    const restChain = parent
+      ? poseGlobal.get(parent).clone().multiply(restGlobal.get(parent).clone().invert()).multiply(targetRest)
+      : targetRest.clone();
+    if (!mapping.has(t)) {
+      poseGlobal.set(t, restChain);
+      continue;
+    }
+    const s = mapping.get(t);
+    const animated = rotation(targetInverse.clone().multiply(s.matrixWorld));
+    const desired = align.clone().multiply(animated).multiply(correction.get(t)).normalize();
+    const parentPose = parent ? poseGlobal.get(parent).clone() : new THREE.Quaternion();
+    const local = parentPose.invert().multiply(desired).normalize();
+    t.quaternion.copy(local);
+    poseGlobal.set(t, desired);
     if(t === state.targetPelvis) {
-      const p=position(tr.get(t)).add(displacement).applyMatrix4(targetRoot.matrixWorld);
+      const p = position(tr.get(t)).add(displacement).applyMatrix4(targetRoot.matrixWorld);
       t.position.copy(t.parent ? t.parent.worldToLocal(p) : p);
     }
     t.updateMatrix();

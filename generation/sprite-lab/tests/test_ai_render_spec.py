@@ -22,6 +22,14 @@ class AiRenderSpecTests(unittest.TestCase):
             "south", "south_west", "west", "north_west",
         ])
 
+    def test_default_structural_reference_is_beauty_only(self) -> None:
+        spec = ai_render_spec.default_render_spec(name="hero")
+
+        self.assertTrue(spec["references"]["identity"]["enabled"])
+        self.assertTrue(spec["references"]["beauty"]["enabled"])
+        for channel in ("bones", "lineart", "frame_control"):
+            self.assertFalse(spec["references"][channel]["enabled"])
+
     def test_output_size_accepts_1024_and_is_dynamic_in_provider_prompt(self) -> None:
         spec = ai_render_spec.default_render_spec(name="hero")
         spec["output"]["width"] = 1024

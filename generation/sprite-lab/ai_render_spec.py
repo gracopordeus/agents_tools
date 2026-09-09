@@ -204,7 +204,8 @@ def default_render_spec(
             "include_cells": include_descriptions,
         },
         "references": {
-            key: {"enabled": True, **value} for key, value in REFERENCE_ROLES.items()
+            key: {"enabled": key in {"identity", "beauty"}, **value}
+            for key, value in REFERENCE_ROLES.items()
         },
         "rows": rows,
     }

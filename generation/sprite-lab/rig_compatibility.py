@@ -11,7 +11,9 @@ from typing import Iterable
 
 
 RETARGET_SCHEMA = "sprite_lab.rig_compatibility/v1"
-RETARGET_VERSION = "humanoid-world-v2"
+# Bump when the baked pose solver changes: previously generated Actions must
+# be regenerated instead of being treated as equivalent binary intermediates.
+RETARGET_VERSION = "humanoid-rest-calibrated-v3"
 
 CRITICAL_ROLES = {
     "pelvis",
