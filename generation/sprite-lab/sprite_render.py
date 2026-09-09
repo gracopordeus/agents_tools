@@ -438,7 +438,7 @@ def generate_sprite_render(
                 "resolution": resolution,
                 "rows": rows,
                 "phases": phases,
-                "elevation": float(payload.get("elevation", 35.264)),
+                "elevation": float(payload.get("elevation", 30.0)),
                 "azimuth": float(payload.get("azimuth", 45.0)),
             },
         )
@@ -546,7 +546,7 @@ def generate_sprite_render(
             if camera_preset
             else locked_profile["camera_elevation"]
             if locked_profile
-            else float(payload.get("elevation", 35.264))
+            else float(payload.get("elevation", 30.0))
         ),
         "azimuth": (
             camera_preset["azimuth"]

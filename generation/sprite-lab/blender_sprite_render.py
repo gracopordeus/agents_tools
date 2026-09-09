@@ -629,7 +629,7 @@ def main() -> int:
     else:
         camera = brc.make_camera(
             scene,
-            math.radians(float(request.get("elevation", 35.264))),
+            math.radians(float(request.get("elevation", 30.0))),
             math.radians(float(request.get("azimuth", 45.0))),
             height,
             extent,
@@ -887,7 +887,7 @@ def main() -> int:
                 if effective_profile
                 else request.get("camera_preset")
             ),
-            "elevation": float(request.get("elevation", 35.264)),
+            "elevation": float(request.get("elevation", 30.0)),
             "azimuth": float(request.get("azimuth", 45.0)),
             "ortho_scale": float(camera.data.ortho_scale),
         },

@@ -32,7 +32,7 @@ from blender_semantic_preview import rest_pose_forward
 
 ROWS = list(DIRECTION_ROWS)
 TARGETS = [DIRECTION_TARGETS[row] for row in DIRECTION_ROWS]
-DEFAULT_ELEV = 35.264
+DEFAULT_ELEV = 30.0
 DEFAULT_AZIM = 45.0
 
 

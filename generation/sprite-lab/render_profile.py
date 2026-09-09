@@ -18,7 +18,7 @@ CAMERA_PRESETS: dict[str, dict[str, Any]] = {
     # running the Blender calibration job; they are absolute world spans,
     # never percentages of the isometric camera.
     "isometric": {
-        "label": "Isométrico", "elevation": 35.264, "azimuth": 45.0,
+        "label": "Isométrico", "elevation": 30.0, "azimuth": 45.0,
         "ortho_scale": 2.57705670238966,
         "profile_id": "hero_reference_v1",
     },
@@ -148,7 +148,7 @@ def normalize_manifest(value: Any) -> dict[str, Any]:
         "vertical_margin_px": vertical_margin_px,
         "foot_anchor": foot_anchor,
         "camera_elevation": _finite_number(
-            value.get("camera_elevation", 35.264), "camera_elevation"
+            value.get("camera_elevation", 30.0), "camera_elevation"
         ),
         "camera_azimuth": _finite_number(
             value.get("camera_azimuth", 45.0), "camera_azimuth"

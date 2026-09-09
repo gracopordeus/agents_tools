@@ -1,6 +1,6 @@
 """Blender worker for tile atlas renders (asset_type=tile, representation=tile_atlas).
 
-Renders a tile mesh from a fixed top-down orthographic camera, producing
+Renders a tile mesh from a fixed isometric orthographic camera, producing
 individual cells that stitch together pixel-perfectly when placed in a grid.
 
 Usage:
@@ -82,7 +82,7 @@ def setup_camera(
 ) -> bpy.types.Object:
     cell_size = profile.get("cell_size", [256, 256])
     ortho_scale = profile.get("ortho_scale", 1.0)
-    elevation = profile.get("camera_elevation", 80.0)
+    elevation = profile.get("camera_elevation", 30.0)
     azimuth = profile.get("camera_azimuth", 45.0)
 
     data = bpy.data.cameras.new("tile_camera")
