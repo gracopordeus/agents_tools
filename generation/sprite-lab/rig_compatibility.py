@@ -11,13 +11,11 @@ from typing import Iterable
 
 
 RETARGET_SCHEMA = "sprite_lab.rig_compatibility/v1"
-RETARGET_VERSION = "mixamo-ual1-v1"
+RETARGET_VERSION = "humanoid-world-v2"
 
 CRITICAL_ROLES = {
     "pelvis",
     "spine_01",
-    "spine_02",
-    "spine_03",
     "head",
     "upperarm_l",
     "upperarm_r",
@@ -36,6 +34,7 @@ CRITICAL_ROLES = {
 
 def _compact(value: str) -> str:
     value = str(value or "").casefold()
+    value = value.rsplit(":", 1)[-1]
     value = re.sub(r"mixamorig\d*", "", value)
     return re.sub(r"[^a-z0-9]+", "", value)
 
@@ -46,6 +45,10 @@ def _side_and_body(value: str) -> tuple[str | None, str]:
         return "l", compact[4:]
     if compact.startswith("right"):
         return "r", compact[5:]
+    if compact.endswith("left"):
+        return "l", compact[:-4]
+    if compact.endswith("right"):
+        return "r", compact[:-5]
     if compact.endswith("l") and len(compact) > 1:
         return "l", compact[:-1]
     if compact.endswith("r") and len(compact) > 1:
@@ -58,7 +61,7 @@ def bone_role(name: str) -> str | None:
     compact = _compact(name)
     if compact in {"root", "master"}:
         return "root"
-    if compact in {"hips", "pelvis"}:
+    if compact in {"hip", "hips", "pelvis"}:
         return "pelvis"
     if compact in {"spine", "spine01"}:
         return "spine_01"
@@ -66,6 +69,8 @@ def bone_role(name: str) -> str | None:
         return "spine_02"
     if compact in {"spine2", "spine03"}:
         return "spine_03"
+    if compact in {"chest", "upperchest", "thorax"}:
+        return "spine_02"
     if compact in {"neck", "neck01"}:
         return "neck_01"
     if compact == "head":
@@ -99,6 +104,8 @@ def bone_role(name: str) -> str | None:
     finger_match = re.fullmatch(r"(thumb|index|middle|ring|pinky|little)(\d+)(?:leaf|end)?", body)
     if finger_match:
         finger, number = finger_match.groups()
+        if finger == "little":
+            finger = "pinky"
         return f"{finger}_{int(number):02d}_{side}"
     finger_match = re.fullmatch(
         r"hand(?:thumb|index|middle|ring|pinky|little)(\d+)", body
@@ -110,7 +117,10 @@ def bone_role(name: str) -> str | None:
         finger = re.match(r"[a-z]+", prefix)
         number = finger_match.group(1)
         if finger:
-            return f"{finger.group(0)}_{int(number):02d}_{side}"
+            value = finger.group(0)
+            if value == "little":
+                value = "pinky"
+            return f"{value}_{int(number):02d}_{side}"
     return None
 
 
@@ -139,11 +149,16 @@ def build_bone_map(source_names: Iterable[str], target_names: Iterable[str]) -> 
     return result
 
 
-def compatibility_report(source_names: Iterable[str], target_names: Iterable[str]) -> dict:
+def compatibility_report(source_names: Iterable[str], target_names: Iterable[str], mapping_override: dict | None = None) -> dict:
     source_names = [str(name) for name in source_names]
     target_names = [str(name) for name in target_names]
     mapping = build_bone_map(source_names, target_names)
-    mapped_roles = {bone_role(name) for name in mapping}
+    if mapping_override:
+        for target, source in mapping_override.items():
+            if target not in target_names or source not in source_names:
+                raise ValueError(f"osso inexistente no mapeamento: {target} -> {source}")
+        mapping.update(mapping_override)
+    mapped_roles = {bone_role(name) for name in mapping.values()}
     missing_critical = sorted(CRITICAL_ROLES - mapped_roles)
     return {
         "schema": RETARGET_SCHEMA,

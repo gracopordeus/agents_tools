@@ -23,166 +23,9 @@ function animationLeafName(value) {
   return String(value || "").split("|").filter(Boolean).pop()?.trim().toLowerCase() || "";
 }
 
-const CRITICAL_RETARGET_ROLES = new Set([
-  "pelvis",
-  "spine_01",
-  "spine_02",
-  "spine_03",
-  "head",
-  "upperarm_l",
-  "upperarm_r",
-  "lowerarm_l",
-  "lowerarm_r",
-  "hand_l",
-  "hand_r",
-  "thigh_l",
-  "thigh_r",
-  "calf_l",
-  "calf_r",
-  "foot_l",
-  "foot_r",
-]);
-
-function compactBoneName(value) {
-  return String(value || "")
-    .toLowerCase()
-    .replace(/mixamorig\d*/g, "")
-    .replace(/[^a-z0-9]/g, "");
-}
-
-function boneRole(name) {
-  const compact = compactBoneName(name);
-  if (["root", "master"].includes(compact)) return "root";
-  if (["hips", "pelvis"].includes(compact)) return "pelvis";
-  if (["spine", "spine01"].includes(compact)) return "spine_01";
-  if (["spine1", "spine02"].includes(compact)) return "spine_02";
-  if (["spine2", "spine03"].includes(compact)) return "spine_03";
-  if (["neck", "neck01"].includes(compact)) return "neck_01";
-  if (compact === "head") return "head";
-  if (["headtopend", "headend"].includes(compact)) return null;
-
-  let side = null;
-  let body = compact;
-  if (body.startsWith("left")) {
-    side = "l";
-    body = body.slice(4);
-  } else if (body.startsWith("right")) {
-    side = "r";
-    body = body.slice(5);
-  } else if (body.endsWith("l") && body.length > 1) {
-    side = "l";
-    body = body.slice(0, -1);
-  } else if (body.endsWith("r") && body.length > 1) {
-    side = "r";
-    body = body.slice(0, -1);
-  }
-  if (!side) return null;
-  if (["clavicle", "shoulder"].includes(body)) return `clavicle_${side}`;
-  if (["arm", "upperarm"].includes(body)) return `upperarm_${side}`;
-  if (["forearm", "lowerarm"].includes(body)) return `lowerarm_${side}`;
-  if (body === "hand") return `hand_${side}`;
-  if (["upleg", "thigh", "upperleg"].includes(body)) return `thigh_${side}`;
-  if (["leg", "calf", "lowerleg"].includes(body)) return `calf_${side}`;
-  if (body === "foot") return `foot_${side}`;
-  if (["ball", "toebase", "toe"].includes(body)) return `ball_${side}`;
-  if (["ballleaf", "toeend", "toebaseend"].includes(body)) return `ball_leaf_${side}`;
-
-  let match = body.match(/^(thumb|index|middle|ring|pinky|little)(\d+)(?:leaf|end)?$/);
-  if (match) return `${match[1]}_${String(Number(match[2])).padStart(2, "0")}_${side}`;
-  match = body.match(/^hand(?:thumb|index|middle|ring|pinky|little)(\d+)$/);
-  if (match) {
-    const finger = body.match(/^hand([a-z]+)/)?.[1];
-    return finger ? `${finger}_${String(Number(match[1])).padStart(2, "0")}_${side}` : null;
-  }
-  return null;
-}
-
-function rigBones(root) {
-  const bones = [];
-  root?.traverse((object) => {
-    if (object.isBone) bones.push(object);
-  });
-  return bones;
-}
-
-function rigSignature(root) {
-  return rigBones(root)
-    .map((bone) => `${bone.name}|${bone.parent?.name || ""}`)
-    .sort()
-    .join(";");
-}
-
-function createRuntimeRetarget(sourceRoot, targetRoot) {
-  const sourceBones = rigBones(sourceRoot);
-  const targetBones = rigBones(targetRoot);
-  if (!sourceBones.length || !targetBones.length) {
-    throw new Error("retargeting exige armature de origem e personagem com ossos");
-  }
-  if (rigSignature(sourceRoot) === rigSignature(targetRoot)) return null;
-  const sourceByRole = new Map();
-  sourceBones.forEach((bone) => {
-    const role = boneRole(bone.name);
-    if (role && !sourceByRole.has(role)) sourceByRole.set(role, bone);
-  });
-  const targetByRole = new Map();
-  targetBones.forEach((bone) => {
-    const role = boneRole(bone.name);
-    if (role && !targetByRole.has(role)) targetByRole.set(role, bone);
-  });
-  const mapping = new Map();
-  targetByRole.forEach((targetBone, role) => {
-    const sourceBone = sourceByRole.get(role);
-    if (sourceBone) mapping.set(targetBone, sourceBone);
-  });
-  const missing = [...CRITICAL_RETARGET_ROLES].filter((role) =>
-    !sourceByRole.has(role) || !targetByRole.has(role),
-  );
-  if (missing.length) {
-    throw new Error(`rigs incompatíveis; ossos críticos ausentes: ${missing.join(", ")}`);
-  }
-
-  sourceRoot.updateMatrixWorld(true);
-  targetRoot.updateMatrixWorld(true);
-  const sourceRestInverse = new Map();
-  sourceBones.forEach((bone) => {
-    sourceRestInverse.set(bone.name, bone.matrix.clone().invert());
-  });
-  const targetRest = new Map();
-  targetBones.forEach((bone) => targetRest.set(bone, bone.matrix.clone()));
-  const sourcePelvis = sourceByRole.get("pelvis");
-  const targetPelvis = targetByRole.get("pelvis");
-  const targetMotion = targetByRole.get("root") || targetByRole.get("pelvis");
-  const sourcePelvisRestWorld = sourcePelvis.getWorldPosition(new THREE.Vector3());
-  const targetMotionRestWorld = targetMotion.getWorldPosition(new THREE.Vector3());
-  const sourceHead = sourceByRole.get("head");
-  const targetHead = targetByRole.get("head");
-  const sourceHeight = Math.max(
-    sourcePelvisRestWorld.distanceTo(sourceHead.getWorldPosition(new THREE.Vector3())),
-    1e-6,
-  );
-  const targetHeight = Math.max(
-    targetPelvis.getWorldPosition(new THREE.Vector3()).distanceTo(targetHead.getWorldPosition(new THREE.Vector3())),
-    1e-6,
-  );
-  return {
-    sourceRoot,
-    targetRoot,
-    mapping,
-    sourcePelvis,
-    targetMotion,
-    sourcePelvisRestWorld,
-    targetMotionRestWorld,
-    heightScale: targetHeight / sourceHeight,
-    delta: new THREE.Matrix4(),
-    targetMatrix: new THREE.Matrix4(),
-    sourcePosition: new THREE.Vector3(),
-    displacement: new THREE.Vector3(),
-    desiredWorldPosition: new THREE.Vector3(),
-    parentInverse: new THREE.Matrix4(),
-    sourceRestInverse,
-    targetRest,
-  };
-}
+// Shared, renderer-independent retargeting keeps the browser and Blender
+// paths on the same semantic mapping contract.
+import { createRuntimeRetarget, applyRuntimeRetarget } from './retarget.js?v=3';
 
 function findAnimationClip(clips, name) {
   const exact = clips.find((clip) => clip.name === name);
@@ -603,45 +446,13 @@ class SpriteViewer {
     // Evaluate the first pose even while paused so the composition opens as a
     // stable frame instead of briefly showing the bind pose.
     this.mixer.update(0);
+    if (this.retargetState) this.retargetState.first = null;
     this.applyRetarget();
     this.playButton.textContent = this.action.paused ? "Play" : "Pausar";
   }
 
   applyRetarget() {
-    const state = this.retargetState;
-    if (!state) return;
-    state.sourceRoot.updateMatrixWorld(true);
-    state.targetRoot.updateMatrixWorld(true);
-    state.mapping.forEach((sourceBone, targetBone) => {
-      state.delta
-        .copy(sourceBone.matrix)
-        .multiply(state.sourceRestInverse.get(sourceBone.name));
-      state.delta.setPosition(0, 0, 0);
-      state.targetMatrix
-        .copy(state.targetRest.get(targetBone))
-        .multiply(state.delta);
-      state.targetMatrix.decompose(targetBone.position, targetBone.quaternion, targetBone.scale);
-    });
-
-    // Transfer locomotion separately from the pelvis rotation. This keeps a
-    // Mixamo Hips animation moving a UAL1 root (and the reverse direction)
-    // without copying exporter-specific rest-pose translations.
-    state.targetRoot.updateMatrixWorld(true);
-    state.sourcePelvis.getWorldPosition(state.sourcePosition);
-    state.displacement
-      .copy(state.sourcePosition)
-      .sub(state.sourcePelvisRestWorld)
-      .multiplyScalar(state.heightScale);
-    state.desiredWorldPosition
-      .copy(state.targetMotionRestWorld)
-      .add(state.displacement);
-    if (state.targetMotion.parent) {
-      state.parentInverse.copy(state.targetMotion.parent.matrixWorld).invert();
-      state.targetMotion.position.copy(state.desiredWorldPosition.applyMatrix4(state.parentInverse));
-    } else {
-      state.targetMotion.position.copy(state.desiredWorldPosition);
-    }
-    state.targetRoot.updateMatrixWorld(true);
+    if (this.retargetState) applyRuntimeRetarget(this.retargetState);
   }
 
   toggleAnimation() {
@@ -979,7 +790,8 @@ class SpriteViewer {
           modelUrl: config.animationModelUrl,
         });
         if (token !== this.token) return;
-        const selected = findAnimationClip(animationAsset.animations, config.animationName) || animationAsset.animations[0];
+        const selected = config.animationName ? findAnimationClip(animationAsset.animations, config.animationName) : animationAsset.animations[0];
+        if (config.animationName && !selected) throw new Error('Action solicitada não encontrada: ' + config.animationName);
         if (selected) clips = [selected];
       }
       // Finish every network/conversion load before touching the live scene.
@@ -1009,7 +821,7 @@ class SpriteViewer {
         animationAsset.scene.updateMatrixWorld(true);
         this.animationModel = animationAsset.scene;
         this.scene.add(this.animationModel);
-        this.retargetState = createRuntimeRetarget(this.animationModel, this.character);
+        this.retargetState = createRuntimeRetarget(this.animationModel, this.character, { mapping: config.boneMapping, inPlace: config.inPlace });
       }
       this.clips = clips;
       const animationRoot = this.retargetState ? this.animationModel : this.character;

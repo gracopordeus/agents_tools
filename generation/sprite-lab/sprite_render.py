@@ -519,6 +519,8 @@ def generate_sprite_render(
         "character_path": str(character_path),
         "animation_path": str(animation_path),
         "action_name": animation.get("action_name") or animation.get("clip_name"),
+        "bone_mapping": payload.get("bone_mapping"),
+        "in_place": bool(payload.get("in_place", True)),
         "animation_metadata": animation_metadata,
         "orientation": orientation,
         "asset_spec": asset_spec,

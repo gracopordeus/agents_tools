@@ -19,7 +19,7 @@ import bpy
 from mathutils import Euler, Matrix, Quaternion, Vector
 
 from orientation_contract import axis_vector, normalize_orientation
-from blender_retarget import retarget_action
+from blender_retarget import retarget_action, rigs_share_bind
 
 
 BONE_PATH_RE = re.compile(r"pose\.bones\[(?:\"([^\"]+)\"|'([^']+)')\]")
@@ -288,13 +288,6 @@ def find_action(name: str | None) -> bpy.types.Action | None:
     )
 
 
-def _rig_signature(armature: bpy.types.Object) -> tuple[tuple[str, str], ...]:
-    return tuple(sorted(
-        (bone.name, bone.parent.name if bone.parent else "")
-        for bone in armature.data.bones
-    ))
-
-
 def rest_pose_forward(
     armature: bpy.types.Object,
     orientation: dict[str, Any] | None = None,
@@ -466,6 +459,8 @@ def apply_animation(
     armature: bpy.types.Object,
     animation_path: Path | None,
     action_name: str | None,
+    mapping_override: dict[str, str] | None = None,
+    in_place: bool = True,
 ) -> bpy.types.Action | None:
     action = find_action(action_name) if animation_path is None else None
     if animation_path is not None:
@@ -487,10 +482,12 @@ def apply_animation(
             action = exact or next(
                 (
                     item for item in imported_actions
-                    if item.name == leaf or item.name.endswith("|" + leaf)
+                    if re.sub(r'\.\d{3}$', '', item.name).split('|')[-1] == leaf
                 ),
                 None,
             )
+            if action_name and action is None:
+                raise ValueError(f'Action solicitada não encontrada: {action_name}')
             action = action or active_source_action or max(
                 imported_actions,
                 key=lambda item: item.frame_range[1] - item.frame_range[0],
@@ -501,12 +498,14 @@ def apply_animation(
             # Same-family exports already share the target's bone names and
             # rest-axis contract. Keep their Action untouched; retargeting is
             # only needed when the source hierarchy actually differs.
-            if _rig_signature(source_armature) != _rig_signature(armature):
+            if not rigs_share_bind(source_armature, armature):
                 action, _ = retarget_action(
                     armature,
                     source_armature,
                     action,
                     label=str(action_name or action.name).split("|")[-1],
+                    mapping_override=mapping_override,
+                    in_place=in_place,
                 )
         for obj in imported:
             bpy.data.objects.remove(obj, do_unlink=True)
@@ -517,7 +516,8 @@ def apply_animation(
         action_slots = getattr(action, "slots", ())
         if action_slots and hasattr(armature.animation_data, "action_slot"):
             armature.animation_data.action_slot = action_slots[0]
-        lock_root_motion(armature, action)
+        if not action.get('retarget_version'):
+            lock_root_motion(armature, action)
     return action
 
 
@@ -1066,6 +1066,8 @@ def main() -> int:
             armature,
             Path(request["animation_path"]).expanduser().resolve(),
             request.get("action_name"),
+            mapping_override=request.get("bone_mapping"),
+            in_place=bool(request.get("in_place", True)),
         )
     root_motion_lock = root_motion_lock_metadata(action)
     weapon_meta = None

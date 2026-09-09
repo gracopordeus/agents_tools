@@ -46,6 +46,12 @@ class RigCompatibilityTests(unittest.TestCase):
         self.assertFalse(report["compatible"])
         self.assertIn("hand_l", report["missing_critical_roles"])
 
+    def test_common_humanoid_aliases_resolve(self) -> None:
+        self.assertEqual(bone_role("Hip"), "pelvis")
+        self.assertEqual(bone_role("Chest"), "spine_02")
+        self.assertEqual(bone_role("upperArmLeft"), "upperarm_l")
+        self.assertEqual(bone_role("Little2.R"), "pinky_02_r")
+
 
 if __name__ == "__main__":
     unittest.main()

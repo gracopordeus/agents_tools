@@ -582,6 +582,8 @@ def main() -> int:
         armature,
         Path(request["animation_path"]).expanduser().resolve(),
         request.get("action_name"),
+        mapping_override=request.get("bone_mapping"),
+        in_place=bool(request.get("in_place", True)),
     )
     root_motion_lock = root_motion_lock_metadata(action)
     component_meta = []

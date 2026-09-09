@@ -1,190 +1,175 @@
-"""Blender-side Action retargeting between compatible humanoid rigs.
-
-The worker uses the source and target rest-pose bone bases to transfer local
-pose deltas, then bakes the result into a standalone Action owned by the
-target armature.  No source FBX or source armature is modified.
-"""
+"""Rest-calibrated world-space humanoid retargeting with target-length FK."""
 from __future__ import annotations
 
 import json
 import math
-from typing import Any
-
 import bpy
 from mathutils import Matrix, Vector
-
-from rig_compatibility import (
-    RETARGET_VERSION,
-    bone_role,
-    compatibility_report,
-)
+from rig_compatibility import RETARGET_SCHEMA, RETARGET_VERSION, bone_role, compatibility_report
 
 
-def _set_action(armature: bpy.types.Object, action: bpy.types.Action | None) -> None:
-    if armature.animation_data is None:
-        armature.animation_data_create()
+def _set_action(armature, action):
+    armature.animation_data_create()
     armature.animation_data.action = action
-    slots = getattr(action, "slots", ()) if action is not None else ()
-    if slots and hasattr(armature.animation_data, "action_slot"):
+    slots = getattr(action, 'slots', ()) if action else ()
+    if slots and hasattr(armature.animation_data, 'action_slot'):
         armature.animation_data.action_slot = slots[0]
 
 
-def _frame_range(action: bpy.types.Action) -> tuple[int, int]:
-    start = max(1, math.floor(float(action.frame_range[0])))
-    end = max(start, math.ceil(float(action.frame_range[1])))
-    return start, end
+def _body_frame(rest, roles):
+    up = (rest[roles['head']].translation - rest[roles['pelvis']].translation).normalized()
+    right = rest[roles['thigh_r']].translation - rest[roles['thigh_l']].translation
+    right = (right - up * right.dot(up)).normalized()
+    if right.length < 0.5 or up.length < 0.5:
+        raise ValueError('pose de referência degenerada: cabeça/quadril/pernas')
+    forward = up.cross(right).normalized()
+    return Matrix((right, forward, up)).transposed().to_quaternion()
 
 
-def _world_position(armature: bpy.types.Object, bone: bpy.types.PoseBone) -> Vector:
-    return (armature.matrix_world @ bone.matrix).translation.copy()
+def _leg_height(rest, roles):
+    return sum((rest[roles[a]].translation - rest[roles[b]].translation).length
+               for a, b in [('thigh_l', 'calf_l'), ('calf_l', 'foot_l')])
 
 
-def _skeleton_height(armature: bpy.types.Object) -> float:
-    pelvis = next(
-        (bone for bone in armature.pose.bones if bone_role(bone.name) == "pelvis"),
-        None,
-    )
-    head = next(
-        (bone for bone in armature.pose.bones if bone_role(bone.name) == "head"),
-        None,
-    )
-    if pelvis is None or head is None:
-        return 1.0
-    height = (_world_position(armature, head) - _world_position(armature, pelvis)).length
-    return max(float(height), 1e-6)
+def rigs_share_bind(source, target, tolerance=1e-5):
+    """Names alone don't establish compatible local channels (FBX vs glTF)."""
+    if set(source.data.bones.keys()) != set(target.data.bones.keys()):
+        return False
+    if any(abs(source.matrix_world[i][j] - target.matrix_world[i][j]) > tolerance
+           for i in range(4) for j in range(4)):
+        return False
+    for b in source.data.bones:
+        t = target.data.bones[b.name]
+        if (b.parent.name if b.parent else '') != (t.parent.name if t.parent else ''):
+            return False
+        if any(abs(b.matrix_local[i][j] - t.matrix_local[i][j]) > tolerance
+               for i in range(4) for j in range(4)):
+            return False
+    return True
 
 
-def _set_target_motion(
-    target: bpy.types.Object,
-    target_bone: bpy.types.PoseBone,
-    rest_location: Vector,
-    source_displacement: Vector,
-    scale: float,
-) -> None:
-    # Root and Mixamo Hips are both top-level bones, so the target location
-    # channel is expressed in armature space.  The parent-aware conversion
-    # keeps this correct for a future rig with an extra control bone.
-    displacement_world = source_displacement * scale
-    parent = target_bone.parent
-    if parent is None:
-        local_delta = target.matrix_world.inverted().to_3x3() @ displacement_world
-    else:
-        parent_world = target.matrix_world @ parent.matrix
-        local_delta = parent_world.to_3x3().inverted() @ displacement_world
-    target_bone.location = rest_location + local_delta
-
-
-def _keyframe_bone(bone: bpy.types.PoseBone, frame: int) -> None:
-    bone.keyframe_insert(data_path="location", frame=frame)
-    bone.keyframe_insert(data_path="rotation_quaternion", frame=frame)
-    bone.keyframe_insert(data_path="scale", frame=frame)
-
-
-def retarget_action(
-    target: bpy.types.Object,
-    source: bpy.types.Object,
-    source_action: bpy.types.Action,
-    label: str = "animation",
-) -> tuple[bpy.types.Action, dict[str, Any]]:
-    """Bake ``source_action`` onto ``target`` and return the new Action."""
-    source_names = [bone.name for bone in source.data.bones]
-    target_names = [bone.name for bone in target.data.bones]
-    report = compatibility_report(source_names, target_names)
-    if not report["compatible"]:
-        missing = ", ".join(report["missing_critical_roles"])
-        raise RuntimeError(f"rigs incompatíveis; bones críticos ausentes: {missing}")
-
-    mapping = report["mapping"]
-    previous_source_action = source.animation_data.action if source.animation_data else None
-    previous_target_action = target.animation_data.action if target.animation_data else None
-    _set_action(source, None)
-    _set_action(target, None)
+def retarget_action(target, source, source_action, label='animation', mapping_override=None, in_place=True):
+    report = compatibility_report(source.data.bones.keys(), target.data.bones.keys(), mapping_override)
+    if not report['compatible']:
+        raise ValueError('Mapeamento humanoide incompleto: ' + ', '.join(report['missing_critical_roles']))
+    mapping = report['mapping']
+    source_roles = {bone_role(s): s for s in mapping.values() if bone_role(s)}
+    target_roles = {bone_role(t): t for t in mapping if bone_role(t)}
     scene = bpy.context.scene
-    scene.frame_set(1)
-    bpy.context.view_layer.update()
-    source_rest = {
-        source_name: source.pose.bones[source_name].matrix_basis.copy()
-        for source_name in mapping.values()
+    # Removing an Action does not clear its evaluated channels. Reference
+    # matrices come exclusively from the immutable data-bone bind pose.
+    sw = source.matrix_world.copy()
+    tw = target.matrix_world.copy()
+    sr = {b.name: sw @ b.matrix_local for b in source.data.bones}
+    tr = {b.name: tw @ b.matrix_local for b in target.data.bones}
+    alignment = _body_frame(tr, target_roles) @ _body_frame(sr, source_roles).inverted()
+    scale = _leg_height(tr, target_roles) / max(_leg_height(sr, source_roles), 1e-8)
+    target_object_rotation_inverse = tw.to_quaternion().inverted()
+    source_pelvis = source_roles['pelvis']
+    target_pelvis = target_roles['pelvis']
+    corrections = {t: tr[t].to_quaternion() for t in mapping}
+    # Calibrate every mapped bone from a direct mapped child. This is
+    # important for rigs with extra spine/neck joints: calibrating Spine1
+    # against Head would include several independent joints and skew the
+    # torso. Bone roll is never used as the calibration reference.
+    preferred_children = {
+        'pelvis': ('spine_01',),
+        'spine_01': ('spine_02', 'neck_01', 'head'),
+        'spine_02': ('spine_03', 'neck_01', 'head'),
+        'spine_03': ('neck_01', 'head'),
+        'neck_01': ('head',),
+        'clavicle_l': ('upperarm_l',), 'clavicle_r': ('upperarm_r',),
+        'upperarm_l': ('lowerarm_l',), 'upperarm_r': ('lowerarm_r',),
+        'lowerarm_l': ('hand_l',), 'lowerarm_r': ('hand_r',),
+        'thigh_l': ('calf_l',), 'thigh_r': ('calf_r',),
+        'calf_l': ('foot_l',), 'calf_r': ('foot_r',),
     }
-    target_rest = {
-        target_name: target.pose.bones[target_name].matrix_basis.copy()
-        for target_name in mapping
-    }
-    target_rest_locations = {
-        target_name: target.pose.bones[target_name].location.copy()
-        for target_name in mapping
-    }
-    source_pelvis = next(
-        (bone for bone in source.pose.bones if bone_role(bone.name) == "pelvis"),
-        None,
-    )
-    target_motion = next(
-        (
-            bone
-            for bone in target.pose.bones
-            if bone_role(bone.name) in {"root", "pelvis"}
-        ),
-        None,
-    )
-    if source_pelvis is None or target_motion is None:
-        raise RuntimeError("retargeting exige ossos pelvis/root em ambos os rigs")
-    target_motion_rest_location = target_motion.location.copy()
-    source_pelvis_rest = _world_position(source, source_pelvis)
-    target_family = report["target_rig_family"]
-    source_family = report["source_rig_family"]
-    height_scale = _skeleton_height(target) / _skeleton_height(source)
-
+    for t in mapping:
+        s = mapping[t]
+        role = bone_role(t)
+        target_children = list(target.data.bones[t].children)
+        child = next((target.data.bones[target_roles[r]] for r in preferred_children.get(role, ())
+                      if r in target_roles and target_roles[r] in mapping and
+                      target.data.bones[target_roles[r]].parent == target.data.bones[t]), None)
+        if child is None:
+            child = next((candidate for candidate in target_children
+                          if candidate.name in mapping and
+                          source.data.bones[mapping[candidate.name]].parent and
+                          source.data.bones[mapping[candidate.name]].parent.name == s), None)
+        if child is None:
+            continue
+        sc = mapping[child.name]
+        tv = tr[child.name].translation - tr[t].translation
+        sv = alignment @ (sr[sc].translation - sr[s].translation)
+        if tv.length > 1e-8 and sv.length > 1e-8:
+            corrections[t] = tv.rotation_difference(sv) @ corrections[t]
+    _set_action(target, None)
+    target.animation_data.use_nla = False
+    source.animation_data_create()
+    source.animation_data.use_nla = False
+    for bone in target.pose.bones:
+        bone.matrix_basis = Matrix.Identity(4)
+        bone.rotation_mode = 'QUATERNION'
     _set_action(source, source_action)
-    start, end = _frame_range(source_action)
-    scene.frame_start = start
-    scene.frame_end = end
-    action_name = f"RETARGET|{target_family}|{source_family}|{label}"
-    action = bpy.data.actions.new(action_name)
+    start, end = math.floor(source_action.frame_range[0]), math.ceil(source_action.frame_range[1])
+    scene.frame_set(start)
+    bpy.context.view_layer.update()
+    first = (source.matrix_world @ source.pose.bones[source_pelvis].matrix).translation.copy()
+    up = _body_frame(tr, target_roles) @ Vector((0, 0, 1))
+    action = bpy.data.actions.new(f'RETARGET|{label}')
     _set_action(target, action)
-
-    for target_name in mapping:
-        target.pose.bones[target_name].rotation_mode = "QUATERNION"
-
+    ordered = sorted(target.pose.bones, key=lambda b: len(b.parent_recursive))
+    previous = {}
     for frame in range(start, end + 1):
         scene.frame_set(frame)
         bpy.context.view_layer.update()
-        for target_name, source_name in mapping.items():
-            target_bone = target.pose.bones[target_name]
-            source_bone = source.pose.bones[source_name]
-            # matrix_basis contains the imported rest-pose basis. Removing it
-            # before transfer prevents Mixamo's bone-axis conventions from
-            # leaking into UAL1, and multiplying by the target basis restores
-            # the target rig's own rest orientation.
-            delta = source_bone.matrix_basis @ source_rest[source_name].inverted()
-            delta.translation = (0.0, 0.0, 0.0)
-            target_bone.matrix_basis = target_rest[target_name] @ delta
-
-        source_displacement = _world_position(source, source_pelvis) - source_pelvis_rest
-        _set_target_motion(
-            target,
-            target_motion,
-            target_rest_locations.get(target_motion.name, target_motion_rest_location),
-            source_displacement,
-            height_scale,
-        )
-        bpy.context.view_layer.update()
-        for target_bone in target.pose.bones:
-            if target_bone.name in mapping or target_bone is target_motion:
-                _keyframe_bone(target_bone, frame)
-
-    action["retarget_schema"] = "sprite_lab.rig_compatibility/v1"
-    action["retarget_version"] = RETARGET_VERSION
-    action["source_action"] = source_action.name
-    action["source_rig_family"] = source_family
-    action["target_rig_family"] = target_family
-    action["bone_map"] = json.dumps(mapping, ensure_ascii=False, sort_keys=True)
-    action["height_scale"] = height_scale
-    # Ensure the action evaluates at its first frame before source objects are
-    # removed by the caller.
+        source_world = {s: source.matrix_world @ source.pose.bones[s].matrix for s in mapping.values()}
+        displacement = alignment @ (source_world[source_pelvis].translation - sr[source_pelvis].translation) * scale
+        if in_place:
+            travel = alignment @ (source_world[source_pelvis].translation - first) * scale
+            displacement -= travel - up * travel.dot(up)
+        solved = {}
+        for bone in ordered:
+            parent = bone.parent
+            kwargs = dict(parent_matrix=solved[parent.name], parent_matrix_local=parent.bone.matrix_local) if parent else {}
+            # Preserve target joint positions and solve extra parents with FK.
+            pose = bone.bone.convert_local_to_pose(Matrix.Identity(4), bone.bone.matrix_local, **kwargs)
+            if bone.name in mapping:
+                s = mapping[bone.name]
+                delta = source_world[s].to_quaternion() @ sr[s].to_quaternion().inverted()
+                rotation = target_object_rotation_inverse @ alignment @ delta @ alignment.inverted() @ corrections[bone.name]
+                position = pose.translation.copy()
+                if bone.name == target_pelvis:
+                    position = tw.inverted() @ (tr[target_pelvis].translation + displacement)
+                pose = Matrix.LocRotScale(position, rotation, Vector((1, 1, 1)))
+            basis = bone.bone.convert_local_to_pose(pose, bone.bone.matrix_local, invert=True, **kwargs)
+            bone.matrix_basis = basis
+            if bone.name in mapping:
+                q = bone.rotation_quaternion.copy()
+                if bone.name in previous and q.dot(previous[bone.name]) < 0:
+                    q.negate()
+                bone.rotation_quaternion = q
+                previous[bone.name] = q.copy()
+                for channel in ('location', 'rotation_quaternion', 'scale'):
+                    bone.keyframe_insert(data_path=channel, frame=frame)
+            solved[bone.name] = pose
+    action['retarget_schema'] = RETARGET_SCHEMA
+    action['retarget_version'] = RETARGET_VERSION
+    action['source_action'] = source_action.name
+    action['source_rig_family'] = report['source_rig_family']
+    action['target_rig_family'] = report['target_rig_family']
+    action['bone_map'] = json.dumps(mapping, sort_keys=True)
+    action['height_scale'] = scale
+    action['in_place'] = in_place
+    for layer in getattr(action, 'layers', []):
+        for strip in layer.strips:
+            for slot in action.slots:
+                bag = strip.channelbag(slot)
+                if bag:
+                    for curve in bag.fcurves:
+                        for key in curve.keyframe_points:
+                            key.interpolation = 'LINEAR'
+    scene.frame_start, scene.frame_end = start, end
     scene.frame_set(start)
     bpy.context.view_layer.update()
-    if previous_source_action is not None and previous_source_action != source_action:
-        _set_action(source, source_action)
-    if previous_target_action is not None and previous_target_action != action:
-        _set_action(target, action)
     return action, report

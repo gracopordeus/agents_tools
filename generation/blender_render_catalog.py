@@ -27,7 +27,7 @@ GENERATION_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(GENERATION_ROOT))
 sys.path.insert(0, str(GENERATION_ROOT / "sprite-lab"))
 from blender_mixamo_props import _attach, _find_bone, add_placeholder_props
-from blender_retarget import retarget_action
+from blender_retarget import retarget_action, rigs_share_bind
 from direction_contract import DIRECTION_ROWS, DIRECTION_TARGETS, direction_contract_for
 from blender_semantic_preview import rest_pose_forward
 
@@ -154,15 +154,7 @@ def import_source(path: Path, character_path: Path | None = None) -> tuple[bpy.t
                 action = max(new_actions, key=lambda candidate: candidate.frame_range[1] - candidate.frame_range[0])
         if action is not None:
             if animation_arm is not None:
-                target_signature = sorted(
-                    (bone.name, bone.parent.name if bone.parent else "")
-                    for bone in arm.data.bones
-                )
-                source_signature = sorted(
-                    (bone.name, bone.parent.name if bone.parent else "")
-                    for bone in animation_arm.data.bones
-                )
-                if source_signature != target_signature:
+                if not rigs_share_bind(animation_arm, arm):
                     action, _ = retarget_action(
                         arm,
                         animation_arm,

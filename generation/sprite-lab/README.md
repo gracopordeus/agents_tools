@@ -61,13 +61,21 @@ diretamente pela URL. A página permite:
 
 ### Compatibilidade de animações
 
-Actions Mixamo, UAL1 e rigs equivalentes podem ser usadas em qualquer mesh
-humanoide compatível. O pipeline identifica papéis semânticos dos ossos,
-transfere a pose a partir do rest pose, normaliza a escala e preserva o
-deslocamento do quadril na raiz. O Blender grava uma Action `RETARGET|...`
-pertencente ao personagem-alvo; o preview web aplica o mesmo retarget em
-tempo de execução. Rigs sem os ossos críticos são rejeitados com a lista do
-que falta, em vez de gerar uma pose parcialmente quebrada.
+Actions do Mixamo, UAL1 e rigs humanoides equivalentes podem ser usadas em
+qualquer personagem humanoide compatível. O pipeline identifica os papéis
+semânticos dos ossos, calibra a orientação usando o rest pose, preserva os
+comprimentos do esqueleto-alvo e normaliza a escala entre os personagens.
+Por padrão, a locomoção horizontal fica in-place para sprites; envie
+`"in_place": false` quando quiser preservar o deslocamento do quadril.
+O Blender grava uma Action `RETARGET|...` pertencente ao personagem-alvo e o
+preview web aplica a mesma solução em tempo de execução.
+
+Nomes Mixamo (`mixamorig:Hips`, `LeftArm`, `LeftForeArm` etc.) são resolvidos
+automaticamente, inclusive quando a Action foi exportada como `Layer0`. Para
+um rig com nomes próprios, passe `bone_mapping` no payload como
+`{"nome_do_osso_alvo": "nome_do_osso_mixamo"}`. Um rig sem os ossos críticos
+é rejeitado com a lista do que falta, em vez de produzir uma pose parcialmente
+quebrada; anatomias não humanoides exigem um adaptador específico.
 
 ### Providers de renderização por IA
 
