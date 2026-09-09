@@ -299,11 +299,12 @@ def _category(source: dict[str, Any], name: str, extension: str) -> str:
     if extension == "fbx":
         if any(token in lowered for token in ("character", "outfit", "body", "mannequin")):
             return "character"
-        # Weapon props (ex.: "Maria WProp") ship a prop mesh, not a
-        # body: keep them as weapon components even if the pack is
-        # animation-driven.
+        # Mixamo's ``WProp`` export is a character mesh with an attached
+        # weapon prop (for example ``Maria WProp``), not an animation-only
+        # file. Keep the renderable principal visible to Sprite Lab; files
+        # named only after a sword/weapon remain weapon components below.
         if "wprop" in lowered or "weapon_prop" in lowered:
-            return "weapon"
+            return "character"
         # Token set aligned with animation_catalog.classify_action plus
         # locomotion verbs seen in packs like the Great Sword Pack
         # (crouch, draw, turn, strafe, slide, slash, kick, ...). Animation

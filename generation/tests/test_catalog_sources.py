@@ -52,6 +52,7 @@ class CatalogSourcesTests(unittest.TestCase):
         source = {"category_by_extension": {}}
         cases = {
             "Knight_Body.fbx": "character",
+            "Maria WProp J J Ong.fbx": "character",
             "Longsword_Attack.fbx": "animation",
             "Iron_Shield.fbx": "weapon",
             "Idle_Loop.fbx": "animation",

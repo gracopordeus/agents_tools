@@ -32,6 +32,54 @@ class RelationshipCatalogTests(unittest.TestCase):
         unrelated_action = {**action, "name": "UAL2_Action", "relative_path": "UAL2_Action.fbx"}
         self.assertEqual(catalog.asset_kind(unrelated_action), "animation")
 
+    def test_mixamo_wprop_mesh_is_cataloged_as_character(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            assets_path = root / "assets.json"
+            animations_path = root / "animations.json"
+            output_path = root / "relationships.json"
+            annotations_path = root / "semantic_annotations.json"
+            assets_path.write_text(
+                json.dumps(
+                    {
+                        "catalog_root": str(root),
+                        "assets": [
+                            {
+                                "id": "maria-wprop",
+                                "name": "Maria WProp J J Ong",
+                                "category": "weapon",
+                                "format": "fbx",
+                                "relative_path": "Maria WProp J J Ong.fbx",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            animations_path.write_text(
+                json.dumps(
+                    {
+                        "assets": [
+                            {
+                                "asset_id": "maria-wprop",
+                                "mesh_count": 2,
+                                "armature_count": 1,
+                            }
+                        ],
+                        "animations": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            indexed = catalog.build_relationship_catalog(
+                assets_path, animations_path, output_path, annotations_path
+            )
+
+            maria = indexed["assets"][0]
+            self.assertEqual(maria["kind"], "character")
+            self.assertEqual(maria["annotation"]["kind"], "character")
+
     def test_index_annotation_relationship_and_validation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

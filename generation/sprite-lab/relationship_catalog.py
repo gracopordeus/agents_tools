@@ -170,8 +170,8 @@ def build_relationship_catalog(
     # geometria E armature (ex.: UAL1_Standard.fbx, mesh_count=1) deve
     # aparecer como mesh principal, não só como ação. Promove
     # animation(+mesh+armature) a character; weapon com mesh (ex.: espada
-    # Maria WProp) continua weapon, e malha estática sem armature
-    # (ex.: decals Sidewalk) nunca vira character (o render exige armature:
+    # Um WProp do Mixamo é um personagem com arma anexada e malha estática
+    # sem armature (ex.: decals Sidewalk) nunca vira character (o render exige armature:
     # blender_sprite_render.py "mesh principal sem armature").
     probe_geometry: dict[str, tuple[int, int]] = {}
     for probe in animations_data.get("assets", []):
@@ -198,8 +198,26 @@ def build_relationship_catalog(
             and armature_count > 0
         ):
             kind = "character"
+        searchable_name = " ".join(
+            (str(source.get("name", "")), str(source.get("relative_path", "")))
+        ).casefold()
+        if (
+            kind == "weapon"
+            and ("wprop" in searchable_name or "weapon_prop" in searchable_name)
+            and mesh_count > 0
+            and armature_count > 0
+        ):
+            # Preserve compatibility with catalogs generated before the
+            # source classifier knew that Mixamo WProp files include the
+            # render mesh and armature.
+            kind = "character"
         annotation = annotations.get(str(source.get("id")), _annotation_defaults(source))
-        if kind == "character" and isinstance(annotation, dict) and annotation.get("kind") == "animation":
+        if (
+            kind == "character"
+            and isinstance(annotation, dict)
+            and annotation.get("review_status") == "unreviewed"
+            and annotation.get("kind") != "character"
+        ):
             annotation = {**annotation, "kind": "character"}
         record = {
             "id": source.get("id"),
