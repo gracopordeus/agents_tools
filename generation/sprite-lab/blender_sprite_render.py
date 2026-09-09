@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import sys
 from pathlib import Path
 
@@ -513,9 +514,12 @@ def fit_ortho_scale(
     ground: float,
     profile: dict,
     resolution: int,
+    *,
+    overflow_only: bool = False,
 ) -> tuple[dict, dict[str, object] | None]:
     """Optimize the camera scale while keeping the requested cell dimensions."""
-    if profile.get("ortho_scale_mode", "fixed") != "fit":
+    requested_mode = profile.get("ortho_scale_mode", "fixed")
+    if requested_mode != "fit" and not overflow_only:
         return profile, None
     maximum_width = 0.0
     maximum_height = 0.0
@@ -535,6 +539,9 @@ def fit_ortho_scale(
         vertical_margin_px=float(profile.get("vertical_margin_px", 1.0)),
         safety_px=safety_px,
     )
+    if requested_mode != "fit" and optimized <= float(profile["ortho_scale"]) + 1e-9:
+        render_root.location = (0.0, 0.0, 0.0)
+        return profile, None
     effective_profile = {**profile, "ortho_scale": float(optimized)}
     configure_locked_camera(
         camera,
@@ -548,7 +555,7 @@ def fit_ortho_scale(
     scene.render.resolution_y = resolution
     render_root.location = (0.0, 0.0, 0.0)
     return effective_profile, {
-        "mode": "fit",
+        "mode": "fit" if requested_mode == "fit" else "overflow_fit",
         "cell": list(profile["cell_size"]),
         "base_ortho_scale": float(profile["ortho_scale"]),
         "effective_ortho_scale": float(optimized),
@@ -604,7 +611,9 @@ def main() -> int:
         include_studio_lights=False,
     )
     start, end = brc.action_range(action, scene)
-    cycle = brc.find_cycle(armature, scene, start, end) if action else None
+    timing_hint = request.get("animation_metadata") or {}
+    loop_hint = timing_hint.get("loop_recommended", timing_hint.get("loop"))
+    cycle = brc.find_cycle(armature, scene, start, end) if action and loop_hint is not False else None
     if cycle:
         phases = brc.phase_frames(start, start + cycle, phases_count, looping=True)
     else:
@@ -744,14 +753,23 @@ def main() -> int:
             ground,
             effective_profile,
             resolution,
+            overflow_only=bool(
+                effective_profile.get("dynamic_x", False)
+                or effective_profile.get("dynamic_y", False)
+            ),
         )
     lighting = configure_sprite_lighting(scene, render_root, request, camera)
     semantic_objects = [obj for obj in scene.objects if obj.type == "MESH" and obj.visible_get()]
-    semantic_materials = {
-        role: _material(f"__generation_seg_{role}", color)
-        for role, color in ROLE_COLORS.items()
-    }
-    depth_enabled = bool(request.get("depth", True))
+    auxiliary_channels = bool(request.get("auxiliary_channels", False))
+    semantic_materials = (
+        {
+            role: _material(f"__generation_seg_{role}", color)
+            for role, color in ROLE_COLORS.items()
+        }
+        if auxiliary_channels
+        else {}
+    )
+    depth_enabled = auxiliary_channels and bool(request.get("depth", True))
     depth_near, depth_far = (float(value) for value in request.get("depth_range", DEPTH_RANGE_DEFAULT))
     if depth_near >= depth_far:
         raise RuntimeError("depth_range inválido")
@@ -773,22 +791,25 @@ def main() -> int:
                     scene, camera, render_root, effective_profile, resolution
                 )
             path = output / f"row{row}_col{column}.png"
-            if depth_enabled:
-                scene.use_nodes = False
+            # Depth is rendered through a material override below.  Do not
+            # toggle Scene.use_nodes here: Blender 5.2 deprecated that
+            # property; no compositor is used by these material passes.
             if str(request.get("beauty_mode", "neutral")).casefold() == "original":
                 scene.render.filepath = str(path)
                 bpy.ops.render.render(write_still=True)
             else:
                 _render_neutral_beauty(scene, semantic_objects, path)
             segmentation_path = output / "segmentation" / f"row{row}_col{column}.png"
-            _render_vertex_segmentation(
-                scene,
-                semantic_objects,
-                {role: semantic_materials[role] for role in ROLE_COLORS},
-                segmentation_path,
-            )
+            if auxiliary_channels:
+                _render_vertex_segmentation(
+                    scene,
+                    semantic_objects,
+                    {role: semantic_materials[role] for role in ROLE_COLORS},
+                    segmentation_path,
+                )
             mesh_path = output / "mesh" / f"row{row}_col{column}.png"
-            render_mesh_wireframe(scene, mesh_path)
+            if auxiliary_channels:
+                render_mesh_wireframe(scene, mesh_path)
             lineart_path = output / "lineart" / f"row{row}_col{column}.png"
             render_mesh_lineart(scene, semantic_objects, lineart_path)
             bones_path = output / "bones" / f"row{row}_col{column}.png"
@@ -796,7 +817,8 @@ def main() -> int:
                 scene, camera, bones_path, resolution, resolution
             )
             heatmap_path = output / "heatmap" / f"row{row}_col{column}.png"
-            _write_pose_heatmap(scene, camera, heatmap_path, resolution, resolution)
+            if auxiliary_channels:
+                _write_pose_heatmap(scene, camera, heatmap_path, resolution, resolution)
             cell = {
                 "row": row,
                 "direction": row_names[row],
@@ -823,7 +845,9 @@ def main() -> int:
                     depth_far,
                 )
                 cell["depth_path"] = str(depth_path)
-                scene.use_nodes = False
+            if not auxiliary_channels:
+                for channel in ("segmentation_path", "mesh_path", "heatmap_path"):
+                    cell.pop(channel, None)
             if dynamic_fit is not None:
                 offsets_world = dynamic_fit["offset_world"]
                 offsets_pixels = dynamic_fit["offset_pixels"]
@@ -898,6 +922,7 @@ def main() -> int:
             "mode": depth_mode,
             "range": [depth_near, depth_far],
         },
+        "render_backend": str(os.environ.get("SPRITE_LAB_RENDER_BACKEND", "gpu")),
         "lighting": lighting,
         "horizontal_fit": {
             "enabled": dynamic_x,

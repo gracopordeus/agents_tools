@@ -1,7 +1,11 @@
+import json
+import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 import sys
+from unittest import mock
 
 from PIL import Image
 
@@ -14,6 +18,84 @@ import render_profile  # noqa: E402
 
 
 class SpriteRenderTests(unittest.TestCase):
+    def test_gpu_circuit_breaker_retries_after_backoff(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            health_path = Path(directory) / "gpu-health.json"
+            health_path.write_text(
+                json.dumps({"failed_at": 1_000.0}), encoding="utf-8"
+            )
+            with mock.patch.object(sprite_render, "GPU_HEALTH_PATH", health_path):
+                self.assertFalse(sprite_render._gpu_retry_allowed(1_001.0))
+                self.assertTrue(
+                    sprite_render._gpu_retry_allowed(
+                        1_000.0 + sprite_render.GPU_RETRY_SECONDS
+                    )
+                )
+
+    def test_worker_environments_isolate_gpu_and_software(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            mesa_vendor = Path(directory) / "50_mesa.json"
+            mesa_vendor.touch()
+            inherited = {
+                "__EGL_VENDOR_LIBRARY_FILENAMES": "stale",
+                "LIBGL_ALWAYS_SOFTWARE": "1",
+            }
+            with (
+                mock.patch.dict(os.environ, inherited, clear=False),
+                mock.patch.object(sprite_render, "MESA_EGL_VENDOR", mesa_vendor),
+            ):
+                gpu = sprite_render._blender_worker_env("gpu")
+                software = sprite_render._blender_worker_env("software")
+            self.assertNotIn("__EGL_VENDOR_LIBRARY_FILENAMES", gpu)
+            self.assertNotIn("LIBGL_ALWAYS_SOFTWARE", gpu)
+            self.assertEqual(gpu["SPRITE_LAB_RENDER_BACKEND"], "gpu")
+            self.assertEqual(
+                software["__EGL_VENDOR_LIBRARY_FILENAMES"], str(mesa_vendor)
+            )
+            self.assertEqual(software["LIBGL_ALWAYS_SOFTWARE"], "1")
+
+    def test_auto_worker_falls_back_to_software_after_gpu_failure(self) -> None:
+        failed = subprocess.CompletedProcess(["blender"], -6, "", "")
+        succeeded = subprocess.CompletedProcess(["blender"], 0, "", "")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result_path = root / "request.json.result.json"
+            result_path.touch()
+            with (
+                mock.patch.object(sprite_render, "_gpu_retry_allowed", return_value=True),
+                mock.patch.object(
+                    sprite_render,
+                    "_run_blender_worker",
+                    side_effect=[failed, succeeded],
+                ) as run,
+                mock.patch.object(sprite_render, "_record_gpu_health") as health,
+            ):
+                completed = sprite_render._execute_blender_worker(
+                    ["blender"], root, result_path, 60.0, "auto"
+                )
+            self.assertEqual(completed.returncode, 0)
+            self.assertEqual(
+                [call.args[3] for call in run.call_args_list], ["gpu", "software"]
+            )
+            health.assert_called_once()
+            self.assertFalse(health.call_args.args[0])
+
+    def test_auto_worker_respects_open_gpu_circuit(self) -> None:
+        succeeded = subprocess.CompletedProcess(["blender"], 0, "", "")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with (
+                mock.patch.object(sprite_render, "_gpu_retry_allowed", return_value=False),
+                mock.patch.object(
+                    sprite_render, "_run_blender_worker", return_value=succeeded
+                ) as run,
+            ):
+                completed = sprite_render._execute_blender_worker(
+                    ["blender"], root, root / "result.json", 60.0, "auto"
+                )
+            self.assertEqual(completed.returncode, 0)
+            self.assertEqual(run.call_args.args[3], "software")
+
     def test_locked_render_profile_contract(self) -> None:
         manifest = render_profile.normalize_manifest(
             {

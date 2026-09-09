@@ -5,7 +5,9 @@ import json
 import math
 import os
 import shutil
+import signal
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +48,9 @@ DEFAULT_CELL = 256
 DEFAULT_UPSCALE = 2
 SPRITE_WORK = Path(__file__).resolve().parent / "work" / "sprite-renders"
 BLENDER_WORKER = Path(__file__).resolve().with_name("blender_sprite_render.py")
+GPU_HEALTH_PATH = Path(__file__).resolve().parent / "state" / "blender_gpu_health.json"
+GPU_RETRY_SECONDS = 24 * 60 * 60
+MESA_EGL_VENDOR = Path("/usr/share/glvnd/egl_vendor.d/50_mesa.json")
 
 
 def write_json_atomic(path: Path, data: Any) -> None:
@@ -59,6 +64,8 @@ def write_json_atomic(path: Path, data: Any) -> None:
 
 def _worker_error(completed: subprocess.CompletedProcess[str], output: Path) -> str:
     """Extract a useful Blender/Python error when the result file is missing."""
+    if completed.returncode < 0:
+        return f"Blender abortou com {signal.Signals(-completed.returncode).name}; consulte o core dump e worker.log"
     chunks = [completed.stdout or "", completed.stderr or ""]
     worker_log = output / "worker.log"
     if worker_log.is_file():
@@ -76,6 +83,99 @@ def _worker_error(completed: subprocess.CompletedProcess[str], output: Path) -> 
         if stripped.startswith(error_prefixes):
             return stripped
     return lines[-1].strip() if lines else "worker encerrou sem produzir metadados"
+
+
+def _blender_worker_env(backend: str) -> dict[str, str]:
+    env = os.environ.copy()
+    env["SPRITE_LAB_RENDER_BACKEND"] = backend
+    if backend == "software":
+        if not MESA_EGL_VENDOR.is_file():
+            raise RuntimeError("Render por software exige o driver EGL Mesa instalado")
+        env["__EGL_VENDOR_LIBRARY_FILENAMES"] = str(MESA_EGL_VENDOR)
+        env["LIBGL_ALWAYS_SOFTWARE"] = "1"
+    else:
+        env.pop("__EGL_VENDOR_LIBRARY_FILENAMES", None)
+        env.pop("LIBGL_ALWAYS_SOFTWARE", None)
+    return env
+
+
+def _gpu_retry_allowed(now: float | None = None) -> bool:
+    if not GPU_HEALTH_PATH.is_file():
+        return True
+    try:
+        health = json.loads(GPU_HEALTH_PATH.read_text(encoding="utf-8"))
+        failed_at = float(health.get("failed_at", 0.0))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return True
+    return (now if now is not None else time.time()) - failed_at >= GPU_RETRY_SECONDS
+
+
+def _record_gpu_health(ok: bool, error: str | None = None) -> None:
+    checked_at = time.time()
+    write_json_atomic(
+        GPU_HEALTH_PATH,
+        {
+            "ok": ok,
+            "checked_at": checked_at,
+            "failed_at": None if ok else checked_at,
+            "error": error,
+        },
+    )
+
+
+def _run_blender_worker(
+    command: list[str],
+    output: Path,
+    result_path: Path,
+    backend: str,
+    timeout: float,
+) -> subprocess.CompletedProcess[str]:
+    completed = subprocess.run(
+        command,
+        env=_blender_worker_env(backend),
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    log_path = output / ("worker.log" if backend == "software" else "worker.gpu.log")
+    log_path.write_text(
+        (completed.stdout or "") + "\n" + (completed.stderr or ""), encoding="utf-8"
+    )
+    if completed.returncode == 0 and not result_path.is_file():
+        completed = subprocess.CompletedProcess(
+            completed.args,
+            1,
+            completed.stdout,
+            (completed.stderr or "") + "\nworker encerrou sem produzir metadados",
+        )
+    return completed
+
+
+def _execute_blender_worker(
+    command: list[str],
+    output: Path,
+    result_path: Path,
+    timeout: float,
+    mode: str,
+) -> subprocess.CompletedProcess[str]:
+    if mode not in {"auto", "gpu", "software"}:
+        raise RuntimeError(f"SPRITE_LAB_BLENDER_MODE inválido: {mode}")
+    completed = None
+    if mode == "gpu" or (mode == "auto" and _gpu_retry_allowed()):
+        completed = _run_blender_worker(command, output, result_path, "gpu", timeout)
+        if completed.returncode == 0:
+            _record_gpu_health(True)
+        else:
+            _record_gpu_health(False, _worker_error(completed, output))
+            if mode == "gpu":
+                return completed
+            result_path.unlink(missing_ok=True)
+    if completed is None or completed.returncode != 0:
+        completed = _run_blender_worker(
+            command, output, result_path, "software", timeout
+        )
+    return completed
 
 
 def render_dimensions(payload: dict[str, Any]) -> tuple[str, int, int]:
@@ -516,6 +616,7 @@ def generate_sprite_render(
         )
     }
     request = {
+        "auxiliary_channels": bool(payload.get("auxiliary_channels", False)),
         "character_path": str(character_path),
         "animation_path": str(animation_path),
         "action_name": animation.get("action_name") or animation.get("clip_name"),
@@ -574,19 +675,15 @@ def generate_sprite_render(
         "--request",
         str(request_path),
     ]
-    completed = subprocess.run(
-        command,
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-    )
-    (output / "worker.log").write_text(
-        (completed.stdout or "") + "\n" + (completed.stderr or ""), encoding="utf-8"
+    result_path = Path(str(request_path) + ".result.json")
+    mode = str(os.environ.get("SPRITE_LAB_BLENDER_MODE", "auto")).strip().casefold()
+    if os.environ.get("SPRITE_LAB_BLENDER_SOFTWARE") == "1":
+        mode = "software"
+    completed = _execute_blender_worker(
+        command, output, result_path, timeout, mode
     )
     if completed.returncode != 0:
         raise RuntimeError(_worker_error(completed, output))
-    result_path = Path(str(request_path) + ".result.json")
     if not result_path.is_file():
         raise RuntimeError(_worker_error(completed, output))
     worker_report = json.loads(result_path.read_text(encoding="utf-8"))
