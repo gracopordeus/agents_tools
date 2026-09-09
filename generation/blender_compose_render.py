@@ -30,7 +30,7 @@ from direction_contract import DIRECTION_ROWS, DIRECTION_TARGETS, direction_cont
 
 ROWS = list(DIRECTION_ROWS)
 TARGETS = [DIRECTION_TARGETS[row] for row in DIRECTION_ROWS]
-ELEV = 35.264
+ELEV = 30.0
 AZIM = 45.0
 
 

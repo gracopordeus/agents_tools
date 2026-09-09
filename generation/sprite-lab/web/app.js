@@ -234,7 +234,7 @@ function aiRenderDefaultSpec() {
     version: "2.0",
     output: { width: 2048, height: 2048, grid: { rows: 8, columns: 8 }, background: "transparent", draw_grid: false },
     asset: { mode: "character_animation", name: "", global_description: "", style: { preset: "", description: "" } },
-    camera: { projection: "orthographic", preset: "isometric", elevation_deg: 35.264, azimuth_deg: 45 },
+    camera: { projection: "orthographic", preset: "isometric", elevation_deg: 30.0, azimuth_deg: 45 },
     framing: { anchor: "bottom_center", scale_policy: "normalize_per_row", safe_area: 0.9, allow_crop: false, allow_cross_cell_overlap: false },
     references: {},
     prompt_options: { include_rows: false, include_cells: false },
@@ -273,7 +273,7 @@ function aiRenderSpecFormValues(spec) {
   set("gemini-background", selectedImageBackground());
   set("gemini-camera-projection", camera.projection || "orthographic");
   set("gemini-camera-preset", camera.preset || "isometric");
-  set("gemini-camera-elevation", camera.elevation_deg ?? 35.264);
+  set("gemini-camera-elevation", camera.elevation_deg ?? 30.0);
   set("gemini-camera-azimuth", camera.azimuth_deg ?? 45);
   set("gemini-framing-anchor", framing.anchor || "bottom_center");
   set("gemini-scale-policy", framing.scale_policy || "normalize_per_row");
@@ -363,7 +363,7 @@ function readAiRenderSpecFromForm() {
   spec.camera = {
     projection: value("gemini-camera-projection", "orthographic"),
     preset: value("gemini-camera-preset", "isometric").trim(),
-    elevation_deg: numberValue("gemini-camera-elevation", 35.264),
+    elevation_deg: numberValue("gemini-camera-elevation", 30.0),
     azimuth_deg: numberValue("gemini-camera-azimuth", 45),
   };
   spec.framing = {
@@ -558,7 +558,7 @@ const CAMERA_PRESET_OPTIONS = [
 ];
 const CAMERA_PRESET_DEFAULTS = Object.freeze({
   isometric: {
-    elevation: 35.264, azimuth: 45, ortho_scale: 2.57705670238966,
+    elevation: 30.0, azimuth: 45, ortho_scale: 2.57705670238966,
     profile_id: "hero_reference_v1",
   },
   platform: {
@@ -2370,7 +2370,7 @@ async function renderSprites() {
     profile: $("#sprite-profile").value,
     resolution: Number($("#sprite-resolution").value || 256),
     fps: Number($("#sprite-fps").value || 10),
-    elevation: Number($("#sprite-elevation").value || 35.264),
+    elevation: Number($("#sprite-elevation").value || 30.0),
     azimuth: Number($("#sprite-azimuth").value || 45),
     camera_preset: $("#sprite-camera-preset").value || "isometric",
     optimize_ortho_scale: $("#sprite-scale-mode").value === "dynamic",

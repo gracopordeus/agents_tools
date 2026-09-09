@@ -189,7 +189,7 @@ def default_render_spec(
         "camera": {
             "projection": "orthographic",
             "preset": "isometric",
-            "elevation_deg": 35.264,
+            "elevation_deg": 30.0,
             "azimuth_deg": 45.0,
         },
         "framing": {
@@ -296,7 +296,7 @@ def normalize_render_spec(
     spec["camera"] = {
         "projection": _clean_text(incoming_camera.get("projection"), "orthographic"),
         "preset": _clean_text(incoming_camera.get("preset"), "isometric"),
-        "elevation_deg": _float(incoming_camera.get("elevation_deg"), 35.264),
+        "elevation_deg": _float(incoming_camera.get("elevation_deg"), 30.0),
         "azimuth_deg": _float(incoming_camera.get("azimuth_deg"), 45.0),
     }
 

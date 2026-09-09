@@ -149,7 +149,7 @@ class AiRenderReferenceTests(unittest.TestCase):
             (source / "render_metadata.json").write_text(
                 json.dumps(
                     {
-                        "camera": {"type": "ORTHO", "preset": "isometric", "elevation": 35.264, "azimuth": 45},
+                        "camera": {"type": "ORTHO", "preset": "isometric", "elevation": 30.0, "azimuth": 45},
                         "render_profile": {"foot_anchor": [128, 220], "cell_size": [256, 256]},
                     }
                 ),
