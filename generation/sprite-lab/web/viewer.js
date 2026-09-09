@@ -25,7 +25,7 @@ function animationLeafName(value) {
 
 // Shared, renderer-independent retargeting keeps the browser and Blender
 // paths on the same semantic mapping contract.
-import { createRuntimeRetarget, applyRuntimeRetarget } from './retarget.js?v=5';
+import { createRuntimeRetarget, applyRuntimeRetarget } from './retarget.js?v=6';
 
 function findAnimationClip(clips, name) {
   const exact = clips.find((clip) => clip.name === name);
