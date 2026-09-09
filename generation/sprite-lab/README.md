@@ -59,6 +59,16 @@ diretamente pela URL. A página permite:
 - acompanhar renderizações de sprites e abrir o spritesheet, GIF e JSON de
   metadados do resultado.
 
+### Compatibilidade de animações
+
+Actions Mixamo, UAL1 e rigs equivalentes podem ser usadas em qualquer mesh
+humanoide compatível. O pipeline identifica papéis semânticos dos ossos,
+transfere a pose a partir do rest pose, normaliza a escala e preserva o
+deslocamento do quadril na raiz. O Blender grava uma Action `RETARGET|...`
+pertencente ao personagem-alvo; o preview web aplica o mesmo retarget em
+tempo de execução. Rigs sem os ossos críticos são rejeitados com a lista do
+que falta, em vez de gerar uma pose parcialmente quebrada.
+
 ### Providers de renderização por IA
 
 A página **AI Render** usa OpenAI como provider padrão e oferece Gemini e Qwen

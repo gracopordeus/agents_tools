@@ -19,6 +19,7 @@ import bpy
 from mathutils import Euler, Matrix, Quaternion, Vector
 
 from orientation_contract import axis_vector, normalize_orientation
+from blender_retarget import retarget_action
 
 
 BONE_PATH_RE = re.compile(r"pose\.bones\[(?:\"([^\"]+)\"|'([^']+)')\]")
@@ -459,17 +460,43 @@ def apply_animation(
     animation_path: Path | None,
     action_name: str | None,
 ) -> bpy.types.Action | None:
-    action = find_action(action_name)
-    if action is None and animation_path is not None:
+    action = find_action(action_name) if animation_path is None else None
+    if animation_path is not None:
+        actions_before = set(bpy.data.actions)
         imported = import_asset(animation_path)
-        action = find_action(action_name)
-        if action is None:
-            imported_actions = list(bpy.data.actions)
-            if imported_actions:
-                action = max(
-                    imported_actions,
-                    key=lambda item: item.frame_range[1] - item.frame_range[0],
-                )
+        source_armature = next(
+            (obj for obj in imported if obj.type == "ARMATURE"),
+            None,
+        )
+        imported_actions = [item for item in bpy.data.actions if item not in actions_before]
+        active_source_action = (
+            source_armature.animation_data.action
+            if source_armature and source_armature.animation_data
+            else None
+        )
+        if imported_actions:
+            exact = next((item for item in imported_actions if item.name == action_name), None)
+            leaf = str(action_name or "").split("|")[-1]
+            action = exact or next(
+                (
+                    item for item in imported_actions
+                    if item.name == leaf or item.name.endswith("|" + leaf)
+                ),
+                None,
+            )
+            action = action or active_source_action or max(
+                imported_actions,
+                key=lambda item: item.frame_range[1] - item.frame_range[0],
+            )
+        else:
+            action = active_source_action
+        if source_armature is not None and action is not None:
+            action, _ = retarget_action(
+                armature,
+                source_armature,
+                action,
+                label=str(action_name or action.name).split("|")[-1],
+            )
         for obj in imported:
             bpy.data.objects.remove(obj, do_unlink=True)
     if action is not None:
