@@ -288,6 +288,13 @@ def find_action(name: str | None) -> bpy.types.Action | None:
     )
 
 
+def _rig_signature(armature: bpy.types.Object) -> tuple[tuple[str, str], ...]:
+    return tuple(sorted(
+        (bone.name, bone.parent.name if bone.parent else "")
+        for bone in armature.data.bones
+    ))
+
+
 def rest_pose_forward(
     armature: bpy.types.Object,
     orientation: dict[str, Any] | None = None,
@@ -491,12 +498,16 @@ def apply_animation(
         else:
             action = active_source_action
         if source_armature is not None and action is not None:
-            action, _ = retarget_action(
-                armature,
-                source_armature,
-                action,
-                label=str(action_name or action.name).split("|")[-1],
-            )
+            # Same-family exports already share the target's bone names and
+            # rest-axis contract. Keep their Action untouched; retargeting is
+            # only needed when the source hierarchy actually differs.
+            if _rig_signature(source_armature) != _rig_signature(armature):
+                action, _ = retarget_action(
+                    armature,
+                    source_armature,
+                    action,
+                    label=str(action_name or action.name).split("|")[-1],
+                )
         for obj in imported:
             bpy.data.objects.remove(obj, do_unlink=True)
     if action is not None:

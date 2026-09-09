@@ -105,12 +105,20 @@ function rigBones(root) {
   return bones;
 }
 
+function rigSignature(root) {
+  return rigBones(root)
+    .map((bone) => `${bone.name}|${bone.parent?.name || ""}`)
+    .sort()
+    .join(";");
+}
+
 function createRuntimeRetarget(sourceRoot, targetRoot) {
   const sourceBones = rigBones(sourceRoot);
   const targetBones = rigBones(targetRoot);
   if (!sourceBones.length || !targetBones.length) {
     throw new Error("retargeting exige armature de origem e personagem com ossos");
   }
+  if (rigSignature(sourceRoot) === rigSignature(targetRoot)) return null;
   const sourceByRole = new Map();
   sourceBones.forEach((bone) => {
     const role = boneRole(bone.name);
