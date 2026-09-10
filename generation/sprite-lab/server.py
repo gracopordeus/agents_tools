@@ -1174,6 +1174,11 @@ def run_sprite_job(job: dict) -> None:
             "spritesheet": f"{job['id']}/spritesheet.png",
             "gif": f"{job['id']}/animation.gif" if report.get("gif") else None,
             "gifs": direction_gifs,
+            "controlnet_channels": {
+                "lineart": f"{job['id']}/spritesheet_lineart.png",
+                "bones": f"{job['id']}/spritesheet_bones.png",
+                "report": f"{job['id']}/controlnet_channels.json",
+            },
             "ai_base_pages": {
                 direction: f"{job['id']}/{Path(path).name}"
                 for direction, path in (report.get("ai_base_pages") or {}).items()

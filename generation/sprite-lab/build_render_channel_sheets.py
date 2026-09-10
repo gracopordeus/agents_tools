@@ -21,7 +21,10 @@ CHANNELS = {
 
 def build_channel(root: Path, channel: str, rows: int, columns: int, size: int) -> Path:
     directory = root / CHANNELS[channel]
-    mode = "RGBA" if channel in {"beauty", "silhouette", "segmentation"} else "L"
+    # OpenPose uses the COCO18 RGB limb colors. Blender's old bones channel
+    # was white, but converting inferred OpenPose to L would destroy its
+    # semantic color encoding.
+    mode = "RGBA" if channel in {"beauty", "silhouette", "segmentation", "bones"} else "L"
     sheet = Image.new(mode, (columns * size, rows * size), 0)
     for row in range(rows):
         for column in range(columns):

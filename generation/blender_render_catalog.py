@@ -236,12 +236,22 @@ def find_cycle(arm: bpy.types.Object, scene: bpy.types.Scene,
     """
     if end <= start:
         return None
-    seam = pose_distance(arm, scene, start, end)
+    # The initial pose is invariant throughout this search. Evaluating its
+    # deformed meshes again for every candidate doubles the expensive work.
+    first = _mesh_signature(arm, scene, start)
+
+    def distance(frame: int) -> float:
+        last = _mesh_signature(arm, scene, frame)
+        if not first or len(first) != len(last):
+            return float("inf")
+        return sum((a - b).length for a, b in zip(first, last)) / len(first)
+
+    seam = distance(end)
     if seam <= threshold:
         return end - start if end - start >= min_period else None
     best_period, best_diff = None, float("inf")
     for period in range(min_period, end - start):
-        diff = pose_distance(arm, scene, start, start + period)
+        diff = distance(start + period)
         if diff < best_diff:
             best_diff, best_period = diff, period
     return best_period if best_period is not None and best_diff <= threshold else None

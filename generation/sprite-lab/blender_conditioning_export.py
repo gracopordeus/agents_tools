@@ -15,6 +15,7 @@ import argparse
 import json
 import math
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +54,8 @@ ROLE_COLORS = {
     "other": (189, 195, 199, 255),
 }
 DEPTH_RANGE_DEFAULT = (0.1, 20.0)
+COMPONENT_ROOT_PREFIX = "sprite_component_"
+COMPONENT_ROLE_PROPERTY = "conditioning_component_role"
 NAME_ROLE_HINTS = (
     ("weapon", "weapon"),
     ("sword", "weapon"),
@@ -107,6 +110,21 @@ def _role(obj: bpy.types.Object) -> str:
         if hint in name:
             return role
     return "other"
+
+
+def _component_role(obj: bpy.types.Object) -> str | None:
+    """Return the composition role inherited by a component mesh, if any."""
+    current = obj
+    while current is not None:
+        declared = str(current.get(COMPONENT_ROLE_PROPERTY, "")).strip().casefold()
+        if declared:
+            return declared
+        if current.name.startswith(COMPONENT_ROOT_PREFIX):
+            # Keep compatibility with scenes created before the explicit
+            # component-role property was added.
+            return "prop"
+        current = current.parent
+    return None
 
 
 def _material(name: str, color: tuple[int, int, int, int]) -> bpy.types.Material:
@@ -172,11 +190,16 @@ def _render_with_overrides(
     objects: list[bpy.types.Object],
     material_by_role: dict[str, bpy.types.Material],
     path: Path,
+    material_resolver: Callable[[bpy.types.Object], bpy.types.Material] | None = None,
 ) -> None:
     previous: dict[str, list[bpy.types.Material | None]] = {}
     try:
         for obj in objects:
-            override = material_by_role[_role(obj)]
+            override = (
+                material_resolver(obj)
+                if material_resolver is not None
+                else material_by_role[_role(obj)]
+            )
             previous[obj.name] = [slot.material for slot in obj.material_slots]
             if obj.material_slots:
                 for slot in obj.material_slots:
@@ -199,13 +222,17 @@ def _render_neutral_beauty(
     objects: list[bpy.types.Object],
     path: Path,
 ) -> None:
-    """Render geometry with a neutral clay material for img2img init."""
+    """Render the character gray and attached composition props orange."""
     clay = _material("__generation_neutral_clay", (128, 128, 128, 255))
+    prop = _material("__generation_neutral_prop", (230, 126, 34, 255))
     _render_with_overrides(
         scene,
         objects,
         {role: clay for role in ROLES},
         path,
+        material_resolver=lambda obj: (
+            prop if _component_role(obj) is not None else clay
+        ),
     )
 
 

@@ -5,6 +5,7 @@ import json
 import math
 import os
 import sys
+import time
 from pathlib import Path
 
 import bpy
@@ -37,21 +38,7 @@ from blender_semantic_preview import (  # noqa: E402
     rest_pose_forward,
     update_two_hand_components,
 )
-from blender_conditioning_export import (  # noqa: E402
-    _configure_depth_compositor,
-    _convert_depth_exr,
-    _convert_depth_render_result,
-    _render_depth_material,
-    _material,
-    _render_with_overrides,
-    _render_neutral_beauty,
-    _render_vertex_segmentation,
-    _role,
-    ROLE_COLORS,
-    DEPTH_RANGE_DEFAULT,
-    _write_skeleton,
-    _write_pose_heatmap,
-)
+from blender_conditioning_export import _material, _component_role  # noqa: E402
 
 
 # Keep the public row contract independent from the camera target ordering.
@@ -570,6 +557,7 @@ def fit_ortho_scale(
 
 
 def main() -> int:
+    started = time.monotonic()
     request_path, result_path = request_paths()
     request = json.loads(request_path.read_text(encoding="utf-8"))
     output = Path(request["output"]).expanduser().resolve()
@@ -581,6 +569,7 @@ def main() -> int:
 
     bpy.ops.wm.read_factory_settings(use_empty=True)
     scene = bpy.context.scene
+    print("STAGE import", flush=True)
     import_asset(Path(request["character_path"]).expanduser().resolve())
     armature = find_armature()
     if armature is None:
@@ -611,6 +600,7 @@ def main() -> int:
         include_studio_lights=False,
     )
     start, end = brc.action_range(action, scene)
+    print("STAGE animation_bounds", flush=True)
     timing_hint = request.get("animation_metadata") or {}
     loop_hint = timing_hint.get("loop_recommended", timing_hint.get("loop"))
     cycle = brc.find_cycle(armature, scene, start, end) if action and loop_hint is not False else None
@@ -760,28 +750,41 @@ def main() -> int:
         )
     lighting = configure_sprite_lighting(scene, render_root, request, camera)
     semantic_objects = [obj for obj in scene.objects if obj.type == "MESH" and obj.visible_get()]
-    auxiliary_channels = bool(request.get("auxiliary_channels", False))
-    semantic_materials = (
-        {
-            role: _material(f"__generation_seg_{role}", color)
-            for role, color in ROLE_COLORS.items()
-        }
-        if auxiliary_channels
-        else {}
-    )
-    depth_enabled = auxiliary_channels and bool(request.get("depth", True))
-    depth_near, depth_far = (float(value) for value in request.get("depth_range", DEPTH_RANGE_DEFAULT))
-    if depth_near >= depth_far:
-        raise RuntimeError("depth_range inválido")
-    depth_mode = None
+    # This dedicated worker exports only beauty. Keep material assignments stable
+    # across frames so EEVEE can reuse shaders instead of invalidating them twice
+    # per cell. The process exits after the render; no source asset is modified.
+    if str(request.get("beauty_mode", "neutral")).casefold() != "original":
+        clay = _material("__generation_neutral_clay", (128, 128, 128, 255))
+        prop = _material("__generation_neutral_prop", (230, 126, 34, 255))
+        for obj in semantic_objects:
+            material = prop if _component_role(obj) is not None else clay
+            if obj.material_slots:
+                for slot in obj.material_slots:
+                    slot.material = material
+            else:
+                obj.data.materials.append(material)
+    preparation_seconds = time.monotonic() - started
+    render_threads = int(request.get("render_threads", 0))
+    scene.render.threads_mode = "FIXED" if render_threads else "AUTO"
+    if render_threads:
+        scene.render.threads = render_threads
+    assigned_rows = request.get("assigned_rows", list(range(rows)))
+    if (not isinstance(assigned_rows, list) or not assigned_rows
+            or any(type(row) is not int or row < 0 or row >= rows for row in assigned_rows)
+            or len(set(assigned_rows)) != len(assigned_rows)):
+        raise RuntimeError("assigned_rows inválido")
+    print(f"STAGE render preparation_seconds={preparation_seconds:.3f}", flush=True)
     cells = []
     dynamic_x = bool(effective_profile and effective_profile.get("dynamic_x", False))
     dynamic_y = bool(effective_profile and effective_profile.get("dynamic_y", False))
     for row, direction_yaw in enumerate(direction_yaws):
+        if row not in assigned_rows:
+            continue
         print(f"DIRECTION row={row_names[row]} yaw={math.degrees(direction_yaw):.3f}", flush=True)
         render_root.rotation_mode = "XYZ"
         render_root.rotation_euler[2] = direction_yaw
         for column, frame in enumerate(phases):
+            cell_started = time.monotonic()
             position_render_root(
                 scene, armature, render_root, frame, direction_yaw, ground
             )
@@ -791,63 +794,16 @@ def main() -> int:
                     scene, camera, render_root, effective_profile, resolution
                 )
             path = output / f"row{row}_col{column}.png"
-            # Depth is rendered through a material override below.  Do not
-            # toggle Scene.use_nodes here: Blender 5.2 deprecated that
-            # property; no compositor is used by these material passes.
-            if str(request.get("beauty_mode", "neutral")).casefold() == "original":
-                scene.render.filepath = str(path)
-                bpy.ops.render.render(write_still=True)
-            else:
-                _render_neutral_beauty(scene, semantic_objects, path)
-            segmentation_path = output / "segmentation" / f"row{row}_col{column}.png"
-            if auxiliary_channels:
-                _render_vertex_segmentation(
-                    scene,
-                    semantic_objects,
-                    {role: semantic_materials[role] for role in ROLE_COLORS},
-                    segmentation_path,
-                )
-            mesh_path = output / "mesh" / f"row{row}_col{column}.png"
-            if auxiliary_channels:
-                render_mesh_wireframe(scene, mesh_path)
-            lineart_path = output / "lineart" / f"row{row}_col{column}.png"
-            render_mesh_lineart(scene, semantic_objects, lineart_path)
-            bones_path = output / "bones" / f"row{row}_col{column}.png"
-            bones_meta = _write_skeleton(
-                scene, camera, bones_path, resolution, resolution
-            )
-            heatmap_path = output / "heatmap" / f"row{row}_col{column}.png"
-            if auxiliary_channels:
-                _write_pose_heatmap(scene, camera, heatmap_path, resolution, resolution)
+            scene.render.filepath = str(path)
+            bpy.ops.render.render(write_still=True)
             cell = {
                 "row": row,
                 "direction": row_names[row],
                 "column": column,
                 "frame": frame,
                 "path": str(path),
-                "segmentation_path": str(segmentation_path),
-                "mesh_path": str(mesh_path),
-                "lineart_path": str(lineart_path),
-                "bones_path": str(bones_path),
-                "heatmap_path": str(heatmap_path),
-                "bones": bones_meta["bones"],
-                "bones_source": "blender_armature_deform",
-                "skeleton_format": bones_meta["format"],
+                "elapsed_seconds": round(time.monotonic() - cell_started, 3),
             }
-            if depth_enabled:
-                depth_path = output / "depth" / f"row{row}_col{column}.png"
-                depth_mode = "material"
-                _render_depth_material(
-                    scene,
-                    semantic_objects,
-                    depth_path,
-                    depth_near,
-                    depth_far,
-                )
-                cell["depth_path"] = str(depth_path)
-            if not auxiliary_channels:
-                for channel in ("segmentation_path", "mesh_path", "heatmap_path"):
-                    cell.pop(channel, None)
             if dynamic_fit is not None:
                 offsets_world = dynamic_fit["offset_world"]
                 offsets_pixels = dynamic_fit["offset_pixels"]
@@ -880,6 +836,10 @@ def main() -> int:
 
     metadata = {
         "schema": "sprite_lab.sprite_render/v1",
+        "timing": {
+            "preparation_seconds": round(preparation_seconds, 3),
+            "total_seconds": round(time.monotonic() - started, 3),
+        },
         "asset": asset_spec,
         "animation_source": {
             key: animation_metadata.get(key)
@@ -917,10 +877,10 @@ def main() -> int:
             "azimuth": float(request.get("azimuth", 45.0)),
             "ortho_scale": float(camera.data.ortho_scale),
         },
-        "depth": {
-            "enabled": depth_enabled,
-            "mode": depth_mode,
-            "range": [depth_near, depth_far],
+        "channel_sources": {
+            "beauty": "blender",
+            "lineart": "generated_after_blender_by_controlnet",
+            "bones": "generated_after_blender_by_controlnet",
         },
         "render_backend": str(os.environ.get("SPRITE_LAB_RENDER_BACKEND", "gpu")),
         "lighting": lighting,

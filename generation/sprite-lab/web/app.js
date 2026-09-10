@@ -13,7 +13,6 @@ const state = {
   selectedCompositionComponentId: null,
   attachmentTargets: [],
   compositionTransformMode: "translate",
-  spriteCompositionViewer: null,
   spriteLighting: { preset: "default", intensity: 3, followCamera: true },
   editingCompositionId: null,
   pendingDeleteCompositionId: null,
@@ -1255,8 +1254,6 @@ function switchPage(pageId, { updateHistory = true } = {}) {
     populateSpriteCompositions();
     renderSpriteJobs();
     if (state.selectedSpriteJob) renderSpriteJob(state.selectedSpriteJob);
-  } else {
-    disposeSpriteCompositionPreview();
   }
   if (nextPageId === "gemini-page") {
     renderGeminiSources();
@@ -1953,62 +1950,6 @@ function spriteOutputUrl(relative) {
   return relative ? `/sprite-outputs/${relative}` : "";
 }
 
-function disposeSpriteCompositionPreview() {
-  state.spriteCompositionViewer?.dispose?.();
-  state.spriteCompositionViewer = null;
-}
-
-function spriteCompositionViewerConfig(relationship) {
-  const character = state.assets.find((asset) => asset.id === relationship?.character_asset_id);
-  if (!character) return null;
-  const animation = state.animations.find((item) => item.id === relationship?.animation_id);
-  const animationAsset = animation ? state.assets.find((asset) => asset.id === animation.asset_id) : null;
-  const components = componentsFromRelationship(relationship);
-  const cameraPresetId = $("#sprite-camera-preset")?.value || "isometric";
-  const cameraPreset = cameraPresetConfig(cameraPresetId);
-  const profile = state.renderProfiles.find((item) => item.id === $("#sprite-render-profile")?.value);
-  return {
-    name: relationshipLabel(relationship),
-    modelKey: `sprite-composition:${relationship.id}`,
-    sourceFormat: String(character.format || "glb").toLowerCase(),
-    modelUrl: `/assets/${encodeURIComponent(character.id)}/model`,
-    animationModelKey: animationAsset?.id || "",
-    animationModelUrl: animationAsset ? `/assets/${encodeURIComponent(animationAsset.id)}/model` : "",
-    animationFormat: String(animationAsset?.format || "glb").toLowerCase(),
-    animationName: animation?.action_name || animation?.clip_name || "",
-    startPaused: true,
-    transformMode: "translate",
-    shadows: false,
-    camera: {
-      type: "ORTHO",
-      elevation: cameraPreset.elevation,
-      azimuth: cameraPreset.azimuth,
-      orthoScale: cameraPreset.ortho_scale || profile?.ortho_scale,
-    },
-    lighting: state.spriteLighting,
-    components: components.map((component) => {
-      const asset = state.assets.find((item) => item.id === component.asset_id);
-      return {
-        ...component,
-        modelKey: component.asset_id,
-        modelUrl: `/assets/${encodeURIComponent(component.asset_id)}/model`,
-        sourceFormat: String(asset?.format || "glb").toLowerCase(),
-      };
-    }),
-  };
-}
-
-function mountSpriteCompositionPreview(job) {
-  const root = $("#sprite-composition-viewer");
-  const relationship = state.relationships.find((item) => item.id === job?.payload?.relationship_id);
-  if (!root || !relationship || !window.SpriteLabViewer) return;
-  disposeSpriteCompositionPreview();
-  state.spriteCompositionViewer = window.SpriteLabViewer.mount(
-    root,
-    spriteCompositionViewerConfig(relationship),
-  );
-}
-
 let spriteMediaTrigger = null;
 let mediaZoom = 1;
 let mediaPanX = 0;
@@ -2260,7 +2201,6 @@ function renderSpriteJob(job) {
   if (!empty || !detail) return;
   state.selectedSpriteJob = job;
   if (job.status === "done" && job.outputs) {
-    disposeSpriteCompositionPreview();
     const directionGifs = job.outputs.gifs || {};
     const isAiBase = job.outputs.render_mode === "ai_base";
     const aiPages = job.outputs.ai_base_pages || {};
@@ -2280,14 +2220,32 @@ function renderSpriteJob(job) {
       gifEntries.push({ direction: "r1", label: "r1", relative: job.outputs.gif });
     }
     const sheet = spriteOutputUrl(job.outputs.spritesheet);
+    const controlnet = job.outputs.controlnet_channels || {};
+    const controlnetEntries = [
+      {
+        key: "lineart",
+        title: "Lineart · PiDiNet",
+        relative: controlnet.lineart || `${job.id}/spritesheet_lineart.png`,
+        alt: "Spritesheet de lineart gerada pelo ControlNet_aux",
+      },
+      {
+        key: "bones",
+        title: "Bones · OpenPose",
+        relative: controlnet.bones || `${job.id}/spritesheet_bones.png`,
+        alt: "Spritesheet de bones gerada pelo ControlNet_aux",
+      },
+    ];
     const primaryImage = isAiBase && aiPages.r1 ? spriteOutputUrl(aiPages.r1) : sheet;
     const primaryTitle = isAiBase ? "Base IA · r1" : "Spritesheet";
     empty.hidden = true;
     detail.hidden = false;
     detail.innerHTML = `
       <div class="sprite-primary-previews">
-        <figure class="spritesheet-preview sprite-composition-preview-card"><div id="sprite-composition-viewer" class="sprite-viewer sprite-composition-viewer"><div class="viewer-loading">Carregando composição…</div></div></figure>
         <figure class="spritesheet-preview sprite-media-card"><button class="sprite-media-trigger" type="button" data-media-open data-media-src="${esc(primaryImage)}" data-media-title="${esc(primaryTitle)}" data-media-alt="${esc(primaryTitle)}"><img src="${esc(primaryImage)}" alt="${esc(primaryTitle)}"></button><figcaption>${esc(primaryTitle)} · clique para ampliar</figcaption></figure>
+        ${controlnetEntries.map((entry) => {
+          const source = spriteOutputUrl(entry.relative);
+          return `<figure class="spritesheet-preview sprite-media-card sprite-controlnet-card"><button class="sprite-media-trigger" type="button" data-media-open data-media-src="${esc(source)}" data-media-title="${esc(entry.title)}" data-media-alt="${esc(entry.alt)}"><img src="${esc(source)}" alt="${esc(entry.alt)}"></button><figcaption>${esc(entry.title)} · ControlNet_aux</figcaption></figure>`;
+        }).join("")}
       </div>
       ${aiPageEntries.length ? `<section class="sprite-directions sprite-ai-pages" aria-labelledby="sprite-ai-pages-title"><div class="sprite-directions-head"><h2 id="sprite-ai-pages-title">Imagens-base para IA</h2><span class="muted">${aiPageEntries.length}/5 direções</span></div><div class="sprite-ai-grid">${aiPageEntries.map((entry) => {
         const source = spriteOutputUrl(entry.relative);
@@ -2298,10 +2256,8 @@ function renderSpriteJob(job) {
         return `<figure class="sprite-gif-card"><button class="sprite-media-trigger" type="button" data-media-open data-media-src="${esc(source)}" data-media-title="GIF · direção ${entry.label}" data-media-alt="GIF da direção ${entry.label}"><span class="sprite-direction-label">${entry.label}</span><img src="${esc(source)}" alt="GIF da direção ${entry.label}"></button></figure>`;
       }).join("") || `<p class="muted">Este job não possui GIFs disponíveis.</p>`}</div></section>
       <div class="sprite-output-actions"><a class="button-link" href="/api/sprite-jobs/${encodeURIComponent(job.id)}/download" download="sprites_${esc(job.id)}.zip">Download</a>${job.outputs.asset_manifest ? `<a class="button-link" href="${esc(spriteOutputUrl(job.outputs.asset_manifest))}" target="_blank" rel="noopener">Manifesto JSON</a>` : ""}</div>`;
-    mountSpriteCompositionPreview(job);
     return;
   }
-  disposeSpriteCompositionPreview();
   empty.hidden = false;
   detail.hidden = true;
   empty.innerHTML = `<div class="empty-icon">${job.status === "error" ? "!" : "◌"}</div><h2>${job.status === "error" ? "Falha na renderização" : "Renderizando sprites…"}</h2><p>${job.status === "error" ? esc(job.error || "Erro desconhecido") : "O worker está calculando câmera, fases e células."}</p>`;
@@ -2403,9 +2359,6 @@ function initializeSprites() {
       if (id === "sprite-camera-preset") syncCameraRenderProfile();
       if (id === "sprite-asset-type") syncAssetTypeContract();
       if (["sprite-render-profile", "sprite-camera-preset"].includes(id)) syncSpriteOutputMode();
-      if ((id === "sprite-render-profile" || id === "sprite-camera-preset") && state.selectedSpriteJob?.status === "done") {
-        mountSpriteCompositionPreview(state.selectedSpriteJob);
-      }
     };
   });
   $("#render-sprites").onclick = renderSprites;
@@ -3468,7 +3421,6 @@ function setStageScale(stage, scale) {
 function viewerForStage(stage) {
   if (stage.classList.contains("viewport-column")) return state.viewer;
   if (stage.classList.contains("composition-stage")) return state.compositionViewer;
-  if (stage.classList.contains("sprite-stage")) return state.spriteCompositionViewer;
   return null;
 }
 
@@ -3634,7 +3586,6 @@ $("#btn-upload-zip").addEventListener("click", () => {
 window.addEventListener("sprite-viewer-ready", () => {
   if (state.selected) renderDetail();
   if (state.compositionPreviewRequested && !$("#composition-page")?.hidden) refreshCompositionViewer();
-  if (state.selectedSpriteJob?.status === "done") mountSpriteCompositionPreview(state.selectedSpriteJob);
 });
 window.addEventListener("sprite-lab-attachment-targets", (event) => {
   if (event.detail?.viewer !== state.compositionViewer) return;
