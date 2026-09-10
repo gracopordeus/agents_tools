@@ -56,6 +56,8 @@ class CatalogSourcesTests(unittest.TestCase):
             "Longsword_Attack.fbx": "animation",
             "Iron_Shield.fbx": "weapon",
             "Idle_Loop.fbx": "animation",
+            "Layer0.fbx": "animation",
+            "Take 001.fbx": "animation",
             "Brick_Wall.fbx": "model",
         }
         for name, expected in cases.items():

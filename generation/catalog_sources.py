@@ -289,6 +289,27 @@ def _word_hit(lowered: str, keyword: str) -> bool:
     ) is not None
 
 
+def _is_generic_animation_filename(name: str) -> bool:
+    """Recognize the generic names produced by Mixamo FBX exports.
+
+    A Mixamo download can be renamed to ``Layer0.fbx`` or ``Take 001.fbx``
+    before it reaches the inbox.  Those names carry no action verb, but they
+    are still useful seeds for the animation probe, which can inspect the
+    internal ``mixamo.com`` action namespace.
+    """
+    stem = Path(name).stem.casefold()
+    normalized = re.sub(r"[^a-z0-9]+", "_", stem).strip("_")
+    return normalized in {
+        "action",
+        "animation",
+        "layer0",
+        "layer_0",
+        "take",
+        "take_01",
+        "take_001",
+    } or normalized.startswith("layer_")
+
+
 def _category(source: dict[str, Any], name: str, extension: str) -> str:
     by_extension = source.get("category_by_extension", {})
     if isinstance(by_extension, dict) and extension in by_extension:
@@ -317,6 +338,8 @@ def _category(source: dict[str, Any], name: str, extension: str) -> str:
         # NOTE: "guard" deliberately excluded: it matches architectural
         # pieces like "Trim_Wall_Guard" more often than block animations
         # ("blocking" already covers the Great Sword guards via block+ing).
+        if _is_generic_animation_filename(name):
+            return "animation"
         if any(
             _word_hit(lowered, token)
             for token in (

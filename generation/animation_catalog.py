@@ -224,6 +224,18 @@ def _animation_candidate(asset: dict[str, Any], all_fbx: bool) -> bool:
     )
 
 
+def _mixamo_probe_signals(record: dict[str, Any]) -> list[str]:
+    """Return structural signals that identify a Mixamo FBX export."""
+    signals: set[str] = set()
+    action_name = str(record.get("action_name", "")).casefold()
+    if "mixamo.com" in action_name:
+        signals.add("action_namespace:mixamo.com")
+    bones = record.get("animated_bones", [])
+    if any("mixamorig" in str(bone).casefold() for bone in bones):
+        signals.add("bone_namespace:mixamorig")
+    return sorted(signals)
+
+
 def _asset_source_path(asset: dict[str, Any], catalog_root: Path, cache_root: Path) -> Path:
     """Resolve a direct asset or safely materialize one ZIP member by hash."""
     relative = str(asset.get("relative_path", ""))
@@ -482,6 +494,22 @@ def index_animation_catalog(
         if asset_ids and str(asset.get("id")) not in asset_ids:
             continue
         candidates.append(asset)
+    # A Mixamo pack usually contains animation-only FBXs plus one render mesh
+    # (for example ``Exo Gray.fbx``). Once a pack has at least one animation
+    # seed, inspect every FBX from that same source so the internal action
+    # namespace can identify the pack and the mesh is retained as part of its
+    # probe metadata. This also covers renamed files such as ``Layer0.fbx``.
+    seed_source_ids = {str(asset.get("source_id")) for asset in candidates}
+    if seed_source_ids and not all_fbx:
+        candidates_by_id = {str(asset.get("id")): asset for asset in candidates}
+        for asset in catalog.get("assets", []):
+            if (
+                isinstance(asset, dict)
+                and str(asset.get("source_id")) in seed_source_ids
+                and str(asset.get("format", "")).casefold() == "fbx"
+            ):
+                candidates_by_id[str(asset.get("id"))] = asset
+        candidates = list(candidates_by_id.values())
     candidates.sort(key=lambda item: str(item.get("id", "")).casefold())
 
     existing = _existing_by_asset(output_path)
@@ -604,6 +632,12 @@ def index_animation_catalog(
         if asset_id in probe_results:
             raw = probe_results[asset_id]
             for action in raw.get("actions", []):
+                # A Mixamo character export may carry a two-frame Layer0
+                # bind/reference pose alongside the render mesh. It is useful
+                # for the character asset probe, but must not appear as a
+                # playable animation in the frontend.
+                if _is_render_mesh_bind_action(raw, action):
+                    continue
                 record = _make_animation_record(asset, raw, action)
                 animations_by_id[record["id"]] = record
         else:
@@ -626,6 +660,28 @@ def index_animation_catalog(
             animation["id"] for animation in animations if animation.get("asset_id") == item.get("asset_id")
         ]
 
+    source_profiles: dict[str, dict[str, Any]] = {}
+    for animation in animations:
+        signals = _mixamo_probe_signals(animation)
+        if not signals:
+            continue
+        source_id = str(animation.get("source_id") or "")
+        if not source_id:
+            continue
+        profile = source_profiles.setdefault(
+            source_id,
+            {"source_id": source_id, "detected_format": "mixamo", "signals": set()},
+        )
+        profile["signals"].update(signals)
+    normalized_source_profiles = [
+        {
+            **profile,
+            "signals": sorted(profile["signals"]),
+        }
+        for profile in source_profiles.values()
+    ]
+    normalized_source_profiles.sort(key=lambda item: item["source_id"].casefold())
+
     manifest = {
         "schema": ANIMATION_SCHEMA,
         "pipeline_version": PIPELINE_VERSION,
@@ -635,6 +691,7 @@ def index_animation_catalog(
         "catalog_root": str(catalog_root),
         "asset_count": len(asset_records),
         "animation_count": len(animations),
+        "source_profiles": normalized_source_profiles,
         "assets": sorted(asset_records.values(), key=lambda item: str(item["asset_id"])),
         "animations": animations,
     }
