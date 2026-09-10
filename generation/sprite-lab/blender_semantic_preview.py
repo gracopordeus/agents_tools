@@ -567,9 +567,13 @@ def _pose_bone_position(armature: bpy.types.Object, bone_name: str) -> Vector:
 def _palm_center_offset(armature: bpy.types.Object, bone_name: str) -> Vector:
     """Return the grip point in hand-bone local coordinates."""
     hand = armature.data.bones.get(bone_name)
-    if hand is None or _normalized_name(hand.name) not in {
+    hand_aliases = {
         "handr", "handl", "righthand", "lefthand", "handright", "handleft",
-    }:
+    }
+    hand_name = _normalized_name(hand.name) if hand else ""
+    if hand is None or not any(
+        hand_name == alias or hand_name.endswith(alias) for alias in hand_aliases
+    ):
         return Vector((0.0, 0.0, 0.0))
     inverse = hand.matrix_local.inverted()
     thumbs: list[Vector] = []
@@ -779,6 +783,20 @@ def _attach_component(
         local_position = Vector(tuple(position[:3])) + palm_offset
         local_rotation = authored_rotation
         local_scale_values = (base_scale[0], base_scale[1], base_scale[2])
+
+    # The canonical GLB conversion preserves the Mixamo armature's 0.01
+    # object scale. A component root parented to that armature/bone would
+    # inherit the scale after its fit value was already computed in world
+    # units, making a standalone prop almost invisible. Keep the authored
+    # position/rotation in socket space, but cancel the inherited armature
+    # scale for the component root. This applies to both one- and two-hand
+    # attachments (and is a no-op for the usual unit-scale FBX armature).
+    if parent_name == "character":
+        inherited_scale = armature.matrix_world.to_scale()
+        local_scale_values = tuple(
+            value / max(abs(float(inherited_scale[index])), 1e-8)
+            for index, value in enumerate(local_scale_values)
+        )
     local_scale = Matrix.Diagonal(
         (
             scale * local_scale_values[0],
