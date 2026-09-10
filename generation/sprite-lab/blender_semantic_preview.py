@@ -256,7 +256,13 @@ def find_bone(armature: bpy.types.Object, name: str) -> str:
     normalized_aliases = aliases.get(normalized_name, {normalized_name})
     for bone in armature.pose.bones:
         normalized = _normalized_name(bone.name)
-        if normalized in normalized_aliases:
+        # Mixamo exports commonly prefix the anatomical name with
+        # ``mixamorig:`` (for example ``mixamorig:RightHand``). The web
+        # viewer already resolves these as aliases; Blender export must use
+        # the same suffix matching or compositions fail only at render time.
+        if normalized in normalized_aliases or any(
+            normalized.endswith(alias) for alias in normalized_aliases
+        ):
             return bone.name
     raise RuntimeError(f"rig sem o osso/socket {name}")
 
