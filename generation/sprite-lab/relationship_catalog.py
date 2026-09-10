@@ -58,6 +58,8 @@ def asset_kind(record: dict[str, Any]) -> str:
     category = str(record.get("category", "")).casefold()
     if category == "weapon" or category.startswith("weapon"):
         return "weapon"
+    if category == "prop" or category.startswith("prop"):
+        return "prop"
     mannequin_name = " ".join(
         (str(record.get("name", "")), str(record.get("relative_path", "")))
     ).casefold()

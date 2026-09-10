@@ -55,6 +55,8 @@ class CatalogSourcesTests(unittest.TestCase):
             "Maria WProp J J Ong.fbx": "character",
             "Longsword_Attack.fbx": "animation",
             "Iron_Shield.fbx": "weapon",
+            "Prop_Barrel.fbx": "prop",
+            "decorative_prop.fbx": "prop",
             "Idle_Loop.fbx": "animation",
             "Layer0.fbx": "animation",
             "Take 001.fbx": "animation",

@@ -80,6 +80,14 @@ class RelationshipCatalogTests(unittest.TestCase):
             self.assertEqual(maria["kind"], "character")
             self.assertEqual(maria["annotation"]["kind"], "character")
 
+    def test_explicit_prop_is_available_as_component_asset(self) -> None:
+        self.assertEqual(
+            catalog.asset_kind(
+                {"category": "prop", "format": "fbx", "name": "Prop_Barrel"}
+            ),
+            "prop",
+        )
+
     def test_index_annotation_relationship_and_validation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

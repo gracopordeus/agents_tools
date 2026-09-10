@@ -761,7 +761,7 @@ function isReviewed(asset) {
 }
 
 function isRenderableAsset(asset) {
-  return ["character", "model", "weapon"].includes(String(asset.kind || "").toLowerCase())
+  return ["character", "model", "weapon", "prop"].includes(String(asset.kind || "").toLowerCase())
     && ["fbx", "glb", "gltf"].includes(String(asset.format || "").toLowerCase());
 }
 

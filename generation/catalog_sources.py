@@ -402,8 +402,29 @@ def _category(source: dict[str, Any], name: str, extension: str) -> str:
             )
         ):
             return "animation"
-        if any(token in lowered for token in ("sword", "shield", "weapon", "axe", "bow")):
+        stem_lowered = Path(name).stem.casefold()
+        weapon_name = any(
+            _word_hit(stem_lowered, token)
+            for token in (
+                "sword",
+                "shield",
+                "weapon",
+                "axe",
+                "bow",
+                "dagger",
+                "hammer",
+                "mace",
+                "spear",
+                "staff",
+            )
+        )
+        if weapon_name:
             return "weapon"
+        if any(
+            _word_hit(stem_lowered, token)
+            for token in ("prop", "item", "static_prop", "static_item")
+        ):
+            return "prop"
         # An FBX is a container format, not evidence that the file contains
         # animation.  The deep animation probe can later promote an asset when
         # an explicit ``--all-fbx`` scan is requested.
@@ -437,6 +458,8 @@ def _kind(category: str, name: str = "") -> str:
         return "character"
     if category.startswith("weapon"):
         return "weapon"
+    if category.startswith("prop"):
+        return "prop"
     if category.startswith("composite"):
         return "composite"
     if category.startswith("reference"):
