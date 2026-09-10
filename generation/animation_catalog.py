@@ -108,6 +108,15 @@ def classify_action(name: str, fallback_name: str | None = None) -> dict[str, An
         ("dodge", ("dodge", "roll", "evade", "dash"), 0.92),
         ("block", ("block", "guard", "parry", "shield"), 0.90),
         ("equip", ("draw", "sheath", "unsheathe", "equip"), 0.86),
+        # UAL ships a few utility actions outside its locomotion/combat
+        # naming convention. Keep these semantic instead of exposing them as
+        # an unusable catch-all ``unknown`` in the web UI.
+        ("aim", ("aim", "target"), 0.86),
+        ("reload", ("reload", "reloading"), 0.86),
+        ("swim", ("swim", "swimming"), 0.86),
+        ("sit", ("sit", "sitting"), 0.86),
+        ("dance", ("dance", "dancing"), 0.80),
+        ("drive", ("drive", "driving"), 0.80),
         ("cast", ("cast", "spell", "magic", "charge", "summon", "power"), 0.86),
         ("crouch", ("crouch",), 0.86),
         ("turn", ("turn",), 0.84),
@@ -137,7 +146,7 @@ def classify_action(name: str, fallback_name: str | None = None) -> dict[str, An
         ("run", ("run", "jog", "sprint"), 0.94),
         ("walk", ("walk", "locomotion", "move", "slide"), 0.84),
         ("idle", ("idle", "stand", "breath", "rest"), 0.88),
-        ("interact", ("consume", "chest", "farm", "harvest", "plant", "water", "yes"), 0.70),
+        ("interact", ("consume", "chest", "farm", "harvest", "plant", "water", "pickup", "pick_up", "fix", "push", "interact", "taunt"), 0.70),
         # Some UAL actions are named only after the weapon (for example
         # ``Sword_Regular_A_Rec``). Keep that compatibility fallback after
         # explicit movement/action verbs, otherwise ``great sword idle``
