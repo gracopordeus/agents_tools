@@ -109,10 +109,18 @@ function legHeight(rest, roles) {
   return p('thigh_l').distanceTo(p('calf_l')) + p('calf_l').distanceTo(p('foot_l'));
 }
 
-function segmentLength(rest, roles, parentRole, childRole) {
-  const parent = roles.get(parentRole), child = roles.get(childRole);
-  if (!parent || !child) return 0;
-  return position(rest.get(parent)).distanceTo(position(rest.get(child)));
+function worldDeltaCorrection(sourceLocalRest, targetLocalRest, sourceWorldRest, targetWorldRest) {
+  // This is the same correction used by Three.js retargeting references:
+  // qTarget = L * qSource * R. It preserves the source bone's animated world
+  // delta while landing the bone on the target's own bind pose. In contrast
+  // with a body-wide alignment, it cannot disconnect a shoulder when the
+  // source and target have different local bone axes or parent transforms.
+  const left = targetLocalRest.clone()
+    .multiply(targetWorldRest.clone().invert())
+    .multiply(sourceWorldRest)
+    .multiply(sourceLocalRest.clone().invert());
+  const right = sourceWorldRest.clone().invert().multiply(targetWorldRest);
+  return { left, right };
 }
 
 export function createRuntimeRetarget(sourceRoot, targetRoot, options = {}) {
@@ -153,7 +161,17 @@ export function createRuntimeRetarget(sourceRoot, targetRoot, options = {}) {
   const targetInverse = targetRoot.matrixWorld.clone().invert();
   const sourceToTarget = targetInverse.clone().multiply(sourceRoot.matrixWorld);
   const sourceCommonRest = new Map(sb.map(b => [b, sourceToTarget.clone().multiply(sr.get(b))]));
+  const sourceRestLocal = new Map(sb.map(b => [b, b.quaternion.clone().normalize()]));
   const targetRestLocal = new Map(tb.map(b => [b, b.quaternion.clone().normalize()]));
+  const correction = new Map([...mapping.keys()].map(t => {
+    const s = mapping.get(t);
+    return [t, worldDeltaCorrection(
+      sourceRestLocal.get(s),
+      targetRestLocal.get(t),
+      rotation(sourceCommonRest.get(s)),
+      rotation(tr.get(t)),
+    )];
+  }));
   const depth = b => { let n=0; while(b.parent) {n++; b=b.parent;} return n; };
   const order = [...mapping.keys()].sort((a,b) => depth(a)-depth(b));
   const fullOrder = [...tb].sort((a,b) => depth(a)-depth(b));
@@ -161,40 +179,20 @@ export function createRuntimeRetarget(sourceRoot, targetRoot, options = {}) {
   const targetRestScale = new Map(tb.map(b => [b, b.scale.clone()]));
   const targetPelvis = targetRoles.get('pelvis');
   const sourcePelvis = sourceRoles.get('pelvis');
-  const heightScale = legHeight(tr,targetRoles)/Math.max(legHeight(sourceCommonRest,sourceRoles),1e-8);
-  const structuralMotionScale = new Map();
-  for (const side of ['l', 'r']) {
-    const role = `clavicle_${side}`;
-    const targetBone = targetRoles.get(role);
-    const sourceLength = segmentLength(sourceCommonRest, sourceRoles, role, `upperarm_${side}`);
-    const targetLength = segmentLength(tr, targetRoles, role, `upperarm_${side}`);
-    if (targetBone && sourceLength > 1e-8 && targetLength > 1e-8) {
-      // A long stylized clavicle sweeps its child through a much larger arc
-      // than Mixamo for the same angular keyframe. Scale only this structural
-      // joint by the bone-length ratio; the upper arm is solved in world space
-      // below and therefore keeps the intended sword/hand trajectory.
-      structuralMotionScale.set(
-        targetBone,
-        THREE.MathUtils.clamp(sourceLength * heightScale / targetLength, 0.2, 1),
-      );
-    }
-  }
-  return { sourceRoot,targetRoot,mapping,order,fullOrder,tr,
-    sourceCommonRest,targetRestLocal,targetRestPosition,targetRestScale,
-    sourceToTarget,structuralMotionScale,
+  return { sourceRoot,targetRoot,mapping,order,fullOrder,sr,tr,correction,
+    sourceRestLocal,sourceCommonRest,targetRestLocal,targetRestPosition,targetRestScale,
     sourcePelvis:sourceRoles.get('pelvis'), targetPelvis:targetRoles.get('pelvis'),
     sourceRestPelvisPosition:position(sourceCommonRest.get(sourcePelvis)),
-    heightScale,
-    up:new THREE.Vector3(0,1,0),
+    heightScale:legHeight(tr,targetRoles)/Math.max(legHeight(sourceCommonRest,sourceRoles),1e-8),
+    up:new THREE.Vector3(0,0,1),
     first:null, inPlace:options.inPlace !== false };
 }
 
 export function applyRuntimeRetarget(state) {
-  const {sourceRoot,targetRoot,mapping,order,fullOrder,tr} = state;
+  const {sourceRoot,targetRoot,mapping,fullOrder,tr,correction} = state;
   sourceRoot.updateMatrixWorld(true);
   targetRoot.updateMatrixWorld(true);
   const targetInverse = targetRoot.matrixWorld.clone().invert();
-  const sourceInverse = sourceRoot.matrixWorld.clone().invert();
   const sourcePelvisPosition = position(targetInverse.clone().multiply(state.sourcePelvis.matrixWorld));
   if (!state.first) state.first = sourcePelvisPosition.clone();
   const displacement = sourcePelvisPosition.clone()
@@ -209,31 +207,21 @@ export function applyRuntimeRetarget(state) {
   if(state.inPlace) {
     displacement.copy(state.up).multiplyScalar(displacement.dot(state.up));
   }
-  for(const t of order) {
-    const s = mapping.get(t);
-    const sourcePose = state.sourceToTarget.clone()
-      .multiply(sourceInverse)
-      .multiply(s.matrixWorld);
-    const sourceDelta = rotation(sourcePose)
-      .multiply(rotation(state.sourceCommonRest.get(s)).invert())
-      .normalize();
-    const structuralScale = state.structuralMotionScale.get(t);
-    if (structuralScale !== undefined) {
-      sourceDelta.copy(new THREE.Quaternion().slerpQuaternions(
-        new THREE.Quaternion(), sourceDelta, structuralScale,
-      ));
+  for(const t of fullOrder) {
+    if (!mapping.has(t)) {
+      continue;
     }
-    const desiredWorld = sourceDelta.multiply(rotation(tr.get(t))).normalize();
-    const parentWorld = t.parent
-      ? rotation(targetInverse.clone().multiply(t.parent.matrixWorld))
-      : new THREE.Quaternion();
-    t.quaternion.copy(parentWorld.invert().multiply(desiredWorld).normalize());
+    const s = mapping.get(t);
+    const calibrated = correction.get(t);
+    const desired = calibrated.left.clone()
+      .multiply(s.quaternion)
+      .multiply(calibrated.right)
+      .normalize();
+    t.quaternion.copy(desired);
     if(t === state.targetPelvis) {
       const p = position(tr.get(t)).add(displacement).applyMatrix4(targetRoot.matrixWorld);
       t.position.copy(t.parent ? t.parent.worldToLocal(p) : p);
     }
-    t.updateMatrix();
-    t.updateWorldMatrix(false, false);
   }
   targetRoot.updateMatrixWorld(true);
 }
