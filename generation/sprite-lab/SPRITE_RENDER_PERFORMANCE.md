@@ -1,11 +1,35 @@
 # Sprite render performance
 
-The normal sprite pipeline exports beauty, Freestyle lineart and projected
-bones. These are the channels consumed by the web UI and AI source catalog.
-It performs two render calls per cell instead of five. Set
-`auxiliary_channels: true` in the sprite render payload to additionally export
-segmentation, wireframe mesh, depth and pose heatmap. Direct Blender requests
-accept the same option. Consumers of those optional channels must request them.
+The beauty worker now assigns neutral materials once for the entire sequence,
+preserving their colors and avoiding per-cell material invalidation. Cycle
+detection also reuses the initial deformed mesh signature across candidates.
+Render metadata records preparation time, total time and elapsed time per cell.
+
+Blender logs are streamed to disk while the process runs. GPU attempts that
+produce no log progress for 60 seconds are stopped and enter the existing
+software fallback/circuit breaker. `SPRITE_LAB_GPU_STALL_SECONDS` overrides
+this interval for unusually expensive scenes. The total job timeout remains
+in force for both backends. This is a log-activity watchdog, not a GPU profiler.
+
+A two-cell software smoke render completed after the material change; its
+first frame was pixel-identical to the existing render. Its timing overlapped
+an active render and is not a valid throughput comparison. No sample count,
+resolution, lighting or animation sampling quality was reduced.
+
+The normal sprite pipeline renders only the beauty cell in Blender. After the
+Blender worker exits, a local ControlNet annotator worker derives
+`hed_softedge` for lineart and body-only `openpose` for bones, preserving the
+same row/column grid. The annotators are loaded once per job and do not run SD
+generation. The two channels can be processed concurrently with bounded CUDA
+streams; production defaults to eight cell workers on the validated GPU. A
+32-worker configuration exhausts VRAM during concurrent activations and is not
+supported. `SPRITE_LAB_PYTHON` selects the Python environment;
+`SPRITE_LAB_POSTPROCESS_DEVICE` selects `auto`, `cpu` or `cuda`.
+
+The old Blender Freestyle lineart and projected-bones implementations remain
+available only as legacy helper code and are no longer called by the normal
+sprite worker. The current sprite output records the annotator provenance in
+`controlnet_channels.json` and `render_metadata.json`.
 
 Non-looping clips explicitly identified by catalog metadata skip geometric
 cycle detection. Clips with unknown or looping metadata retain cycle detection.

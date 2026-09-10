@@ -711,6 +711,10 @@ def _attach_component(
 
     component_id = str(component.get("id") or "component")
     root = bpy.data.objects.new(f"sprite_component_{component_id}", None)
+    root["conditioning_component_role"] = (
+        str(component.get("role") or "prop").strip().casefold()
+    )
+    root["conditioning_component_id"] = component_id
     bpy.context.scene.collection.objects.link(root)
     parent_name = str(component.get("parent") or "character")
     attach_to = component.get("attach_to")

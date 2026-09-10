@@ -18,11 +18,53 @@ import render_profile  # noqa: E402
 
 
 class SpriteRenderTests(unittest.TestCase):
+    def test_gpu_stall_is_stopped_before_job_timeout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            process = mock.MagicMock()
+            process.__enter__.return_value = process
+            process.poll.side_effect = [None, -9]
+            process.returncode = -9
+            with (
+                mock.patch.object(sprite_render.subprocess, "Popen", return_value=process),
+                mock.patch.object(sprite_render.time, "monotonic", side_effect=[0, 61]),
+                mock.patch.dict(os.environ, {"SPRITE_LAB_GPU_STALL_SECONDS": "60"}),
+            ):
+                completed = sprite_render._run_blender_worker(
+                    ["blender"], root, root / "result.json", "gpu", 3600,
+                )
+            process.kill.assert_called_once()
+            self.assertIn("sem progresso", completed.stderr)
+
+    def test_worker_timeout_returns_failure_and_keeps_live_log(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            completed = sprite_render._run_blender_worker(
+                [sys.executable, "-u", "-c",
+                 "import time; print('STAGE render'); time.sleep(30)"],
+                root, root / "result.json", "gpu", 0.1,
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("tempo máximo", completed.stderr)
+            self.assertIn("STAGE render", (root / "worker.gpu.log").read_text())
+
+    def test_worker_success_requires_result_and_preserves_log(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result = root / "result.json"
+            completed = sprite_render._run_blender_worker(
+                [sys.executable, "-c",
+                 "import pathlib,sys; pathlib.Path(sys.argv[1]).write_text('{}'); print('done')",
+                 str(result)], root, result, "gpu", 10,
+            )
+            self.assertEqual(completed.returncode, 0)
+            self.assertIn("done", completed.stdout)
+
     def test_gpu_circuit_breaker_retries_after_backoff(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             health_path = Path(directory) / "gpu-health.json"
             health_path.write_text(
-                json.dumps({"failed_at": 1_000.0}), encoding="utf-8"
+                json.dumps({"failed_at": 1_000.0, "boot_id": sprite_render._boot_id()}), encoding="utf-8"
             )
             with mock.patch.object(sprite_render, "GPU_HEALTH_PATH", health_path):
                 self.assertFalse(sprite_render._gpu_retry_allowed(1_001.0))

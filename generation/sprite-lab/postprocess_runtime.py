@@ -32,13 +32,18 @@ def add_runtime_arguments(parser):
 
 
 def resolve_device(requested="auto"):
-    import torch
     if requested not in ("auto", "cpu", "cuda"):
         raise ValueError(f"Invalid device: {requested}")
+    # An explicit CPU request must not initialize or probe the CUDA driver.
+    # This is important for recovery after a failed GPU worker and makes the
+    # local annotator fallback deterministic.
+    if requested == "cpu":
+        return "cpu"
+    import torch
     available = torch.cuda.is_available()
     if requested == "cuda" and not available:
         raise RuntimeError("CUDA solicitada, mas indisponível neste Python; verifique SPRITE_LAB_PYTHON")
-    return "cuda" if requested != "cpu" and available else "cpu"
+    return "cuda" if available else "cpu"
 
 
 def resolve_dtype(device, precision):
