@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sprite-lab.local/schemas/layered_artifact_hashes_v1.json",
+  "title": "Sprite Lab layered artifact hash registry",
+  "type": "object",
+  "required": [
+    "schema",
+    "artifacts",
+    "config",
+    "config_fingerprint",
+    "manifest",
+    "hashes",
+    "complete",
+    "fingerprint"
+  ],
+  "properties": {
+    "schema": { "const": "sprite_lab.layered_artifact_hashes/v1" },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/record" }
+    },
+    "config": {
+      "type": "object",
+      "required": ["category", "fingerprint"],
+      "properties": {
+        "category": { "const": "config" },
+        "fingerprint": { "$ref": "#/$defs/sha256" },
+        "scope": { "$ref": "#/$defs/scope" },
+        "path": { "$ref": "#/$defs/relativePath" },
+        "bytes": { "type": "integer", "minimum": 0 },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      },
+      "additionalProperties": false
+    },
+    "config_fingerprint": { "$ref": "#/$defs/sha256" },
+    "manifest": { "$ref": "#/$defs/record" },
+    "hashes": {
+      "type": "object",
+      "propertyNames": { "type": "string", "minLength": 3 },
+      "additionalProperties": { "$ref": "#/$defs/sha256" }
+    },
+    "complete": { "type": "boolean" },
+    "fingerprint": { "$ref": "#/$defs/sha256" }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "scope": {
+      "type": "string",
+      "pattern": "^[^./\\\\]+$"
+    },
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!\\\\)(?![A-Za-z]:)(?!.*\\\\)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
+    },
+    "record": {
+      "type": "object",
+      "required": ["category", "scope", "path", "bytes", "sha256"],
+      "properties": {
+        "category": { "type": "string", "minLength": 1 },
+        "scope": { "$ref": "#/$defs/scope" },
+        "path": { "$ref": "#/$defs/relativePath" },
+        "bytes": { "type": "integer", "minimum": 0 },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

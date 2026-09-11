@@ -38,7 +38,28 @@ from blender_semantic_preview import (  # noqa: E402
     rest_pose_forward,
     update_two_hand_components,
 )
-from blender_conditioning_export import _material, _component_role  # noqa: E402
+from blender_conditioning_export import (  # noqa: E402
+    NEUTRAL_COMPONENT_COLOR,
+    ROLES,
+    ROLE_COLORS,
+    _component_role,
+    _material,
+    _render_with_overrides,
+)
+from blender_layer_visibility import (  # noqa: E402
+    character_pass_metadata,
+    character_only_visibility,
+    component_id,
+    weapon_only_visibility,
+    weapon_pass_metadata,
+    weapon_objects,
+)
+from weapon_front_mask import (  # noqa: E402
+    extract_weapon_front_mask,
+    front_mask_metadata,
+    front_mask_palette,
+    front_mask_palette_key,
+)
 
 
 # Keep the public row contract independent from the camera target ordering.
@@ -755,9 +776,9 @@ def main() -> int:
     # per cell. The process exits after the render; no source asset is modified.
     if str(request.get("beauty_mode", "neutral")).casefold() != "original":
         clay = _material("__generation_neutral_clay", (128, 128, 128, 255))
-        prop = _material("__generation_neutral_prop", (230, 126, 34, 255))
+        component = _material("__generation_neutral_component", NEUTRAL_COMPONENT_COLOR)
         for obj in semantic_objects:
-            material = prop if _component_role(obj) is not None else clay
+            material = component if _component_role(obj) is not None else clay
             if obj.material_slots:
                 for slot in obj.material_slots:
                     slot.material = material
@@ -775,6 +796,48 @@ def main() -> int:
         raise RuntimeError("assigned_rows inválido")
     print(f"STAGE render preparation_seconds={preparation_seconds:.3f}", flush=True)
     cells = []
+    character_pass = request.get("character_pass") is True
+    weapon_meshes = weapon_objects(semantic_objects)
+    character_objects = [
+        obj for obj in semantic_objects if obj not in weapon_meshes
+    ]
+    if character_pass:
+        (output / "character_beauty").mkdir(parents=True, exist_ok=True)
+        (output / "character_lineart").mkdir(parents=True, exist_ok=True)
+    weapon_pass = request.get("weapon_pass") is True
+    weapon_component_id = str(request.get("weapon_component_id") or "").strip()
+    selected_weapon_meta = next(
+        (
+            item
+            for item in component_meta
+            if item.get("id") == weapon_component_id and item.get("role") == "weapon"
+        ),
+        None,
+    )
+    if weapon_pass:
+        if selected_weapon_meta is None:
+            raise RuntimeError(
+                f"weapon_component_id '{weapon_component_id}' não identifica a arma anexada"
+            )
+        (output / "weapon_beauty").mkdir(parents=True, exist_ok=True)
+        (output / "weapon_silhouette").mkdir(parents=True, exist_ok=True)
+        silhouette_material = _material(
+            "__generation_weapon_silhouette", (255, 255, 255, 255)
+        )
+    front_mask_pass = request.get("weapon_front_mask") is True
+    front_mask_dilation = request.get("weapon_front_mask_dilation", 0)
+    front_mask_reports = []
+    if front_mask_pass:
+        if selected_weapon_meta is None:
+            raise RuntimeError(
+                f"weapon_component_id '{weapon_component_id}' não identifica a arma anexada"
+            )
+        (output / "weapon_front_segmentation").mkdir(parents=True, exist_ok=True)
+        (output / "weapon_front_mask").mkdir(parents=True, exist_ok=True)
+        semantic_materials = {
+            key: _material(f"__generation_front_mask_{key}", color)
+            for key, color in front_mask_palette().items()
+        }
     dynamic_x = bool(effective_profile and effective_profile.get("dynamic_x", False))
     dynamic_y = bool(effective_profile and effective_profile.get("dynamic_y", False))
     for row, direction_yaw in enumerate(direction_yaws):
@@ -796,6 +859,79 @@ def main() -> int:
             path = output / f"row{row}_col{column}.png"
             scene.render.filepath = str(path)
             bpy.ops.render.render(write_still=True)
+            character_beauty_path = None
+            character_lineart_path = None
+            if character_pass:
+                character_beauty_path = (
+                    output / "character_beauty" / f"row{row}_col{column}.png"
+                )
+                character_lineart_path = (
+                    output / "character_lineart" / f"row{row}_col{column}.png"
+                )
+                with character_only_visibility(semantic_objects):
+                    scene.render.filepath = str(character_beauty_path)
+                    bpy.ops.render.render(write_still=True)
+                    render_mesh_lineart(
+                        scene,
+                        character_objects,
+                        character_lineart_path,
+                    )
+            weapon_beauty_path = None
+            weapon_silhouette_path = None
+            if weapon_pass:
+                weapon_beauty_path = (
+                    output / "weapon_beauty" / f"row{row}_col{column}.png"
+                )
+                weapon_silhouette_path = (
+                    output / "weapon_silhouette" / f"row{row}_col{column}.png"
+                )
+                with weapon_only_visibility(
+                    semantic_objects, weapon_component_id
+                ) as selected_weapon_objects:
+                    scene.render.filepath = str(weapon_beauty_path)
+                    bpy.ops.render.render(write_still=True)
+                    _render_with_overrides(
+                        scene,
+                        selected_weapon_objects,
+                        {role: silhouette_material for role in ROLES},
+                        weapon_silhouette_path,
+                    )
+            front_mask_path = None
+            front_segmentation_path = None
+            if front_mask_pass:
+                front_segmentation_path = (
+                    output
+                    / "weapon_front_segmentation"
+                    / f"row{row}_col{column}.png"
+                )
+                front_mask_path = (
+                    output / "weapon_front_mask" / f"row{row}_col{column}.png"
+                )
+                _render_with_overrides(
+                    scene,
+                    semantic_objects,
+                    semantic_materials,
+                    front_segmentation_path,
+                    material_resolver=lambda obj: semantic_materials[
+                        front_mask_palette_key(
+                            component_id(obj), weapon_component_id
+                        )
+                    ],
+                )
+                front_mask_report = extract_weapon_front_mask(
+                    front_segmentation_path,
+                    front_mask_path,
+                    dilation=front_mask_dilation,
+                )
+                front_mask_report.update(
+                    {
+                        "row": row,
+                        "direction": row_names[row],
+                        "column": column,
+                        "frame": frame,
+                    }
+                )
+                front_mask_reports.append(front_mask_report)
             cell = {
                 "row": row,
                 "direction": row_names[row],
@@ -804,6 +940,17 @@ def main() -> int:
                 "path": str(path),
                 "elapsed_seconds": round(time.monotonic() - cell_started, 3),
             }
+            if character_pass:
+                cell["character_beauty_path"] = str(character_beauty_path)
+                cell["character_lineart_path"] = str(character_lineart_path)
+            if weapon_pass:
+                cell["weapon_beauty_path"] = str(weapon_beauty_path)
+                cell["weapon_silhouette_path"] = str(weapon_silhouette_path)
+            if front_mask_pass:
+                cell["weapon_front_segmentation_path"] = str(
+                    front_segmentation_path
+                )
+                cell["weapon_front_mask_path"] = str(front_mask_path)
             if dynamic_fit is not None:
                 offsets_world = dynamic_fit["offset_world"]
                 offsets_pixels = dynamic_fit["offset_pixels"]
@@ -917,6 +1064,18 @@ def main() -> int:
         "bounds": {"min": list(minimum), "max": list(maximum)},
         "cells": cells,
     }
+    if character_pass:
+        metadata["character_pass"] = character_pass_metadata(
+            metadata, effective_profile
+        )
+    if weapon_pass:
+        metadata["weapon_pass"] = weapon_pass_metadata(
+            metadata, selected_weapon_meta
+        )
+    if front_mask_pass:
+        metadata["weapon_front_mask"] = front_mask_metadata(
+            metadata, front_mask_reports, front_mask_dilation
+        )
     metadata_path = output / "render_metadata.json"
     metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     result_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")

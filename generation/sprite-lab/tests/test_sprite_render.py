@@ -18,6 +18,41 @@ import render_profile  # noqa: E402
 
 
 class SpriteRenderTests(unittest.TestCase):
+    def test_character_pass_request_is_explicitly_opt_in(self) -> None:
+        self.assertFalse(sprite_render.character_pass_requested({}))
+        self.assertFalse(
+            sprite_render.character_pass_requested(
+                {"generation_mode": "character_weapon_holdout"}
+            )
+        )
+        self.assertTrue(sprite_render.character_pass_requested({"character_pass": True}))
+
+    def test_weapon_pass_request_is_explicitly_opt_in(self) -> None:
+        self.assertFalse(sprite_render.weapon_pass_requested({}))
+        self.assertFalse(
+            sprite_render.weapon_pass_requested(
+                {"generation_mode": "character_weapon_holdout"}
+            )
+        )
+        self.assertTrue(sprite_render.weapon_pass_requested({"weapon_pass": True}))
+
+    def test_weapon_front_mask_request_is_explicitly_opt_in(self) -> None:
+        self.assertFalse(sprite_render.weapon_front_mask_requested({}))
+        self.assertTrue(
+            sprite_render.weapon_front_mask_requested({"weapon_front_mask": True})
+        )
+
+    def test_layered_outputs_is_explicitly_opt_in(self) -> None:
+        self.assertFalse(sprite_render.layered_outputs_requested({}))
+        self.assertFalse(
+            sprite_render.layered_outputs_requested(
+                {"generation_mode": "character_weapon_holdout"}
+            )
+        )
+        self.assertTrue(
+            sprite_render.layered_outputs_requested({"layered_outputs": True})
+        )
+
     def test_gpu_stall_is_stopped_before_job_timeout(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

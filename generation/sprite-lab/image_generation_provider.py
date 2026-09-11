@@ -17,6 +17,7 @@ from typing import Any, Protocol
 
 
 DEFAULT_MODELS = {
+    "chatgpt-local": "gpt-6-astra",
     "google": "gemini-3.1-flash-image",
     "openai": "gpt-image-2",
     "qwen": "qwen-image-3.0-pro",
@@ -30,6 +31,7 @@ GEMINI_TOP_K = 64
 SUPPORTED_OUTPUT_SIZES = ((1024, 1024), (2048, 2048))
 
 _PROVIDER_ALIASES = {
+    "chatgpt-local": "chatgpt-local",
     "dry": "dry-run",
     "dry-run": "dry-run",
     "none": "dry-run",
@@ -55,6 +57,10 @@ class GenerationRequest:
     output_path: Path
     model: str
     metadata: dict[str, Any] = field(default_factory=dict)
+    generation_role: str | None = None
+    base_image: Path | None = None
+    reference_images: tuple[Path, ...] = ()
+    mask_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -112,6 +118,12 @@ def _write_request(
         "output_path": str(request.output_path),
         "metadata": request.metadata,
     }
+    if request.generation_role is not None:
+        payload["generation_role"] = request.generation_role
+    if request.base_image is not None:
+        payload["base_image"] = str(request.base_image)
+        payload["references"] = [str(path) for path in request.reference_images]
+    mask_path = mask_path or request.mask_path
     if mask_path is not None:
         payload["mask"] = {
             "path": str(mask_path),
@@ -179,7 +191,12 @@ def _prepare_openai_base_image(reference_path: Path, output_path: Path) -> Path:
 
 
 class DryRunProvider:
-    """Write request files without calling a remote service."""
+    """Write request files and a deterministic transparent fixture.
+
+    Materialising the fixture keeps dry-run useful for the layered pipeline:
+    both passes can exercise validation, persistence and resume without a
+    remote API call or provider credentials.
+    """
 
     name = "dry-run"
 
@@ -188,12 +205,21 @@ class DryRunProvider:
             if not image.is_file():
                 raise FileNotFoundError(image)
         _write_request(request, self.name)
+        if request.metadata.get("materialize_output", False):
+            output_size = _requested_output_size(request)
+            from PIL import Image
+
+            request.output_path.parent.mkdir(parents=True, exist_ok=True)
+            Image.new("RGBA", output_size, (0, 0, 0, 0)).save(request.output_path, format="PNG")
         return GenerationResult(
             status="dry-run",
             provider=self.name,
             model=request.model,
-            output_path=None,
-            response_metadata={"request": str(request.output_path.with_suffix(".request.json"))},
+            output_path=request.output_path,
+            response_metadata={
+                "request": str(request.output_path.with_suffix(".request.json")),
+                "fixture": "transparent_rgba" if request.metadata.get("materialize_output", False) else None,
+            },
         )
 
 
@@ -218,34 +244,46 @@ class OpenAIImageProvider:
             raise RuntimeError("instale o pacote openai para usar o provider openai") from exc
         if not request.input_images:
             raise ValueError("o provider openai exige ao menos uma imagem de referência")
+        requested_inputs = (
+            (request.base_image, *request.reference_images)
+            if request.base_image is not None
+            else request.input_images
+        )
         base_image_path = _prepare_openai_base_image(
-            request.input_images[0],
+            requested_inputs[0],
             request.output_path.with_name("openai_base_image.png"),
         )
-        input_images = (base_image_path, *request.input_images[1:])
+        input_images = (base_image_path, *requested_inputs[1:])
         _write_request(
             request,
             self.name,
             input_images=input_images,
+            mask_path=request.mask_path,
         )
         client = OpenAI(api_key=self.api_key)
         output_width, output_height = _requested_output_size(request)
         handles = [path.open("rb") for path in input_images]
+        mask_handle = request.mask_path.open("rb") if request.mask_path else None
         try:
             image_argument: Any = handles[0] if len(handles) == 1 else handles
+            arguments = {
+                "model": request.model,
+                "image": image_argument,
+                "prompt": request.prompt,
+                "background": "transparent",
+                "output_format": "png",
+                "size": f"{output_width}x{output_height}",
+            }
+            if mask_handle is not None:
+                arguments["mask"] = mask_handle
             response = client.images.edit(
-                model=request.model,
-                image=image_argument,
-                prompt=request.prompt,
-                # Preserve the successful first-run behavior: empty areas must
-                # remain transparent for direct use as a game sprite asset.
-                background="transparent",
-                output_format="png",
-                size=f"{output_width}x{output_height}",
+                **arguments,
             )
         finally:
             for handle in handles:
                 handle.close()
+            if mask_handle is not None:
+                mask_handle.close()
         item = response.data[0]
         encoded = getattr(item, "b64_json", None)
         if not encoded:
@@ -548,6 +586,9 @@ def default_model(provider: str) -> str:
 def create_provider(name: str) -> ImageGenerationProvider:
     """Create a provider without importing optional SDKs prematurely."""
     normalized = normalize_provider(name)
+    if normalized == "chatgpt-local":
+        from chatgpt_bridge import ChatGPTBridgeProvider
+        return ChatGPTBridgeProvider()
     if normalized == "dry-run":
         return DryRunProvider()
     if normalized == "openai":

@@ -28,9 +28,12 @@ const state = {
   qwenConfig: { configured: false, source: null, updated_at: null },
   huggingfaceConfig: { configured: false, source: null, updated_at: null },
   postprocessJobs: [],
+  layeredBundles: [],
+  selectedLayeredBundle: null,
   selectedGeminiJob: null,
   selectedPostprocessJob: null,
   geminiReferences: [],
+  weaponReferences: [],
   geminiPrompt: null,
   aiRenderSpecDefaults: null,
   aiRenderSpec: null,
@@ -41,23 +44,28 @@ const state = {
 };
 
 const IMAGE_PROVIDER_DEFAULT_MODELS = Object.freeze({
+  "chatgpt-local": "gpt-6-astra",
   google: "gemini-3.1-flash-image",
   openai: "gpt-image-2",
   qwen: "qwen-image-3.0-pro",
 });
 const IMAGE_PROVIDER_DEFAULT_BACKGROUNDS = Object.freeze({
+  "chatgpt-local": "#00FF00",
   google: "#00FF00",
   openai: "transparent",
   qwen: "transparent",
 });
 const AI_RENDER_REFERENCE_CHANNELS = Object.freeze(["beauty", "bones", "lineart", "frame_control"]);
 const IDENTITY_GUIDE_MODES = Object.freeze(["lineart_standard", "canny_edges"]);
+const AI_RENDER_GENERATION_MODES = Object.freeze(["single_sheet", "character_weapon_holdout"]);
 const DEFAULT_GEMINI_TEMPERATURE = 1;
 const DEFAULT_GEMINI_TOP_K = 64;
+const DEFAULT_HOLDOUT_DILATION = 0;
+const DEFAULT_HOLDOUT_TOLERANCE = 4;
 
 function selectedImageProvider() {
   const provider = $("#gemini-provider")?.value;
-  return ["google", "openai", "qwen"].includes(provider) ? provider : "google";
+  return ["google", "openai", "qwen", "chatgpt-local"].includes(provider) ? provider : "google";
 }
 
 function selectedImageBackground(provider = selectedImageProvider()) {
@@ -65,6 +73,7 @@ function selectedImageBackground(provider = selectedImageProvider()) {
 }
 
 function imageProviderLabel(provider) {
+  if (provider === "chatgpt-local") return "ChatGPT local · POC";
   if (provider === "qwen") return "Qwen Image";
   if (provider === "openai") return "OpenAI";
   return "Gemini";
@@ -95,6 +104,82 @@ function selectedIdentityReferenceName() {
 function selectedIdentityGuideMode() {
   const mode = $("#gemini-identity-lineart-mode")?.value;
   return IDENTITY_GUIDE_MODES.includes(mode) ? mode : "canny_edges";
+}
+
+function selectedAiGenerationMode() {
+  const mode = $("#gemini-generation-mode")?.value;
+  return AI_RENDER_GENERATION_MODES.includes(mode) ? mode : "single_sheet";
+}
+
+function selectedHoldoutDilation() {
+  const value = Number($("#gemini-holdout-dilation")?.value ?? DEFAULT_HOLDOUT_DILATION);
+  return Number.isInteger(value) && value >= 0 && value <= 32 ? value : DEFAULT_HOLDOUT_DILATION;
+}
+
+function selectedHoldoutTolerance() {
+  const value = Number($("#gemini-holdout-tolerance")?.value ?? DEFAULT_HOLDOUT_TOLERANCE);
+  return Number.isInteger(value) && value >= 0 && value <= 32 ? value : DEFAULT_HOLDOUT_TOLERANCE;
+}
+
+function selectedWeaponComponentId() {
+  return $("#gemini-weapon-component")?.value.trim() || "";
+}
+
+function selectedGeminiSource() {
+  return state.geminiSources.find((source) => source.id === $("#gemini-source")?.value);
+}
+
+function weaponComponentsForSource(source = selectedGeminiSource()) {
+  const components = source?.inherited?.component_specs;
+  if (!Array.isArray(components)) return [];
+  return components.filter((component) => (
+    component && component.visible !== false && String(component.role || "").trim().toLocaleLowerCase() === "weapon"
+    && String(component.id || "").trim()
+  ));
+}
+
+function renderWeaponComponents() {
+  const select = $("#gemini-weapon-component");
+  const help = $("#gemini-weapon-component-help");
+  if (!select) return;
+  const selected = selectedWeaponComponentId();
+  const components = weaponComponentsForSource();
+  select.innerHTML = components.length
+    ? `<option value="">Selecione uma arma visível</option>${components.map((component) => {
+      const label = component.name || component.asset_id || component.id;
+      const attachment = component.attach_to || component.hand;
+      return `<option value="${esc(component.id)}">${esc(label)}${attachment ? ` · ${esc(attachment)}` : ""}</option>`;
+    }).join("")}`
+    : `<option value="">Nenhuma arma visível detectada</option>`;
+  if (components.some((component) => component.id === selected)) {
+    select.value = selected;
+  } else if (components.length === 1) {
+    select.value = components[0].id;
+  }
+  select.disabled = components.length === 0;
+  if (help) {
+    help.textContent = components.length === 1
+      ? `Arma detectada: ${components[0].name || components[0].asset_id || components[0].id}.`
+      : components.length > 1
+        ? "Mais de uma arma visível foi detectada; a POC aceita somente uma."
+        : "Nenhuma arma visível foi detectada neste render estrutural.";
+  }
+}
+
+function updateHoldoutControls() {
+  const holdout = selectedAiGenerationMode() === "character_weapon_holdout";
+  const controls = $("#gemini-holdout-controls");
+  const weaponReference = $("#gemini-weapon-reference-card");
+  const modeHelp = $("#gemini-generation-mode-help");
+  if (controls) controls.hidden = !holdout;
+  if (weaponReference) weaponReference.hidden = !holdout;
+  if (modeHelp) {
+    modeHelp.textContent = holdout
+      ? "Executa personagem e arma em passes separados e compõe o holdout na saída final."
+      : "Gera uma única spritesheet, preservando o fluxo atual.";
+  }
+  renderWeaponComponents();
+  updateAiRenderSummary();
 }
 
 function identityGuideLabel(mode) {
@@ -161,16 +246,30 @@ function updateAiRenderSummary() {
   const summary = $("#ai-render-summary");
   if (!summary) return;
   const issues = [];
+  const holdout = selectedAiGenerationMode() === "character_weapon_holdout";
   if (!$("#gemini-render-name")?.value.trim()) issues.push("nome do render");
   if (!$("#gemini-source")?.value) issues.push("render estrutural");
   if (!$("#gemini-reference")?.files?.length && !$("#gemini-reference-cache")?.value) issues.push("referência de identidade");
   const channels = selectedReferenceChannels();
   if (!channels.length) issues.push("referência estrutural");
   if (selectedImageProvider() === "qwen" && channels.length > 1) issues.push("limite de 1 referência estrutural do Qwen");
+  if (holdout) {
+    if (!weaponComponentsForSource().length) issues.push("arma visível no render estrutural");
+    if (!selectedWeaponComponentId()) issues.push("componente weapon");
+    if (!$("#weapon-reference")?.files?.length && !$("#weapon-reference-cache")?.value) {
+      issues.push("referência visual da arma");
+    }
+  }
   summary.classList.toggle("error", issues.length > 0);
-  summary.textContent = issues.length
-    ? `${issues.length} ${issues.length === 1 ? "item precisa" : "itens precisam"} de atenção: ${issues.join(", ")}.`
-    : `${channels.length + 2} referências · 64 células · ${aiRenderOutputLabel({ output: { width: selectedAiRenderOutputSize() } })} · ${imageProviderLabel(selectedImageProvider())}`;
+  if (issues.length) {
+    summary.textContent = `${issues.length} ${issues.length === 1 ? "item precisa" : "itens precisam"} de atenção: ${issues.join(", ")}.`;
+  } else if (holdout) {
+    const weapon = weaponComponentsForSource()[0];
+    const weaponLabel = weapon?.name || weapon?.asset_id || weapon?.id || "weapon";
+    summary.textContent = `2 gerações · weapon: ${weaponLabel} · ${channels.length + 2} referências · 64 células · ${aiRenderOutputLabel({ output: { width: selectedAiRenderOutputSize() } })} · ${imageProviderLabel(selectedImageProvider())}`;
+  } else {
+    summary.textContent = `${channels.length + 2} referências · 64 células · ${aiRenderOutputLabel({ output: { width: selectedAiRenderOutputSize() } })} · ${imageProviderLabel(selectedImageProvider())}`;
+  }
   updateAiRenderOutputSizeStatus();
 }
 
@@ -183,6 +282,8 @@ function updateImageProviderControls() {
   const topKField = $("#gemini-top-k-field");
   const background = $("#gemini-background");
   const backgroundHelp = $("#gemini-background-help");
+  if (model) model.disabled = provider === "chatgpt-local";
+  if (model && provider === "chatgpt-local") model.value = "gpt-6-astra";
   if (seedField) seedField.hidden = provider !== "qwen";
   if (temperatureField) temperatureField.hidden = provider !== "google";
   if (topKField) topKField.hidden = provider !== "google";
@@ -268,6 +369,9 @@ function aiRenderSpecFormValues(spec) {
   set("gemini-global-description", asset.global_description || "");
   set("gemini-style-preset", style.preset || "");
   set("gemini-style-description", style.description || "");
+  set("gemini-generation-mode", AI_RENDER_GENERATION_MODES.includes(spec.generation_mode)
+    ? spec.generation_mode
+    : "single_sheet");
   set("gemini-output-size", Number(output.width) === 1024 && Number(output.height) === 1024 ? 1024 : 2048);
   set("gemini-background", selectedImageBackground());
   set("gemini-camera-projection", camera.projection || "orthographic");
@@ -347,6 +451,21 @@ function readAiRenderSpecFromForm() {
     return Number.isFinite(parsed) ? parsed : fallback;
   };
   spec.version = "2.0";
+  spec.generation_mode = selectedAiGenerationMode();
+  if (spec.generation_mode === "character_weapon_holdout") {
+    spec.layer_contract = {
+      weapon_component_id: selectedWeaponComponentId(),
+      generation_order: ["character", "weapon"],
+      composition_order: ["weapon", "character_holdout"],
+      layers: [
+        { id: "weapon", z: 0 },
+        { id: "character_holdout", z: 1 },
+      ],
+      preview: null,
+    };
+  } else {
+    delete spec.layer_contract;
+  }
   const outputSize = selectedAiRenderOutputSize();
   spec.output.width = outputSize;
   spec.output.height = outputSize;
@@ -588,6 +707,7 @@ const PAGE_ROUTES = Object.freeze({
   "env-atlas-page": "/env-atlas",
   "gemini-page": "/gemini",
   "postprocess-page": "/postprocess",
+  "results-page": "/results",
 });
 
 async function api(path, options = {}) {
@@ -1097,9 +1217,9 @@ function initializeSettings() {
 
 async function load() {
   try {
-    const [catalog, animations, relationships, spriteJobs, geminiSources, aiRenderSpecDefaults, geminiReferences, geminiJobs, geminiConfig, openaiConfig, qwenConfig, huggingfaceConfig, postprocessJobs, geminiPrompt] = await Promise.all([
+    const [catalog, animations, relationships, spriteJobs, geminiSources, aiRenderSpecDefaults, geminiReferences, weaponReferences, geminiJobs, geminiConfig, openaiConfig, qwenConfig, huggingfaceConfig, postprocessJobs, geminiPrompt] = await Promise.all([
       api("/api/catalog"), api("/api/animations"), api("/api/relationships"), api("/api/sprite-jobs"),
-      api("/api/gemini/sources"), api("/api/ai-render-spec/defaults"), api("/api/gemini/references"), api("/api/gemini-jobs"), api("/api/config/gemini"), api("/api/config/openai"), api("/api/config/qwen"), api("/api/config/huggingface"), api("/api/postprocess-jobs"), api("/api/config/gemini-prompt"),
+      api("/api/gemini/sources"), api("/api/ai-render-spec/defaults"), api("/api/gemini/references"), api("/api/weapon/references"), api("/api/gemini-jobs"), api("/api/config/gemini"), api("/api/config/openai"), api("/api/config/qwen"), api("/api/config/huggingface"), api("/api/postprocess-jobs"), api("/api/config/gemini-prompt"),
     ]);
     // A listagem principal não pode desaparecer se um servidor antigo ainda
     // não tiver o endpoint opcional de perfis de enquadramento.
@@ -1121,6 +1241,12 @@ async function load() {
     } catch (error) {
       console.warn("Contrato de assets indisponível:", error);
     }
+    let layeredBundles = { bundles: [] };
+    try {
+      layeredBundles = await api("/api/layered-bundles");
+    } catch (error) {
+      console.warn("Resultados layered indisponíveis:", error);
+    }
     state.assets = catalog.assets || [];
     state.animations = animations.animations || [];
     state.relationships = relationships.relationships || [];
@@ -1128,6 +1254,7 @@ async function load() {
     state.geminiSources = geminiSources.sources || [];
     state.aiRenderSpecDefaults = aiRenderSpecDefaults || null;
     state.geminiReferences = geminiReferences.references || [];
+    state.weaponReferences = weaponReferences.references || [];
     state.geminiPrompt = geminiPrompt.prompt || null;
     state.geminiJobs = geminiJobs.jobs || [];
     state.geminiConfig = geminiConfig.config || state.geminiConfig;
@@ -1135,6 +1262,7 @@ async function load() {
     state.qwenConfig = qwenConfig.config || state.qwenConfig;
     state.huggingfaceConfig = huggingfaceConfig.config || state.huggingfaceConfig;
     state.postprocessJobs = postprocessJobs.jobs || [];
+    state.layeredBundles = layeredBundles.bundles || [];
     state.renderProfiles = renderProfiles.render_profiles || [];
     state.cameraPresets = cameraPresets.camera_presets || [];
     state.assetContract = assetContract;
@@ -1146,6 +1274,7 @@ async function load() {
     initializeEnvAtlas();
     initializeGemini();
     initializePostprocess();
+    initializeResults();
     initializeSettings();
   } catch (error) { toast(error.message, true); }
 }
@@ -1267,6 +1396,11 @@ function switchPage(pageId, { updateHistory = true } = {}) {
     populatePostprocessGeminiJobs();
     renderPostprocessJobs();
     if (state.selectedPostprocessJob) renderPostprocessJob(state.selectedPostprocessJob);
+  }
+  if (nextPageId === "results-page") {
+    renderLayeredBundles();
+    if (state.selectedLayeredBundle) renderLayeredBundle(state.selectedLayeredBundle);
+    loadLayeredBundles();
   }
   emitLabEvent("page_view", { page: nextPageId });
 }
@@ -2038,7 +2172,7 @@ function initializeSpriteMediaPopup() {
   popup.addEventListener("click", (event) => {
     if (event.target.closest("[data-media-close]")) closeSpriteMedia();
   });
-  [detail, $("#gemini-page"), $("#postprocess-detail")].filter(Boolean).forEach((root) => root.addEventListener("click", (event) => {
+  [detail, $("#gemini-page"), $("#postprocess-detail"), $("#results-page")].filter(Boolean).forEach((root) => root.addEventListener("click", (event) => {
     const trigger = event.target.closest("[data-media-open]");
     if (!trigger) return;
     openSpriteMedia(trigger.dataset.mediaSrc, trigger.dataset.mediaTitle, trigger.dataset.mediaAlt);
@@ -2176,6 +2310,42 @@ function patchJobCardStatus(listSelector, attribute, datasetKey, job, label) {
   if (!status) return false;
   status.className = `job-status ${String(job.status || "unknown")}`;
   status.textContent = label;
+  return true;
+}
+
+function geminiJobCardProgressSummary(job) {
+  if (!isLayeredGeminiJob(job)) return "";
+  const progressStage = job.progress?.stage ? pipelineStageLabel(job.progress.stage) : "";
+  const layerSummary = normalizedLayerProgress(job)
+    .map((layer) => `${layer.label}: ${Math.round(layer.percent)}%`)
+    .join(" · ");
+  return progressStage && layerSummary
+    ? `${progressStage} · ${layerSummary}`
+    : progressStage || layerSummary;
+}
+
+function patchGeminiJobCard(job) {
+  const list = $("#gemini-job-list");
+  if (!list) return false;
+  const card = [...list.querySelectorAll("[data-gemini-job-id]")].find(
+    (item) => item.dataset.geminiJobId === String(job.id),
+  );
+  if (!card) return false;
+  const status = card.querySelector(".job-status");
+  if (!status) return false;
+  status.className = `job-status ${String(job.status || "unknown")}`;
+  status.textContent = pipelineStatusLabel(job.status);
+  const expectedSummary = geminiJobCardProgressSummary(job);
+  const summary = card.querySelector(".pipeline-job-progress-summary");
+  if (expectedSummary && summary) {
+    summary.textContent = expectedSummary;
+  } else if (expectedSummary && !summary) {
+    // A pre-progress card can legitimately omit the node; let the canonical
+    // renderer add it while preserving active selection and click handlers.
+    return false;
+  } else if (!expectedSummary && summary) {
+    summary.remove();
+  }
   return true;
 }
 
@@ -2371,18 +2541,42 @@ function initializeSprites() {
 const PIPELINE_STATUS_LABELS = Object.freeze({
   queued: "na fila",
   running: "processando",
+  generating_character: "gerando personagem",
+  validating_character: "validando personagem",
+  character_complete: "personagem aprovado",
+  character_failed: "falha na personagem",
+  generating_weapon: "gerando arma",
+  validating_weapon: "validando arma",
+  weapon_complete: "arma aprovada",
+  weapon_failed: "falha na arma",
+  weapon_blocked: "arma bloqueada",
+  building_holdout: "compondo holdout",
+  completed: "concluído",
   done: "concluído",
+  failed: "falhou",
   error: "falhou",
 });
 const PIPELINE_STAGE_LABELS = Object.freeze({
+  queued: "Na fila",
   preparing_inputs: "Preparando entradas",
+  preprocessing_identity_lineart: "Preparando guia da identidade",
   generating_image: "Gerando imagem no Gemini",
   validating_output: "Validando output",
+  generating_character: "Gerando personagem",
+  validating_character: "Validando personagem",
+  character_complete: "Personagem aprovado",
+  character_failed: "Falha na personagem",
+  generating_weapon: "Gerando arma",
+  validating_weapon: "Validando arma",
+  weapon_complete: "Arma aprovada",
+  weapon_failed: "Falha na arma",
+  weapon_blocked: "Arma bloqueada",
+  building_holdout: "Compondo holdout",
   crop_and_alignment: "Crop e alinhamento",
   mask_generation: "Gerando máscara binária",
-  upscaling_realesrgan: "Upscaling Real-ESRGAN · CPU",
-  mask_pass_realesrgan: "Passe de máscara · Real-ESRGAN + BiRefNet · CPU",
-  quality_pass_realesrgan: "Passe de qualidade · Real-ESRGAN · CPU",
+  upscaling_realesrgan: "Upscaling Real-ESRGAN · GPU/CPU",
+  mask_pass_realesrgan: "Passe de máscara · Real-ESRGAN + BiRefNet · GPU/CPU",
+  quality_pass_realesrgan: "Passe de qualidade · Real-ESRGAN · GPU/CPU",
   building_color_variants: "Gerando variantes de cor",
   completed: "Concluído",
 });
@@ -2397,6 +2591,52 @@ function pipelineStatusLabel(status) {
   return PIPELINE_STATUS_LABELS[status] || status || "desconhecido";
 }
 
+function pipelineStageLabel(stage) {
+  const normalized = String(stage || "").trim();
+  if (PIPELINE_STAGE_LABELS[normalized]) return PIPELINE_STAGE_LABELS[normalized];
+  if (normalized.startsWith("layered_")) {
+    const compositionStage = normalized.slice("layered_".length);
+    return `Holdout · ${PIPELINE_STAGE_LABELS[compositionStage] || compositionStage}`;
+  }
+  return normalized || "Processando";
+}
+
+function isLayeredGeminiJob(job) {
+  return job?.payload?.render_spec?.generation_mode === "character_weapon_holdout"
+    || job?.payload?.publish_layered_bundle === true
+    || Boolean(job?.outputs?.character || job?.outputs?.weapon || job?.outputs?.layered_bundle);
+}
+
+function normalizedLayerProgress(job) {
+  if (!isLayeredGeminiJob(job)) return [];
+  const progress = job?.progress || {};
+  const saved = progress.layers && typeof progress.layers === "object" ? progress.layers : {};
+  const stage = String(progress.stage || "");
+  const overall = Math.max(0, Math.min(100, Number(progress.percent || 0)));
+  const fallback = {
+    character: stage.includes("character") || stage === "character_complete" ? Math.min(100, Math.round(overall * 2)) : (overall >= 50 ? 100 : 0),
+    weapon: stage.includes("weapon") || stage === "weapon_complete" ? Math.min(100, Math.max(0, Math.round((overall - 50) * 2))) : (overall >= 100 ? 100 : 0),
+    composition: stage.startsWith("layered_") || stage === "completed" ? Math.max(0, overall - 50) * 2 : 0,
+  };
+  return [
+    ["character", "Personagem"],
+    ["weapon", "Arma"],
+    ["composition", "Composição holdout"],
+  ].map(([id, label]) => {
+    const layer = saved[id] && typeof saved[id] === "object" ? saved[id] : {};
+    const percent = Math.max(0, Math.min(100, Number(layer.percent ?? fallback[id] ?? 0)));
+    const layerStage = String(layer.stage || (id === "composition" ? "queued" : id));
+    const status = String(layer.status || (percent >= 100 ? "done" : percent > 0 ? "running" : "queued"));
+    return { id, label, percent, stage: layerStage, status };
+  });
+}
+
+function pipelineLayerProgressMarkup(job) {
+  const layers = normalizedLayerProgress(job);
+  if (!layers.length) return "";
+  return `<div class="pipeline-layer-progress" data-layer-progress="true">${layers.map((layer) => `<div class="pipeline-layer-row" data-layer-id="${esc(layer.id)}"><div class="pipeline-progress-head"><strong>${esc(layer.label)}</strong><span>${Math.round(layer.percent)}%</span></div><div class="pipeline-progress-track"><i style="width:${layer.percent}%"></i></div><div class="pipeline-layer-meta"><span>${esc(pipelineStatusLabel(layer.status))}</span><span>${esc(pipelineStageLabel(layer.stage))}</span></div></div>`).join("")}</div>`;
+}
+
 function formatDuration(seconds) {
   if (!Number.isFinite(seconds) || seconds < 0) return "—";
   const rounded = Math.round(seconds);
@@ -2408,13 +2648,14 @@ function formatDuration(seconds) {
 function pipelineProgressMarkup(job) {
   const progress = job.progress || {};
   const percent = Math.max(0, Math.min(100, Number(progress.percent || 0)));
-  const stage = PIPELINE_STAGE_LABELS[progress.stage] || progress.stage || "Processando";
+  const stage = pipelineStageLabel(progress.stage);
   const started = job.started_at ? Date.parse(job.started_at) : NaN;
   const elapsed = Number.isFinite(started) ? Math.max(0, (Date.now() - started) / 1000) : NaN;
   return `<div class="pipeline-progress" data-progress-started="${Number.isFinite(started) ? started : ""}" data-progress-eta="${Number(progress.eta_seconds ?? "")}">
     <div class="pipeline-progress-head"><strong>${esc(stage)}</strong><span>${Math.round(percent)}%</span></div>
     <div class="pipeline-progress-track"><i style="width:${percent}%"></i></div>
     <div class="pipeline-progress-meta"><span>Decorrido: <b data-progress-elapsed>${formatDuration(elapsed)}</b></span><span>Restante: <b data-progress-eta-label>${formatDuration(Number(progress.eta_seconds))}</b></span></div>
+    ${pipelineLayerProgressMarkup(job)}
   </div>`;
 }
 
@@ -2452,6 +2693,14 @@ function renderGeminiReferences() {
   }
 }
 
+function renderWeaponReferences() {
+  const select = $("#weapon-reference-cache");
+  if (!select) return;
+  const selected = select.value;
+  select.innerHTML = `<option value="">Nenhuma referência salva</option>${state.weaponReferences.map((reference) => `<option value="${esc(reference.id)}">${esc(reference.name)} · ${esc((reference.size || []).join("×"))}</option>`).join("")}`;
+  if (state.weaponReferences.some((reference) => reference.id === selected)) select.value = selected;
+}
+
 function postprocessOutputUrl(relative) {
   return pipelineOutputUrl("/postprocess-outputs", relative);
 }
@@ -2477,6 +2726,7 @@ function renderGeminiSources() {
     select.value = state.geminiSources[0].id;
   }
   renderGeminiSourcePreview();
+  renderWeaponComponents();
 }
 
 function renderGeminiSourcePreview() {
@@ -2511,14 +2761,42 @@ function renderGeminiJobs() {
     const source = state.geminiSources.find((item) => item.id === job.payload?.source_id);
     const name = job.payload?.render_name || job.payload?.reference_name || job.id;
     const provider = imageProviderLabel(job.payload?.provider);
-    return `<div class="pipeline-job-card ${state.selectedGeminiJob?.id === job.id ? "selected" : ""}" data-gemini-job-id="${esc(job.id)}">
+    const layered = isLayeredGeminiJob(job);
+    const progressSummary = geminiJobCardProgressSummary(job);
+    return `<div class="pipeline-job-card ${layered ? "layered" : ""} ${state.selectedGeminiJob?.id === job.id ? "selected" : ""}" data-gemini-job-id="${esc(job.id)}">
       <div class="pipeline-job-head"><b>${esc(name)} · ${esc(provider)}</b><span class="job-status ${esc(job.status)}">${esc(pipelineStatusLabel(job.status))}</span></div>
-      <div class="pipeline-job-sub">${esc(source?.label || job.payload?.source_id || "Fonte estrutural")} · ${esc(aiRenderOutputLabel(job))} · ${esc(job.id)}</div>
+      <div class="pipeline-job-sub">${esc(source?.label || job.payload?.source_id || "Fonte estrutural")} · ${esc(layered ? "2 passes + holdout" : aiRenderOutputLabel(job))} · ${esc(job.id)}</div>
+      ${layered && progressSummary ? `<div class="pipeline-job-progress-summary">${esc(progressSummary)}</div>` : ""}
     </div>`;
   }).join("") || `<p class="muted">Nenhum render iniciado.</p>`;
   list.querySelectorAll("[data-gemini-job-id]").forEach((card) => {
     card.addEventListener("click", () => selectGeminiJob(card.dataset.geminiJobId));
   });
+}
+
+function layeredResultMarkup(job) {
+  if (!isLayeredGeminiJob(job)) return "";
+  const outputs = job.outputs || {};
+  const layered = job.report?.layered || {};
+  const publication = layered.publication || outputs.layered_bundle || {};
+  const manifest = publication.manifest || {};
+  const stages = [
+    ["character", "Personagem", outputs.character || "character_full.png"],
+    ["weapon", "Arma", outputs.weapon || "weapon_full.png"],
+    ["composition", "Composição holdout", manifest.preview || "layered_sprite_bundle.json"],
+  ];
+  return `<section class="layered-result" data-layered-result="true"><div class="pipeline-output-head"><div><h3>Resultado das etapas</h3><p>Character → weapon → holdout, com cada checkpoint preservado.</p></div><span class="job-status done">${esc(pipelineStatusLabel("done"))}</span></div><div class="layered-result-grid">${stages.map(([id, label, artifact]) => `<div class="layered-result-card" data-result-layer="${esc(id)}"><strong>${esc(label)}</strong><span class="job-status done">${esc(pipelineStatusLabel("done"))}</span><small>${esc(String(artifact))}</small></div>`).join("")}</div></section>`;
+}
+
+function failedGeminiLayer(job) {
+  const layers = normalizedLayerProgress(job);
+  const failed = layers.find((layer) => layer.status === "error");
+  if (failed) return failed.label;
+  const stage = String(job?.progress?.stage || "");
+  if (stage.includes("character")) return "Personagem";
+  if (stage.includes("weapon")) return "Arma";
+  if (stage.startsWith("layered_")) return "Composição holdout";
+  return "AI Render";
 }
 
 function renderGeminiJob(job) {
@@ -2533,6 +2811,10 @@ function renderGeminiJob(job) {
   if (job.status === "done" && job.outputs?.image) {
     const image = geminiOutputUrl(job.outputs.image);
     const validationImage = job.outputs?.validation ? geminiOutputUrl(job.outputs.validation) : "";
+    const providerOriginal = job.outputs?.provider_original ? geminiOutputUrl(job.outputs.provider_original) : "";
+    const providerResized = job.outputs?.provider_resized ? geminiOutputUrl(job.outputs.provider_resized) : "";
+    const providerUpscaled = job.outputs?.provider_upscaled ? geminiOutputUrl(job.outputs.provider_upscaled) : "";
+    const bridgeReceipt = job.outputs?.bridge_receipt ? geminiOutputUrl(job.outputs.bridge_receipt) : "";
     const identityLineart = job.outputs?.identity_lineart ? geminiOutputUrl(job.outputs.identity_lineart) : "";
     const previewImage = validationImage || image;
     const source = state.geminiSources.find((item) => item.id === job.payload?.source_id);
@@ -2540,8 +2822,9 @@ function renderGeminiJob(job) {
     detail.hidden = false;
     detail.innerHTML = `
       <div class="pipeline-output-head"><div><h2>${esc(renderName)}</h2><p>Output ${esc(provider)} · ${esc(source?.label || job.payload?.source_id || "Fonte estrutural")} · ${esc(outputLabel)}</p></div><span class="job-status done">${esc(pipelineStatusLabel(job.status))}</span></div>
-      <figure class="pipeline-main-preview"><div class="ai-render-grid-preview"><button class="sprite-media-trigger pipeline-zoom-trigger" type="button" data-media-open data-media-src="${esc(previewImage)}" data-media-title="Output ${esc(provider)} · ${esc(outputLabel)}" data-media-alt="Spritesheet gerado pelo ${esc(provider)} com grade de validação"><img src="${esc(previewImage)}" alt="Spritesheet gerado pelo ${esc(provider)} com grade de validação"></button></div><figcaption>${validationImage ? "Grade e alertas persistidos apenas para inspeção do AI Render. O PNG original permanece intacto para o restante da pipeline." : "Output original; a validação visual ainda não está disponível para este job."}</figcaption></figure>
-      <div class="pipeline-output-actions"><a class="button-link" href="${esc(image)}" download="${esc(job.id)}_${esc(job.payload?.provider || "openai")}_original_${outputSize}.png">Baixar original ${esc(outputLabel)}</a>${validationImage ? `<a class="button-link" href="${esc(validationImage)}" download="${esc(job.id)}_${esc(job.payload?.provider || "openai")}_validation_${outputSize}.png">Baixar validação</a>` : ""}${identityLineart ? `<a class="button-link" href="${esc(identityLineart)}" download="${esc(job.id)}_identity_${esc(job.payload?.identity_lineart_mode || "lineart_standard")}.png">Baixar guia da identidade</a>` : ""}<button type="button" class="button-link" data-duplicate-ai-render>Duplicar configuração</button><button type="button" class="primary" data-open-postprocess="${esc(job.id)}">Abrir pós-processamento</button></div>
+      <figure class="pipeline-main-preview"><div class="ai-render-grid-preview"><button class="sprite-media-trigger pipeline-zoom-trigger" type="button" data-media-open data-media-src="${esc(previewImage)}" data-media-title="Output ${esc(provider)} · ${esc(outputLabel)}" data-media-alt="Spritesheet gerado pelo ${esc(provider)} com grade de validação"><img src="${esc(previewImage)}" alt="Spritesheet gerado pelo ${esc(provider)} com grade de validação"></button></div><figcaption>${validationImage ? "Grade e alertas persistidos apenas para inspeção do AI Render." : "Output original; a validação visual ainda não está disponível para este job."}${providerOriginal ? " O arquivo recebido pela ponte também está preservado." : ""}</figcaption></figure>
+      <div class="pipeline-output-actions"><a class="button-link" href="${esc(image)}" download="${esc(job.id)}_${esc(job.payload?.provider || "openai")}_output_${outputSize}.png">Baixar output ${esc(outputLabel)}</a>${providerOriginal ? `<a class="button-link" href="${esc(providerOriginal)}" download="${esc(job.id)}_provider_original.png">Baixar original recebido</a>` : ""}${providerResized ? `<a class="button-link" href="${esc(providerResized)}" download="${esc(job.id)}_provider_1024.png">Baixar resize 1024</a>` : ""}${providerUpscaled ? `<a class="button-link" href="${esc(providerUpscaled)}" download="${esc(job.id)}_provider_swinir_2048.png">Baixar SwinIR 2048</a>` : ""}${bridgeReceipt ? `<a class="button-link" href="${esc(bridgeReceipt)}" download="${esc(job.id)}_bridge.json">Baixar recibo da ponte</a>` : ""}${validationImage ? `<a class="button-link" href="${esc(validationImage)}" download="${esc(job.id)}_${esc(job.payload?.provider || "openai")}_validation_${outputSize}.png">Baixar validação</a>` : ""}${identityLineart ? `<a class="button-link" href="${esc(identityLineart)}" download="${esc(job.id)}_identity_${esc(job.payload?.identity_lineart_mode || "lineart_standard")}.png">Baixar guia da identidade</a>` : ""}<button type="button" class="button-link" data-duplicate-ai-render>Duplicar configuração</button><button type="button" class="primary" data-open-postprocess="${esc(job.id)}">Abrir pós-processamento</button></div>
+      ${layeredResultMarkup(job)}
       <div class="pipeline-metadata"><span>Nome: ${esc(job.payload?.render_name || job.payload?.reference_name || job.id)}</span><span>64 frames</span><span>8 direções × 8 fases</span><span>Referência: ${esc(job.payload?.reference_name || "não informada")}</span><span>Guia da identidade: ${esc(identityGuideLabel(job.payload?.identity_lineart_mode))} · ${job.payload?.identity_lineart?.cache_hit ? "cache" : "GPU local"}</span><span>Validated: ${job.validated ? "true" : "false"}</span></div>`;
     detail.querySelector("[data-duplicate-ai-render]")?.addEventListener("click", () => duplicateAiRenderJob(job));
     detail.querySelector("[data-open-postprocess]")?.addEventListener("click", () => {
@@ -2559,8 +2842,189 @@ function renderGeminiJob(job) {
   empty.hidden = false;
   detail.hidden = true;
   const failed = job.status === "error";
-  empty.innerHTML = `<div class="empty-icon">${failed ? "!" : "◌"}</div><h2>${failed ? `Falha no ${esc(provider)} Render` : "Gerando spritesheet…"}</h2><p>${failed ? esc(imageProviderErrorMessage(job.error, job.payload?.provider)) : `Status: ${esc(pipelineStatusLabel(job.status))}. O output será validado como PNG ${esc(outputLabel)}.`}</p>${failed ? "" : pipelineProgressMarkup(job)}<button type="button" class="button-link" data-duplicate-ai-render>Duplicar configuração</button>`;
+  const retry = failed ? `<button type="button" class="primary" data-retry-ai-render>Repetir ${isLayeredGeminiJob(job) ? "pass layered" : "geração"}</button>` : "";
+  const failureLayer = failed ? `<span class="pipeline-failure-layer">Etapa: ${esc(failedGeminiLayer(job))}</span>` : "";
+  const progressMarkup = failed && !isLayeredGeminiJob(job) ? "" : pipelineProgressMarkup(job);
+  empty.innerHTML = `<div class="empty-icon">${failed ? "!" : "◌"}</div><h2>${failed ? `Falha no ${esc(provider)} Render` : "Gerando spritesheet…"}</h2><p>${failed ? esc(imageProviderErrorMessage(job.error, job.payload?.provider)) : `Status: ${esc(pipelineStatusLabel(job.status))}. O output será validado como PNG ${esc(outputLabel)}.`}</p>${failureLayer}${progressMarkup}${retry}<button type="button" class="button-link" data-duplicate-ai-render>Duplicar configuração</button>`;
+  empty.querySelector("[data-retry-ai-render]")?.addEventListener("click", () => retryGeminiJob(job));
   empty.querySelector("[data-duplicate-ai-render]")?.addEventListener("click", () => duplicateAiRenderJob(job));
+}
+
+const PUBLISHED_LAYERED_ARTIFACT_KEYS = Object.freeze([
+  "character_holdout", "weapon", "holdout_source", "preview", "manifest", "hashes",
+]);
+
+function layeredBundleArtifacts(bundle) {
+  if (Array.isArray(bundle?.artifacts)) return bundle.artifacts;
+  const outputs = bundle?.outputs || {};
+  const labels = {
+    character_holdout: "Personagem · holdout",
+    weapon: "Arma",
+    holdout_source: "Máscara holdout",
+    preview: "Composição final",
+    manifest: "Manifesto do bundle",
+    hashes: "Registro de hashes",
+  };
+  const kinds = { character_holdout: "image", weapon: "image", holdout_source: "image", preview: "image", manifest: "json", hashes: "json" };
+  const filenames = {
+    character_holdout: "character_holdout_spritesheet.png",
+    weapon: "weapon_spritesheet.png",
+    holdout_source: "holdout_cut_mask.png",
+    preview: "composite_preview.png",
+    manifest: "layered_sprite_bundle.json",
+    hashes: "layered_artifact_hashes.json",
+  };
+  return PUBLISHED_LAYERED_ARTIFACT_KEYS.map((key) => ({
+    key,
+    label: labels[key],
+    kind: kinds[key],
+    filename: filenames[key],
+    url: outputs[key] || "",
+  }));
+}
+
+function isPublishedLayeredBundle(bundle) {
+  const layers = bundle?.manifest?.layers;
+  if (!Array.isArray(layers) || layers.length < 2) return false;
+  const ids = new Set(layers.map((layer) => String(layer?.id || "").trim()));
+  return ids.has("weapon") && ids.has("character_holdout");
+}
+
+function decodePublishedLayeredUrl(value) {
+  let decoded = String(value || "").trim();
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    let next;
+    try {
+      next = decodeURIComponent(decoded);
+    } catch (_error) {
+      return "";
+    }
+    if (next === decoded) break;
+    decoded = next;
+  }
+  // Published filenames are canonical ASCII names. Reject any remaining
+  // escape sequence so deeply nested encodings cannot reach an <img> or the
+  // media modal after the bounded decode pass.
+  return /%[0-9a-f]{2}/i.test(decoded) ? "" : decoded;
+}
+
+function safePublishedLayeredUrl(bundle, artifact) {
+  const jobId = String(bundle?.job_id || "").trim();
+  const key = String(artifact?.key || "").trim();
+  const url = String(artifact?.url || "").trim();
+  if (!jobId || !PUBLISHED_LAYERED_ARTIFACT_KEYS.includes(key) || !url) return "";
+  const normalized = decodePublishedLayeredUrl(url);
+  if (!normalized) return "";
+  let canonicalJobId;
+  try {
+    canonicalJobId = decodeURIComponent(encodeURIComponent(jobId));
+  } catch (_error) {
+    return "";
+  }
+  if (!canonicalJobId || canonicalJobId.includes("/") || canonicalJobId.includes("\\")) return "";
+  const prefix = `/layered-outputs/${canonicalJobId}/`;
+  const filename = normalized.startsWith(prefix) ? normalized.slice(prefix.length) : "";
+  if (!filename || filename.includes("/") || filename.includes("\\") || filename.includes("..") || filename.includes("?") || filename.includes("#")) return "";
+  return url;
+}
+
+function layeredDownloadUrl(bundle, artifact) {
+  const jobId = String(bundle?.job_id || "").trim();
+  const key = String(artifact?.key || "").trim();
+  if (!jobId || !PUBLISHED_LAYERED_ARTIFACT_KEYS.includes(key)) return "";
+  return `/api/layered-bundles/${encodeURIComponent(jobId)}/download/${encodeURIComponent(key)}`;
+}
+
+function stableLayeredDownloadName(bundle, artifact) {
+  const jobId = String(bundle?.job_id || "bundle").replace(/[^A-Za-z0-9._-]+/g, "_").replace(/^[_\.]+|[_\.]+$/g, "") || "bundle";
+  const key = String(artifact?.key || "artifact").replace(/[^A-Za-z0-9._-]+/g, "_");
+  const filename = String(artifact?.filename || "artifact.bin");
+  const extension = filename.includes(".") ? filename.split(".").pop() : "bin";
+  return `sprite_lab_${jobId}_${key}.${extension}`;
+}
+
+function renderLayeredBundles() {
+  const list = $("#results-job-list");
+  if (!list) return;
+  list.innerHTML = state.layeredBundles.slice().filter(isPublishedLayeredBundle).map((bundle) => {
+    const manifest = bundle.manifest || {};
+    const title = manifest.name || manifest.render_name || bundle.job_id;
+    const selected = state.selectedLayeredBundle?.job_id === bundle.job_id;
+    return `<div class="pipeline-job-card layered ${selected ? "selected" : ""}" data-layered-bundle-id="${esc(bundle.job_id)}"><div class="pipeline-job-head"><b>${esc(title)}</b><span class="job-status done">Publicado</span></div><div class="pipeline-job-sub">${esc(bundle.job_id)} · ${layeredBundleArtifacts(bundle).length} artefatos</div></div>`;
+  }).join("") || `<p class="muted">Nenhum bundle layered publicado.</p>`;
+  list.querySelectorAll("[data-layered-bundle-id]").forEach((card) => {
+    card.addEventListener("click", () => selectLayeredBundle(card.dataset.layeredBundleId));
+  });
+}
+
+function renderLayeredBundle(bundle) {
+  const empty = $("#results-empty");
+  const detail = $("#results-detail");
+  if (!empty || !detail || !bundle) return;
+  if (!isPublishedLayeredBundle(bundle)) {
+    state.selectedLayeredBundle = null;
+    empty.hidden = false;
+    detail.hidden = true;
+    empty.innerHTML = `<div class="empty-icon">▤</div><h2>Bundle layered indisponível</h2><p>Jobs single-sheet não possuem artefatos layered publicados.</p>`;
+    return;
+  }
+  state.selectedLayeredBundle = bundle;
+  const artifacts = layeredBundleArtifacts(bundle);
+  const jsonValues = {
+    manifest: bundle.manifest,
+    hashes: bundle.artifact_hashes,
+  };
+  const cards = artifacts.map((artifact) => {
+    const key = String(artifact.key || "");
+    const label = artifact.label || key;
+    const previewUrl = safePublishedLayeredUrl(bundle, artifact);
+    const downloadUrl = layeredDownloadUrl(bundle, artifact);
+    const filename = stableLayeredDownloadName(bundle, artifact);
+    if (artifact.kind === "image") {
+      if (!previewUrl || !downloadUrl) return "";
+      return `<figure class="published-artifact-card" data-artifact-key="${esc(key)}"><button class="sprite-media-trigger" type="button" data-media-open data-media-src="${esc(previewUrl)}" data-media-title="${esc(label)}" data-media-alt="${esc(label)}"><img src="${esc(previewUrl)}" alt="${esc(label)}"></button><figcaption><strong>${esc(label)}</strong><span>${esc(artifact.filename || key)}</span><a class="button-link" href="${esc(downloadUrl)}" download="${esc(filename)}">Baixar</a></figcaption></figure>`;
+    }
+    if (!previewUrl || !downloadUrl) return "";
+    const json = jsonValues[key];
+    return `<section class="published-json-card" data-artifact-key="${esc(key)}"><div class="published-json-head"><strong>${esc(label)}</strong><a class="button-link" href="${esc(downloadUrl)}" download="${esc(filename)}">Baixar JSON</a></div>${json ? `<details><summary>Visualizar com segurança</summary><pre>${esc(JSON.stringify(json, null, 2))}</pre></details>` : ""}</section>`;
+  }).filter(Boolean).join("");
+  empty.hidden = true;
+  detail.hidden = false;
+  detail.innerHTML = `<div class="pipeline-output-head"><div><h2>${esc(bundle.manifest?.name || bundle.job_id)}</h2><p>Bundle layered publicado · somente artefatos validados por manifesto e hashes.</p></div><span class="job-status done">Publicado</span></div><div class="published-artifact-grid">${cards || `<p class="muted">Nenhum artefato público disponível.</p>`}</div><div class="pipeline-metadata"><span>Job: ${esc(bundle.job_id)}</span><span>Fonte auditável: ${bundle.manifest?.provenance ? "sim" : "verificação pendente"}</span><span>Artefatos: ${artifacts.length}</span></div>`;
+}
+
+function selectLayeredBundle(jobId) {
+  const bundle = state.layeredBundles.find((item) => item.job_id === jobId);
+  if (!bundle) return;
+  renderLayeredBundle(bundle);
+  renderLayeredBundles();
+}
+
+async function loadLayeredBundles({ announce = false } = {}) {
+  try {
+    const response = await api("/api/layered-bundles");
+    state.layeredBundles = Array.isArray(response.bundles) ? response.bundles : [];
+    renderLayeredBundles();
+    const current = state.selectedLayeredBundle
+      ? state.layeredBundles.find((item) => item.job_id === state.selectedLayeredBundle.job_id)
+      : state.layeredBundles[0];
+    if (current) {
+      renderLayeredBundle(current);
+      renderLayeredBundles();
+    } else {
+      state.selectedLayeredBundle = null;
+      $("#results-empty")?.removeAttribute("hidden");
+      $("#results-detail")?.setAttribute("hidden", "");
+    }
+  } catch (error) {
+    if (announce) toast(error.message, true);
+    else console.warn("Resultados layered indisponíveis:", error);
+  }
+}
+
+function initializeResults() {
+  $("#refresh-results")?.addEventListener("click", () => loadLayeredBundles({ announce: true }));
+  renderLayeredBundles();
 }
 
 function uniqueAiRenderName(originalName) {
@@ -2581,7 +3045,7 @@ function uniqueAiRenderName(originalName) {
   return candidate.slice(0, 160);
 }
 
-function duplicateAiRenderJob(job) {
+function duplicateAiRenderJob(job, { announce = true } = {}) {
   const payload = job?.payload || {};
   state.selectedGeminiJob = null;
   switchPage("gemini-page");
@@ -2606,9 +3070,19 @@ function duplicateAiRenderJob(job) {
   }
 
   const provider = $("#gemini-provider");
-  if (provider && ["google", "openai", "qwen"].includes(payload.provider)) {
+  if (provider && ["google", "openai", "qwen", "chatgpt-local"].includes(payload.provider)) {
     provider.value = payload.provider;
   }
+  const generationMode = $("#gemini-generation-mode");
+  if (generationMode) {
+    generationMode.value = AI_RENDER_GENERATION_MODES.includes(payload.render_spec?.generation_mode)
+      ? payload.render_spec.generation_mode
+      : "single_sheet";
+  }
+  const holdoutDilation = $("#gemini-holdout-dilation");
+  if (holdoutDilation) holdoutDilation.value = payload.holdout_dilation ?? DEFAULT_HOLDOUT_DILATION;
+  const holdoutTolerance = $("#gemini-holdout-tolerance");
+  if (holdoutTolerance) holdoutTolerance.value = payload.holdout_tolerance ?? DEFAULT_HOLDOUT_TOLERANCE;
   updateImageProviderControls();
   const model = $("#gemini-model");
   if (model && payload.model) model.value = payload.model;
@@ -2633,6 +3107,19 @@ function duplicateAiRenderJob(job) {
 
   const referenceId = payload.reference_id || payload.reference?.cached_id || "";
   renderGeminiReferences();
+  renderWeaponReferences();
+  updateHoldoutControls();
+  const weaponComponentId = payload.render_spec?.layer_contract?.weapon_component_id || "";
+  const weaponComponent = $("#gemini-weapon-component");
+  if (weaponComponent && [...weaponComponent.options].some((option) => option.value === weaponComponentId)) {
+    weaponComponent.value = weaponComponentId;
+  }
+  const weaponReferenceId = payload.weapon_reference_id || "";
+  const weaponReference = $("#weapon-reference-cache");
+  if (weaponReference && weaponReferenceId && [...weaponReference.options].some((option) => option.value === weaponReferenceId)) {
+    weaponReference.value = weaponReferenceId;
+    weaponReference.dispatchEvent(new Event("change"));
+  }
   const referenceSelect = $("#gemini-reference-cache");
   if (referenceSelect && referenceId && [...referenceSelect.options].some((option) => option.value === referenceId)) {
     referenceSelect.value = referenceId;
@@ -2653,7 +3140,24 @@ function duplicateAiRenderJob(job) {
   }
   scheduleCompiledPromptRefresh();
   updateAiRenderSummary();
-  toast("Configuração duplicada. Revise a descrição e gere um novo AI Render.");
+  if (announce) toast("Configuração duplicada. Revise a descrição e gere um novo AI Render.");
+}
+
+const geminiRetryInFlight = new Set();
+
+async function retryGeminiJob(job) {
+  if (!job || job.status !== "error") return null;
+  const jobId = String(job.id || "").trim();
+  if (!jobId || geminiRetryInFlight.has(jobId)) return null;
+  geminiRetryInFlight.add(jobId);
+  try {
+    duplicateAiRenderJob(job, { announce: false });
+    // Retry always creates a fresh id/name through the existing idempotent
+    // submission path; the failed record remains available for audit/history.
+    return await generateGemini();
+  } finally {
+    geminiRetryInFlight.delete(jobId);
+  }
 }
 
 function selectGeminiJob(id) {
@@ -2668,17 +3172,17 @@ async function pollGeminiJob(id) {
     await new Promise((resolve) => setTimeout(resolve, 1500));
     const job = await api(`/api/gemini-jobs/${encodeURIComponent(id)}`);
     state.geminiJobs = replaceJobInCollection(state.geminiJobs, job);
-    if (!patchJobCardStatus("#gemini-job-list", "data-gemini-job-id", "geminiJobId", job, pipelineStatusLabel(job.status))) {
+    if (!patchGeminiJobCard(job)) {
       renderGeminiJobs();
     }
     if (state.selectedGeminiJob?.id === id) renderGeminiJob(job);
     if (job.status === "done" || job.status === "error") {
       const result = await api("/api/gemini-jobs");
       state.geminiJobs = result.jobs || [];
-      if (!patchJobCardStatus("#gemini-job-list", "data-gemini-job-id", "geminiJobId", job, pipelineStatusLabel(job.status))) {
+      const current = state.geminiJobs.find((row) => row.id === id) || job;
+      if (!patchGeminiJobCard(current)) {
         renderGeminiJobs();
       }
-      const current = state.geminiJobs.find((row) => row.id === id);
       if (current && state.selectedGeminiJob?.id === id) renderGeminiJob(current);
       populatePostprocessGeminiJobs();
       const provider = imageProviderLabel(job.payload?.provider);
@@ -2700,11 +3204,16 @@ function fileToDataUrl(file) {
 async function generateGemini() {
   const renderName = $("#gemini-render-name")?.value.trim() || "";
   const sourceId = $("#gemini-source")?.value || "";
+  const generationMode = selectedAiGenerationMode();
   const provider = selectedImageProvider();
   const referenceChannels = selectedReferenceChannels();
   const blenderChannels = referenceChannels.filter((channel) => channel !== "frame_control");
   const file = $("#gemini-reference")?.files?.[0];
   let referenceId = $("#gemini-reference-cache")?.value || "";
+  const weaponFile = $("#weapon-reference")?.files?.[0];
+  let weaponReferenceId = generationMode === "character_weapon_holdout"
+    ? $("#weapon-reference-cache")?.value || ""
+    : "";
   const prompt = $("#gemini-prompt")?.value.trim() || "";
   const model = $("#gemini-model")?.value.trim() || IMAGE_PROVIDER_DEFAULT_MODELS[provider];
   const seedValue = $("#qwen-seed")?.value.trim() || "";
@@ -2750,6 +3259,15 @@ async function generateGemini() {
     toast("Selecione ou envie uma imagem de referência", true);
     return;
   }
+  if (generationMode === "character_weapon_holdout" && !selectedWeaponComponentId()) {
+    toast("Selecione o componente weapon detectado", true);
+    $("#gemini-weapon-component")?.focus();
+    return;
+  }
+  if (generationMode === "character_weapon_holdout" && !weaponFile && !weaponReferenceId) {
+    toast("Selecione ou envie uma referência visual da arma", true);
+    return;
+  }
   const button = $("#gemini-render");
   if (button) {
     button.disabled = true;
@@ -2762,6 +3280,13 @@ async function generateGemini() {
       renderGeminiReferences();
       $("#gemini-reference-cache").value = cached.reference.id;
       referenceId = cached.reference.id;
+    }
+    if (generationMode === "character_weapon_holdout" && weaponFile) {
+      const cached = await api("/api/weapon/references", { method: "POST", body: { name: weaponFile.name, reference_data: await fileToDataUrl(weaponFile) } });
+      state.weaponReferences = [cached.reference, ...state.weaponReferences];
+      renderWeaponReferences();
+      $("#weapon-reference-cache").value = cached.reference.id;
+      weaponReferenceId = cached.reference.id;
     }
     const job = await api("/api/gemini-render", {
       method: "POST",
@@ -2780,9 +3305,13 @@ async function generateGemini() {
         gemini_temperature: provider === "google" ? geminiTemperature : null,
         gemini_top_k: provider === "google" ? geminiTopK : null,
         reference_id: referenceId || null,
+        weapon_reference_id: weaponReferenceId || null,
         reference_name: state.geminiReferences.find((reference) => reference.id === referenceId)?.name || file?.name || "identity reference",
         identity_lineart_mode: selectedIdentityGuideMode(),
         reference_data: "",
+        publish_layered_bundle: generationMode === "character_weapon_holdout",
+        holdout_dilation: selectedHoldoutDilation(),
+        holdout_tolerance: selectedHoldoutTolerance(),
       },
     });
     state.geminiJobs = [...state.geminiJobs, job];
@@ -2813,10 +3342,23 @@ function initializeGemini() {
   updateImageProviderControls();
   renderGeminiSources();
   renderGeminiReferences();
+  renderWeaponReferences();
+  updateHoldoutControls();
   updateAiRenderSummary();
   renderGeminiJobs();
   source.onchange = () => {
     renderGeminiSources();
+    updateHoldoutControls();
+    updateAiRenderSummary();
+    scheduleCompiledPromptRefresh();
+  };
+  $("#gemini-generation-mode").onchange = () => {
+    state.aiRenderSpec = readAiRenderSpecFromForm();
+    updateHoldoutControls();
+    scheduleCompiledPromptRefresh();
+  };
+  $("#gemini-weapon-component").onchange = () => {
+    state.aiRenderSpec = readAiRenderSpecFromForm();
     updateAiRenderSummary();
     scheduleCompiledPromptRefresh();
   };
@@ -2877,6 +3419,24 @@ function initializeGemini() {
     }
     updateAiRenderSummary();
     scheduleCompiledPromptRefresh();
+  };
+  $("#weapon-reference").onchange = () => {
+    const file = $("#weapon-reference").files?.[0];
+    if (file) $("#weapon-reference-cache").value = "";
+    $("#weapon-reference-name").textContent = file
+      ? `${file.name} · ${(file.size / 1024 / 1024).toFixed(2)} MB · será salva no cache local ao iniciar`
+      : "Nenhuma imagem selecionada. Cache separado da identidade do personagem.";
+    updateAiRenderSummary();
+  };
+  $("#weapon-reference-cache").onchange = () => {
+    const referenceId = $("#weapon-reference-cache").value;
+    const reference = state.weaponReferences.find((item) => item.id === referenceId);
+    const fileInput = $("#weapon-reference");
+    if (fileInput) fileInput.value = "";
+    $("#weapon-reference-name").textContent = reference
+      ? `${reference.name} · cache local`
+      : "Nenhuma imagem selecionada. Cache separado da identidade do personagem.";
+    updateAiRenderSummary();
   };
   $("#gemini-cache-reference").onclick = async () => {
     const file = $("#gemini-reference")?.files?.[0];

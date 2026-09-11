@@ -6,6 +6,7 @@ import json
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +15,7 @@ from PIL import Image
 
 import chroma_despill
 import huggingface_realesrgan
-from postprocess_runtime import add_runtime_arguments, resolve_device
+from postprocess_runtime import add_runtime_arguments, resolve_device, validate_parallelism
 import sprite_render
 from waifu2x_cunet_scale import alpha_bleed
 
@@ -151,6 +152,83 @@ def preclean_cell(
     return result, report
 
 
+def _preclean_cell_task(
+    task: tuple[str, Image.Image, Image.Image, Path, float, tuple[int, int, int] | None],
+) -> tuple[str, dict[str, Any]]:
+    name, source_cell, mask, output, tolerance, key_color = task
+    try:
+        precleaned, report = preclean_cell(
+            source_cell,
+            mask,
+            tolerance=tolerance,
+            key_color=key_color,
+        )
+        precleaned.save(output / name, format="PNG")
+        precleaned.close()
+        return name, report
+    finally:
+        source_cell.close()
+        mask.close()
+
+
+def _write_final_cell_task(
+    task: tuple[
+        Path,
+        Path,
+        Path,
+        Path | None,
+        str,
+        tuple[int, int],
+        int,
+        Path | None,
+        str,
+        float,
+    ],
+) -> None:
+    (
+        upscaled_dir,
+        mask_source,
+        output,
+        lineart_output,
+        name,
+        final_size,
+        final_bleed_radius,
+        lineart_dir,
+        lineart_mode,
+        lineart_strength,
+    ) = task
+    with Image.open(upscaled_dir / name) as opened:
+        frame = opened.convert("RGBA")
+    with Image.open(mask_source / name) as opened_mask:
+        final_alpha = _mask_from_image(opened_mask, final_size)
+    frame.putalpha(final_alpha)
+    result = alpha_bleed(frame, final_bleed_radius)
+    result.putalpha(final_alpha)
+    lineart_layer = None
+    try:
+        if lineart_mode == "blender" and lineart_dir is not None:
+            candidate = lineart_dir / "lineart" / name
+            if not candidate.is_file():
+                candidate = lineart_dir / name
+            if not candidate.is_file():
+                raise FileNotFoundError(f"lineart ausente: {name}")
+            with Image.open(candidate) as opened_lineart:
+                lineart_layer = build_lineart_layer(
+                    result,
+                    opened_lineart,
+                    lineart_strength,
+                )
+        result.save(output / name, format="PNG")
+        if lineart_layer is not None and lineart_output is not None:
+            lineart_layer.save(lineart_output / name, format="PNG")
+    finally:
+        if lineart_layer is not None:
+            lineart_layer.close()
+        frame.close()
+        final_alpha.close()
+        result.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     add_runtime_arguments(parser)
@@ -187,6 +265,7 @@ def main() -> None:
         raise FileNotFoundError("source ou mask_source ausente")
     if not 0.0 <= args.lineart_strength <= 1.0:
         raise ValueError("lineart-strength deve estar entre 0 e 1")
+    validate_parallelism(args.batch_size, args.cpu_workers)
     if args.lineart_dir is not None and not args.lineart_dir.is_dir():
         raise FileNotFoundError("lineart-dir ausente")
     if args.lineart_mode == "blender" and args.lineart_dir is None:
@@ -227,6 +306,7 @@ def main() -> None:
 
     started = time.monotonic()
     preclean_reports: dict[str, dict[str, Any]] = {}
+    preclean_tasks = []
     for row in range(args.rows):
         for column in range(args.phases):
             name = f"row{row}_col{column}.png"
@@ -239,17 +319,19 @@ def main() -> None:
             source_cell = sheet.crop(box)
             with Image.open(args.mask_source / name) as opened_mask:
                 mask = _mask_from_image(opened_mask, cell_size)
-            precleaned, report = preclean_cell(
-                source_cell,
-                mask,
-                tolerance=args.tolerance,
-                key_color=tuple(args.key_color) if args.key_color else None,
+            preclean_tasks.append(
+                (
+                    name,
+                    source_cell,
+                    mask,
+                    preclean_dir,
+                    args.tolerance,
+                    tuple(args.key_color) if args.key_color else None,
+                )
             )
-            precleaned.save(preclean_dir / name, format="PNG")
+    with ThreadPoolExecutor(max_workers=args.cpu_workers) as executor:
+        for name, report in executor.map(_preclean_cell_task, preclean_tasks):
             preclean_reports[name] = report
-            source_cell.close()
-            mask.close()
-            precleaned.close()
 
     realesrgan_report = _run(
         [
@@ -259,6 +341,8 @@ def main() -> None:
             str(upscaled_dir),
             "--device", args.device,
             "--precision", args.precision,
+            "--batch-size", str(args.batch_size),
+            "--cpu-workers", str(args.cpu_workers),
             "--realesrgan-repo",
             str(args.realesrgan_repo),
             "--model-profile",
@@ -287,9 +371,18 @@ def main() -> None:
     )
 
     final_size = (cell_size[0] * 2, cell_size[1] * 2)
-    for row in range(args.rows):
-        for column in range(args.phases):
-            name = f"row{row}_col{column}.png"
+    names = [
+        f"row{row}_col{column}.png"
+        for row in range(args.rows)
+        for column in range(args.phases)
+    ]
+    lineart_detector_batched = False
+    if args.lineart_mode in (
+        "lineart_standard",
+        "lineart_coarse",
+        "lineart_anime",
+    ):
+        for name in names:
             with Image.open(upscaled_dir / name) as opened:
                 frame = opened.convert("RGBA")
             with Image.open(args.mask_source / name) as opened_mask:
@@ -297,41 +390,47 @@ def main() -> None:
             frame.putalpha(final_alpha)
             result = alpha_bleed(frame, args.final_bleed_radius)
             result.putalpha(final_alpha)
-            lineart_layer = None
-            if args.lineart_mode == "blender" and args.lineart_dir is not None:
-                candidate = args.lineart_dir / "lineart" / name
-                if not candidate.is_file():
-                    candidate = args.lineart_dir / name
-                if not candidate.is_file():
-                    raise FileNotFoundError(f"lineart ausente: {name}")
-                with Image.open(candidate) as opened_lineart:
-                    lineart_layer = build_lineart_layer(
-                        result, opened_lineart, args.lineart_strength
-                    )
-            elif args.lineart_mode in ("lineart_standard", "lineart_coarse", "lineart_anime"):
-                detector_input = _black_composite(result)
-                detector_kwargs = {
-                    "detect_resolution": final_size[0],
-                    "image_resolution": final_size[0],
-                    "output_type": "pil",
-                }
-                if args.lineart_mode in ("lineart_standard", "lineart_coarse"):
-                    detector_kwargs["coarse"] = args.lineart_mode == "lineart_coarse"
-                detected = lineart_detector(detector_input, **detector_kwargs)
-                detected_lineart = _detector_output_as_lineart(detected)
-                lineart_layer = build_lineart_layer(
-                    result, detected_lineart, args.lineart_strength
-                )
-                detector_input.close()
-                detected.close()
-                detected_lineart.close()
+            detector_input = _black_composite(result)
+            detector_kwargs = {
+                "detect_resolution": final_size[0],
+                "image_resolution": final_size[0],
+                "output_type": "pil",
+            }
+            if args.lineart_mode in ("lineart_standard", "lineart_coarse"):
+                detector_kwargs["coarse"] = args.lineart_mode == "lineart_coarse"
+            detected = lineart_detector(detector_input, **detector_kwargs)
+            detected_lineart = _detector_output_as_lineart(detected)
+            lineart_layer = build_lineart_layer(
+                result, detected_lineart, args.lineart_strength
+            )
             result.save(args.output / name, format="PNG")
-            if lineart_layer is not None and lineart_output is not None:
+            if lineart_output is not None:
                 lineart_layer.save(lineart_output / name, format="PNG")
-                lineart_layer.close()
+            detector_input.close()
+            detected.close()
+            detected_lineart.close()
+            lineart_layer.close()
             frame.close()
             final_alpha.close()
             result.close()
+    else:
+        final_tasks = [
+            (
+                upscaled_dir,
+                args.mask_source,
+                args.output,
+                lineart_output,
+                name,
+                final_size,
+                args.final_bleed_radius,
+                args.lineart_dir,
+                args.lineart_mode,
+                args.lineart_strength,
+            )
+            for name in names
+        ]
+        with ThreadPoolExecutor(max_workers=args.cpu_workers) as executor:
+            list(executor.map(_write_final_cell_task, final_tasks))
 
     sprite_render._build_sheet(args.output, args.rows, args.phases, final_size[0])
     directions = sprite_render.DIRECTION_ROWS[: args.rows]
@@ -416,6 +515,11 @@ def main() -> None:
             "reports": preclean_reports,
         },
         "realesrgan": realesrgan_report,
+        "parallelism": {
+            "gpu_batch_size": args.batch_size,
+            "cpu_workers": args.cpu_workers,
+            "lineart_detector_batched": lineart_detector_batched,
+        },
         "model_profile": args.model_profile,
         "final_bleed_radius": args.final_bleed_radius,
         "images": args.rows * args.phases,

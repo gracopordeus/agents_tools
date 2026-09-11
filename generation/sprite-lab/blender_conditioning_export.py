@@ -53,6 +53,9 @@ ROLE_COLORS = {
     "accessory": (233, 30, 99, 255),
     "other": (189, 195, 199, 255),
 }
+# Components are deliberately isolated from the neutral character clay pass.
+# Pure magenta is an explicit, high-contrast cue for image-conditioned models.
+NEUTRAL_COMPONENT_COLOR = (255, 0, 255, 255)
 DEPTH_RANGE_DEFAULT = (0.1, 20.0)
 COMPONENT_ROOT_PREFIX = "sprite_component_"
 COMPONENT_ROLE_PROPERTY = "conditioning_component_role"
@@ -222,16 +225,16 @@ def _render_neutral_beauty(
     objects: list[bpy.types.Object],
     path: Path,
 ) -> None:
-    """Render the character gray and attached composition props orange."""
+    """Render the character gray and attached components pure magenta."""
     clay = _material("__generation_neutral_clay", (128, 128, 128, 255))
-    prop = _material("__generation_neutral_prop", (230, 126, 34, 255))
+    component = _material("__generation_neutral_component", NEUTRAL_COMPONENT_COLOR)
     _render_with_overrides(
         scene,
         objects,
         {role: clay for role in ROLES},
         path,
         material_resolver=lambda obj: (
-            prop if _component_role(obj) is not None else clay
+            component if _component_role(obj) is not None else clay
         ),
     )
 

@@ -41,7 +41,16 @@ class RuntimeTests(unittest.TestCase):
     def test_default_precision_is_fp32(self):
         parser = argparse.ArgumentParser()
         runtime.add_runtime_arguments(parser)
-        self.assertEqual(parser.parse_args([]).precision, "fp32")
+        args = parser.parse_args([])
+        self.assertEqual(args.precision, "fp32")
+        self.assertEqual(args.batch_size, 2)
+        self.assertEqual(args.cpu_workers, 4)
+
+    def test_parallelism_rejects_non_positive_values(self):
+        with self.assertRaises(ValueError):
+            runtime.validate_parallelism(0, 4)
+        with self.assertRaises(ValueError):
+            runtime.validate_parallelism(4, 0)
 
     def test_alternative_checkpoints_have_pinned_hashes(self):
         for name in ("swinir_light_x2", "swinir_m_classical_df2k_x2", "realcugan_x2", "realcugan_conservative_x2"):
