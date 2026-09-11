@@ -20,6 +20,7 @@ import huggingface_realesrgan
 import semantic_preview
 import sprite_render
 import asset_manifest
+from source_alpha_intersection import intersect_with_source_alpha
 from PIL import Image
 from direction_contract import direction_contract_for
 from postprocess_runtime import (
@@ -997,8 +998,15 @@ def process(
         )
         MASK_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
         _save_cached_mask_pass(mask_report, mask_pass, mask_cache_key)
-    mask_report = {**mask_report, "cache": {"hit": mask_cache_hit, "key": mask_cache_key}}
     mask_source = mask_pass / "foreground_cleanup_masks"
+    source_alpha_report = intersect_with_source_alpha(
+        generated_sheet, mask_pass, mask_source, rows, phases
+    )
+    mask_report = {
+        **mask_report,
+        "cache": {"hit": mask_cache_hit, "key": mask_cache_key},
+        "source_alpha_intersection": source_alpha_report,
+    }
     expected_masks = list(mask_source.glob("row*_col*.png"))
     if len(expected_masks) != rows * phases:
         raise RuntimeError(
