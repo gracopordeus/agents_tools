@@ -10,6 +10,23 @@ from source_alpha_intersection import intersect_with_source_alpha
 
 
 class SourceAlphaIntersectionTests(unittest.TestCase):
+    def test_non_decodable_fixture_is_reported_as_not_applicable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "generated.png"
+            source.write_text("fake generated sheet", encoding="utf-8")
+
+            report = intersect_with_source_alpha(
+                source, root / "output", root / "masks", 8, 8
+            )
+
+            self.assertEqual(report, {
+                "applied": False,
+                "applied_cells": 0,
+                "skipped": True,
+                "reason": "source_not_decodable",
+            })
+
     def test_transparent_provider_pixels_cannot_become_foreground(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
