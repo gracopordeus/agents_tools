@@ -19,6 +19,7 @@ import model_cache
 import render_profile
 import asset_manifest
 import parallel_sprite_render
+import layer_channel_assembler
 from orientation_contract import normalize_orientation
 from direction_contract import (
     DIRECTION_CONTRACT,
@@ -54,6 +55,26 @@ CONTROLNET_WORKER = Path(__file__).resolve().with_name("controlnet_sprite_channe
 GPU_HEALTH_PATH = Path(__file__).resolve().parent / "state" / "blender_gpu_health.json"
 GPU_RETRY_SECONDS = 24 * 60 * 60
 MESA_EGL_VENDOR = Path("/usr/share/glvnd/egl_vendor.d/50_mesa.json")
+
+
+def character_pass_requested(payload: dict[str, Any]) -> bool:
+    """Keep isolated character rendering explicitly opt-in."""
+    return payload.get("character_pass") is True
+
+
+def weapon_pass_requested(payload: dict[str, Any]) -> bool:
+    """Keep isolated weapon rendering explicitly opt-in."""
+    return payload.get("weapon_pass") is True
+
+
+def weapon_front_mask_requested(payload: dict[str, Any]) -> bool:
+    """Keep the structural front-mask render explicitly opt-in."""
+    return payload.get("weapon_front_mask") is True
+
+
+def layered_outputs_requested(payload: dict[str, Any]) -> bool:
+    """Keep the complete structural atlas export explicitly opt-in."""
+    return payload.get("layered_outputs") is True
 
 
 def write_json_atomic(path: Path, data: Any) -> None:
@@ -791,10 +812,18 @@ def generate_sprite_render(
             "root_motion",
         )
     }
+    layered_outputs = layered_outputs_requested(payload)
     request = {
         "blender_workers": parallel_sprite_render.worker_count(
             payload.get("blender_workers", os.environ.get("SPRITE_LAB_BLENDER_WORKERS", "4")), rows),
         "auxiliary_channels": bool(payload.get("auxiliary_channels", False)),
+        "character_pass": layered_outputs or character_pass_requested(payload),
+        "weapon_pass": layered_outputs or weapon_pass_requested(payload),
+        "weapon_component_id": payload.get("weapon_component_id"),
+        "weapon_front_mask": layered_outputs or weapon_front_mask_requested(payload),
+        "weapon_front_mask_dilation": payload.get(
+            "weapon_front_mask_dilation", 0
+        ),
         "character_path": str(character_path),
         "animation_path": str(animation_path),
         "action_name": animation.get("action_name") or animation.get("clip_name"),
@@ -912,6 +941,20 @@ def generate_sprite_render(
         resolution = int(worker_cell[0])
     if locked_profile:
         _validate_cells_not_clipped(output, rows, phases)
+    if layered_outputs:
+        if rows != 8 or phases != 8:
+            raise RuntimeError("layered_outputs exige grade 8x8")
+        layer_channels = layer_channel_assembler.assemble_layer_channels(
+            output, worker_report
+        )
+        worker_report.update(
+            layer_channel_assembler.layer_channels_metadata(
+                worker_report,
+                weapon_component_id=str(payload.get("weapon_component_id") or ""),
+                channels=layer_channels,
+            )
+        )
+        worker_report["layered_outputs"] = True
     controlnet_report = _run_controlnet_channels(
         output,
         rows,

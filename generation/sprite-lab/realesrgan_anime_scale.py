@@ -13,7 +13,11 @@ from PIL import Image
 
 import huggingface_realesrgan
 from waifu2x_cunet_scale import alpha_bleed
-from postprocess_runtime import add_runtime_arguments, resolve_device
+from postprocess_runtime import (
+    add_runtime_arguments,
+    resolve_device,
+    validate_parallelism,
+)
 
 
 def _load_realesrgan(profile_id: str, tile_size: int, tile_pad: int, device="auto", precision="fp32"):
@@ -55,6 +59,7 @@ def main() -> None:
         raise FileNotFoundError(args.source)
     if args.bleed_radius < 0 or args.tile_size < 32 or args.tile_pad < 0:
         raise ValueError("parâmetros de tile/bleeding inválidos")
+    validate_parallelism(args.batch_size, args.cpu_workers)
     args.output.mkdir(parents=True, exist_ok=True)
     bleed_output = args.output / "alpha_bleed"
     bleed_output.mkdir(parents=True, exist_ok=True)
@@ -73,46 +78,73 @@ def main() -> None:
     ]
     started = time.monotonic()
     source_size: tuple[int, int] | None = None
-    for source in inputs:
-        if not source.is_file():
-            raise FileNotFoundError(source)
-        with Image.open(source) as opened:
-            original = opened.convert("RGBA")
-        if source_size is None:
-            source_size = original.size
-        if original.size != source_size:
-            raise ValueError("todas as células precisam ter a mesma dimensão")
-        original_alpha = original.getchannel("A")
-        prepared = alpha_bleed(original, args.bleed_radius)
-        prepared.save(bleed_output / source.name, format="PNG")
-        rgb = np.asarray(prepared.convert("RGB"), dtype=np.uint8)
-        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-        if selected_profile["architecture"] == "traditional":
-            output_bgr = cv2.resize(
-                bgr,
-                (original.width * args.scale, original.height * args.scale),
-                interpolation=cv2.INTER_CUBIC,
-            )
-        else:
-            output_bgr, _ = upsampler.enhance(bgr, outscale=float(args.scale))
-        output_rgb = cv2.cvtColor(output_bgr, cv2.COLOR_BGR2RGB)
-        result = Image.fromarray(output_rgb, mode="RGB").convert("RGBA")
-        expected_size = (original.width * args.scale, original.height * args.scale)
-        if result.size != expected_size:
-            raise RuntimeError(
-                f"Real-ESRGAN produziu {result.size}, esperado {expected_size}"
-            )
-        filter_mode = (
-            Image.Resampling.NEAREST
-            if args.alpha_filter == "nearest"
-            else Image.Resampling.LANCZOS
-        )
-        result.putalpha(original_alpha.resize(expected_size, filter_mode))
-        result.save(args.output / source.name, format="PNG")
-        original.close()
-        original_alpha.close()
-        prepared.close()
-        result.close()
+    effective_batch_size = 1 if upsampler is None else args.batch_size
+    for batch_start in range(0, len(inputs), effective_batch_size):
+        batch_sources = inputs[batch_start:batch_start + effective_batch_size]
+        originals: list[Image.Image] = []
+        original_alphas: list[Image.Image] = []
+        prepared_images: list[Image.Image] = []
+        bgr_images: list[np.ndarray] = []
+        try:
+            for source in batch_sources:
+                if not source.is_file():
+                    raise FileNotFoundError(source)
+                with Image.open(source) as opened:
+                    original = opened.convert("RGBA")
+                if source_size is None:
+                    source_size = original.size
+                if original.size != source_size:
+                    raise ValueError("todas as células precisam ter a mesma dimensão")
+                original_alpha = original.getchannel("A")
+                prepared = alpha_bleed(original, args.bleed_radius)
+                prepared.save(bleed_output / source.name, format="PNG")
+                rgb = np.asarray(prepared.convert("RGB"), dtype=np.uint8)
+                originals.append(original)
+                original_alphas.append(original_alpha)
+                prepared_images.append(prepared)
+                bgr_images.append(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+
+            if selected_profile["architecture"] == "traditional":
+                output_bgr_images = [
+                    cv2.resize(
+                        bgr,
+                        (original.width * args.scale, original.height * args.scale),
+                        interpolation=cv2.INTER_CUBIC,
+                    )
+                    for bgr, original in zip(bgr_images, originals)
+                ]
+            else:
+                output_bgr_batch, _ = upsampler.enhance_batch(
+                    bgr_images,
+                    outscale=float(args.scale),
+                )
+                output_bgr_images = list(output_bgr_batch)
+
+            for source, original, original_alpha, output_bgr in zip(
+                batch_sources, originals, original_alphas, output_bgr_images
+            ):
+                output_rgb = cv2.cvtColor(output_bgr, cv2.COLOR_BGR2RGB)
+                result = Image.fromarray(output_rgb, mode="RGB").convert("RGBA")
+                expected_size = (original.width * args.scale, original.height * args.scale)
+                if result.size != expected_size:
+                    raise RuntimeError(
+                        f"Real-ESRGAN produziu {result.size}, esperado {expected_size}"
+                    )
+                filter_mode = (
+                    Image.Resampling.NEAREST
+                    if args.alpha_filter == "nearest"
+                    else Image.Resampling.LANCZOS
+                )
+                result.putalpha(original_alpha.resize(expected_size, filter_mode))
+                result.save(args.output / source.name, format="PNG")
+                result.close()
+        finally:
+            for original_alpha in original_alphas:
+                original_alpha.close()
+            for original in originals:
+                original.close()
+            for prepared in prepared_images:
+                prepared.close()
 
     assert source_size is not None
     output_size = source_size[0] * args.scale
@@ -154,6 +186,7 @@ def main() -> None:
             "tile_pad": args.tile_pad,
             "tiling": "full_frame_global_context" if selected_profile["architecture"] == "realcugan" else "padded_tiles",
             "images": len(inputs),
+            "batch_size": effective_batch_size,
             "elapsed_seconds": round(time.monotonic() - started, 3),
         },
         "cells": [path.name for path in inputs],

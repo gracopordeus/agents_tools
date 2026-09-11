@@ -52,6 +52,7 @@
       <nav class="sidebar-nav" aria-label="Etapas generativas">
         <button class="page-tab sidebar-tab" data-page="gemini-page" type="button" title="AI Render"><span class="sidebar-icon">✧</span><span class="sidebar-label">AI Render</span></button>
         <button class="page-tab sidebar-tab" data-page="postprocess-page" type="button" title="Pós-processamento"><span class="sidebar-icon">◈</span><span class="sidebar-label">Pós-processamento</span></button>
+        <button class="page-tab sidebar-tab" data-page="results-page" type="button" title="Resultados"><span class="sidebar-icon">▤</span><span class="sidebar-label">Resultados</span></button>
       </nav>
       <div class="sidebar-note"><span class="status-dot"></span><span class="sidebar-label">Local · offline</span></div>
       <div class="sidebar-spacer"></div>
@@ -301,14 +302,24 @@
         <div class="panel-head"><div><span class="pane-title">Inspetor de geração</span><span class="pane-subtitle">Configuração do render</span></div></div>
         <form id="ai-render-form" class="pipeline-form">
           <div class="form-grid ai-render-provider-controls">
-            <div class="field"><label for="gemini-provider">Provider</label><select id="gemini-provider"><option value="google" selected>Gemini · Google API</option><option value="openai">GPT Image 2 · OpenAI API</option><option value="qwen">Qwen Image · Qwen Cloud API</option></select><small>Gemini é o provider padrão. Configure a chave correspondente em Configurações.</small></div>
-            <div class="field"><label for="gemini-model">Modelo</label><input id="gemini-model" value="gemini-3.1-flash-image" spellcheck="false"><small>Gemini: gemini-3.1-flash-image · OpenAI: gpt-image-2 · Qwen: qwen-image-3.0-pro ou qwen-image-3.0</small></div>
+            <div class="field"><label for="gemini-provider">Provider</label><select id="gemini-provider"><option value="google" selected>Gemini · Google API</option><option value="openai">GPT Image 2 · OpenAI API</option><option value="qwen">Qwen Image · Qwen Cloud API</option><option value="chatgpt-local">ChatGPT local · POC (tarefa local)</option></select><small>ChatGPT local cria a tarefa com GPT-6 Astra e raciocínio Ultra. Imagens quadradas são ajustadas à resolução escolhida; o original é preservado. A geração de imagem continua sendo a ferramenta integrada da sessão.</small></div>
+            <div class="field"><label for="gemini-model">Modelo</label><input id="gemini-model" value="gemini-3.1-flash-image" spellcheck="false"><small>Gemini: gemini-3.1-flash-image · OpenAI: gpt-image-2 · Qwen: qwen-image-3.0-pro ou qwen-image-3.0 · ChatGPT local: gpt-6-astra (Ultra)</small></div>
             <div class="field"><label for="gemini-output-size">Resolução do output</label><select id="gemini-output-size"><option value="2048" selected>2048×2048 (2K)</option><option value="1024">1024×1024 (1K)</option></select><small>A grade continua 8×8. Em 1024×1024, cada célula terá 128×128 px; em 2048×2048, 256×256 px. No pós-processamento, o 1K é normalizado por célula antes do upscale final para 512×512.</small></div>
             <div id="gemini-temperature-field" class="field"><label for="gemini-temperature">Criatividade / temperatura (Gemini)</label><input id="gemini-temperature" type="number" min="0" max="1" step="0.1" value="1"><small>0 = mais estável · 1 = mais exploratório. Padrão do modelo: 1.</small></div>
             <div id="gemini-top-k-field" class="field"><label for="gemini-top-k">TopK (Gemini)</label><input id="gemini-top-k" type="number" min="1" max="1000" step="1" value="64"><small>Limita a seleção aos tokens mais prováveis. Padrão oficial do modelo: 64.</small></div>
             <div id="qwen-seed-field" class="field" hidden><label for="qwen-seed">Seed (Qwen, opcional)</label><input id="qwen-seed" type="number" min="0" step="1" placeholder="Aleatório"><small>Use o mesmo valor para reproduzir uma variação; deixe vazio para seed aleatória.</small></div>
           </div>
           <div class="field"><label for="gemini-render-name">Nome do AI Render *</label><input id="gemini-render-name" type="text" maxlength="160" required placeholder="Ex.: viking_idle_qwen_01" autocomplete="off"><small>Identifica esta spritesheet no histórico e não pode repetir um nome já usado.</small></div>
+          <div class="field"><label for="gemini-generation-mode">Modo de geração</label><select id="gemini-generation-mode"><option value="single_sheet" selected>Spritesheet única (atual)</option><option value="character_weapon_holdout">POC · Personagem + arma separada</option></select><small id="gemini-generation-mode-help">Gera uma única spritesheet, preservando o fluxo atual.</small></div>
+          <section id="gemini-holdout-controls" class="holdout-controls" hidden aria-labelledby="gemini-holdout-title">
+            <div class="holdout-controls-head"><div><span class="pane-title" id="gemini-holdout-title">Modo holdout</span><span class="pane-subtitle">Duas gerações coordenadas</span></div><span class="status-chip neutral">POC</span></div>
+            <p id="gemini-holdout-notice" class="holdout-notice">A personagem e a arma serão geradas em passes separados; a composição final aplica o holdout na resolução publicada.</p>
+            <div class="form-grid">
+              <div class="field full"><label for="gemini-weapon-component">Componente weapon detectado</label><select id="gemini-weapon-component"><option value="">Selecione uma arma visível</option></select><small id="gemini-weapon-component-help">Selecione o componente estrutural usado no segundo pass.</small></div>
+              <div class="field"><label for="gemini-holdout-dilation">Dilatação da máscara (px)</label><input id="gemini-holdout-dilation" type="number" min="0" max="32" step="1" value="0"><small>0 mantém a máscara estrutural; valores maiores ampliam o holdout por célula.</small></div>
+              <div class="field"><label for="gemini-holdout-tolerance">Tolerância de borda (px)</label><input id="gemini-holdout-tolerance" type="number" min="0" max="32" step="1" value="4"><small>Margem segura para revisão de bordas, sem cruzar limites da célula.</small></div>
+            </div>
+          </section>
           <details class="ai-render-spec-panel" open>
             <summary>Contrato do asset e da composição</summary>
             <p class="section-help">Esses campos formam o RenderSpec. O contrato fixo de consistência é compilado pela aplicação e não pode ser removido pelo prompt adicional.</p>
@@ -342,6 +353,11 @@
             <div class="actions"><button id="gemini-cache-reference" type="button">Salvar no cache</button></div>
             <div id="gemini-reference-preview" class="pipeline-upload-preview" hidden><img id="gemini-reference-image" alt="Pré-visualização da referência"></div>
           </section>
+          <section id="gemini-weapon-reference-card" class="identity-reference-card" aria-labelledby="weapon-reference-title" hidden>
+            <div class="field-head"><div><span id="weapon-reference-title" class="pane-title">Referência visual da arma</span><span class="pane-subtitle">Obrigatória no modo character_weapon_holdout</span></div></div>
+            <div class="field"><label for="weapon-reference-cache">Referência salva</label><select id="weapon-reference-cache"><option value="">Nenhuma referência salva</option></select></div>
+            <div class="field"><label for="weapon-reference">Enviar nova imagem</label><input id="weapon-reference" type="file" accept="image/png,image/jpeg,image/webp"><small id="weapon-reference-name">Nenhuma imagem selecionada. Cache separado da identidade do personagem.</small></div>
+          </section>
           <div class="field gemini-prompt-field"><div class="field-head"><label for="gemini-prompt">Instruções adicionais</label><span><button id="gemini-prompt-expand" type="button">Expandir editor</button><button id="gemini-prompt-save" type="button" hidden>Salvar instruções</button></span></div><textarea id="gemini-prompt" class="code-editor" rows="5" placeholder="Ajustes excepcionais; pose, ação e componentes são herdados automaticamente."></textarea><small>Pose, câmera, direções, foot anchor e equipamentos vêm do render estrutural. Ctrl/Cmd+Enter executa.</small></div>
           <details class="ai-render-debug"><summary>Avançado / debug</summary><div class="field compiled-prompt-field"><div class="field-head"><label for="gemini-compiled-prompt">Prompt compilado</label><span class="muted">somente leitura · fonte usada para debug</span></div><textarea id="gemini-compiled-prompt" class="code-editor compiled-prompt" rows="8" readonly placeholder="O prompt compilado aparecerá aqui."></textarea></div></details>
           <div class="ai-render-footer"><div id="ai-render-summary" class="ai-render-summary" aria-live="polite">Preencha o nome e selecione as referências.</div><button id="gemini-render" class="primary" type="submit">Gerar spritesheet</button></div>
@@ -355,6 +371,18 @@
       </section>
       <div class="pane-resize-handle workspace-resize-right" data-resize-pane="right" role="separator" tabindex="0" aria-label="Redimensionar stage e execuções"></div>
       <aside id="gemini-history" class="panel pipeline-history"><div class="panel-head"><div><span class="pane-title">Execuções</span><span class="pane-subtitle">Outputs para aprovação e pós-processamento</span></div></div><div id="gemini-job-list" class="pipeline-job-list" aria-live="polite"></div></aside>
+    </div>
+  </section>
+  <section id="results-page" class="page" hidden>
+    <div class="page-workspace results-workspace">
+      <div class="page-header">
+        <div><span class="eyebrow">PUBLICAÇÃO</span><h1>Resultados</h1><p>Artefatos publicados dos bundles holdout, com preview e download seguros.</p></div>
+        <div class="page-header-actions"><button id="refresh-results" type="button">Atualizar resultados</button></div>
+      </div>
+      <div class="results-layout">
+        <aside class="panel results-history"><div class="panel-head"><div><span class="pane-title">Bundles publicados</span><span class="pane-subtitle">Somente jobs promovidos</span></div></div><div id="results-job-list" class="pipeline-job-list" aria-live="polite"></div></aside>
+        <section class="panel results-detail-panel"><div id="results-empty" class="empty"><div class="empty-icon">▤</div><h2>Selecione um bundle</h2><p>Jobs single-sheet não possuem artefatos layered publicados.</p></div><div id="results-detail" hidden></div></section>
+      </div>
     </div>
   </section>
   <section id="postprocess-page" class="page" hidden>

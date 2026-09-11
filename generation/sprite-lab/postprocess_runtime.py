@@ -25,10 +25,48 @@ class GPULease:
         self.close()
 
 
+def _positive_env(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.environ.get(name, "") or default))
+    except (TypeError, ValueError):
+        return default
+
+
+def runtime_batch_size() -> int:
+    # Batch 2 is the calibrated default for the local 8 GB GTX 1070 Ti:
+    # it raises occupancy without the memory pressure observed at batch 4.
+    return _positive_env("SPRITE_LAB_POSTPROCESS_BATCH_SIZE", 2)
+
+
+def runtime_cpu_workers() -> int:
+    return _positive_env("SPRITE_LAB_POSTPROCESS_CPU_WORKERS", 4)
+
+
+def validate_parallelism(batch_size: int, cpu_workers: int) -> None:
+    if batch_size < 1 or cpu_workers < 1:
+        raise ValueError("batch-size e cpu-workers devem ser positivos")
+
+
 def add_runtime_arguments(parser):
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"),
                         default=os.environ.get("SPRITE_LAB_POSTPROCESS_DEVICE", "auto"))
-    parser.add_argument("--precision", choices=("fp32", "fp16"), default="fp32")
+    parser.add_argument(
+        "--precision",
+        choices=("fp32", "fp16"),
+        default=os.environ.get("SPRITE_LAB_POSTPROCESS_PRECISION", "fp32"),
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=runtime_batch_size(),
+        help="quantidade de células por inferência GPU",
+    )
+    parser.add_argument(
+        "--cpu-workers",
+        type=int,
+        default=runtime_cpu_workers(),
+        help="workers para etapas independentes por célula na CPU",
+    )
 
 
 def resolve_device(requested="auto"):

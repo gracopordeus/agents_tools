@@ -7,6 +7,7 @@ are retained. Tiling uses padded context and crops only the central region.
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Sequence
 
 import cv2
 import numpy as np
@@ -39,13 +40,33 @@ class Upscaler:
             raise ValueError("Checkpoint scale differs from model profile")
 
     @torch.inference_mode()
-    def enhance(self, bgr, outscale=2.0):
-        if bgr.ndim != 3 or bgr.shape[2] != 3 or bgr.dtype != np.uint8:
+    def enhance_batch(self, bgr_images: Sequence[np.ndarray], outscale=2.0):
+        """Upscale equally sized cells in one model call per tile.
+
+        The previous implementation invoked the network once for every cell.
+        Keeping the model loaded once while batching cells substantially
+        improves GPU occupancy without creating one model copy per worker.
+        """
+        if not bgr_images:
+            raise ValueError("Expected at least one image")
+        first = bgr_images[0]
+        if first.ndim != 3 or first.shape[2] != 3 or first.dtype != np.uint8:
             raise ValueError("Expected uint8 HWC BGR")
-        h, w = bgr.shape[:2]
-        rgb = np.ascontiguousarray(bgr[:, :, ::-1])
-        source = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0).to(self.device, self.dtype) / 255
-        output = np.empty((h*self.scale, w*self.scale, 3), dtype=np.uint8)
+        h, w = first.shape[:2]
+        if any(
+            image.ndim != 3
+            or image.shape != first.shape
+            or image.dtype != np.uint8
+            for image in bgr_images
+        ):
+            raise ValueError("All images must have the same uint8 HWC BGR shape")
+        rgb = np.stack(
+            [np.ascontiguousarray(image[:, :, ::-1]) for image in bgr_images],
+            axis=0,
+        )
+        source = torch.from_numpy(rgb).permute(0, 3, 1, 2).to(self.device, self.dtype) / 255
+        batch = len(bgr_images)
+        output = np.empty((batch, h * self.scale, w * self.scale, 3), dtype=np.uint8)
         # CUGAN's squeeze/excitation statistics are global: do not independently
         # tile small sprite cells and pretend equivalence to full-frame inference.
         global_context = str(self.model.architecture.id) == "RealCUGAN"
@@ -59,10 +80,33 @@ class Upscaler:
                 if not torch.isfinite(predicted).all():
                     raise RuntimeError("Non-finite super-resolution output")
                 s = self.scale
-                cropped = predicted[0, :, (y-py)*s:(y1-py)*s, (x-px)*s:(x1-px)*s]
-                output[y*s:y1*s, x*s:x1*s] = cropped.clamp(0, 1).mul(255).round().byte().permute(1, 2, 0).cpu().numpy()
+                cropped = predicted[:, :, (y-py)*s:(y1-py)*s, (x-px)*s:(x1-px)*s]
+                output[:, y*s:y1*s, x*s:x1*s] = (
+                    cropped.clamp(0, 1)
+                    .mul(255)
+                    .round()
+                    .byte()
+                    .permute(0, 2, 3, 1)
+                    .cpu()
+                    .numpy()
+                )
                 del predicted, cropped
-        output = output[:, :, ::-1].copy()
+        output = output[:, :, :, ::-1].copy()
         if outscale != self.scale:
-            output = cv2.resize(output, (round(w*outscale), round(h*outscale)), interpolation=cv2.INTER_LANCZOS4)
+            output = np.stack(
+                [
+                    cv2.resize(
+                        image,
+                        (round(w * outscale), round(h * outscale)),
+                        interpolation=cv2.INTER_LANCZOS4,
+                    )
+                    for image in output
+                ],
+                axis=0,
+            )
         return output, "RGB"
+
+    @torch.inference_mode()
+    def enhance(self, bgr, outscale=2.0):
+        output, color = self.enhance_batch([bgr], outscale=outscale)
+        return output[0], color
