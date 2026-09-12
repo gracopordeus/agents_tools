@@ -12,6 +12,7 @@ from PIL import Image
 
 
 SCHEMA = "sprite_lab.holdout_validation/v1"
+COMPOSITION_SCHEMA = "sprite_lab.layered_composition_validation/v2"
 DEFAULT_GRID = (8, 8)
 DEFAULT_THRESHOLDS: dict[str, float | int] = {
     "alpha_threshold": 16,
@@ -524,11 +525,185 @@ validate_holdout_cells = validate_holdout_outputs
 validate_holdout = validate_holdout_outputs
 
 
+def _load_rgba_for_composition(path: Path | str, label: str) -> np.ndarray:
+    resolved = Path(path)
+    if not resolved.is_file():
+        raise ValueError(f"arquivo ausente: {label}: {resolved}")
+    try:
+        with Image.open(resolved) as opened:
+            if opened.format != "PNG" or opened.mode != "RGBA":
+                raise ValueError(f"{label} deve ser PNG RGBA: {resolved}")
+            return np.asarray(opened, dtype=np.uint8).copy()
+    except OSError as exc:
+        raise ValueError(f"arquivo inválido: {label}: {resolved}: {exc}") from None
+
+
+def _load_mask_for_composition(path: Path | str) -> np.ndarray:
+    resolved = Path(path)
+    if not resolved.is_file():
+        raise ValueError(f"arquivo ausente: visibility_mask: {resolved}")
+    try:
+        with Image.open(resolved) as opened:
+            if opened.format != "PNG":
+                raise ValueError(f"visibility_mask deve ser PNG: {resolved}")
+            if "A" in opened.getbands():
+                return np.asarray(opened.convert("RGBA"), dtype=np.uint8)[..., 3].copy()
+            return np.asarray(opened.convert("L"), dtype=np.uint8).copy()
+    except OSError as exc:
+        raise ValueError(f"arquivo inválido: visibility_mask: {resolved}: {exc}") from None
+
+
+def _max_channel_error(actual: np.ndarray, expected: np.ndarray) -> int:
+    if actual.shape != expected.shape:
+        raise ValueError("imagens layered possuem dimensões incompatíveis")
+    difference = np.abs(actual.astype(np.int16) - expected.astype(np.int16))
+    return int(difference.max(initial=0))
+
+
+def validate_layered_composition(
+    *,
+    character_source: Path | str,
+    character_full: Path | str,
+    component_source: Path | str,
+    visibility_mask: Path | str,
+    component_visible: Path | str,
+    preview: Path | str,
+    grid: Sequence[int] = DEFAULT_GRID,
+    tolerance: int = 1,
+    output_path: Path | str | None = None,
+) -> dict[str, Any]:
+    """Block publication unless a v2 layered composition is pixel-correct.
+
+    The contract deliberately validates the rendered artifacts rather than a
+    compositor report: the base character must be byte-identical, the
+    detachable layer alpha must equal ``component_alpha * visibility_mask``,
+    and the preview must equal straight-alpha source-over composition.
+    """
+    rows, columns = _validated_grid(grid)
+    if type(tolerance) is not int or not 0 <= tolerance <= 32:
+        raise ValueError("tolerance deve ser um inteiro entre 0 e 32")
+
+    source_character = _load_rgba_for_composition(character_source, "character_source")
+    output_character = _load_rgba_for_composition(character_full, "character_full")
+    source_component = _load_rgba_for_composition(component_source, "component_source")
+    output_component = _load_rgba_for_composition(component_visible, "component_visible")
+    output_preview = _load_rgba_for_composition(preview, "preview")
+    mask = _load_mask_for_composition(visibility_mask)
+
+    shape = source_character.shape
+    for label, image in (
+        ("character_full", output_character),
+        ("component_source", source_component),
+        ("component_visible", output_component),
+        ("preview", output_preview),
+    ):
+        if image.shape != shape:
+            raise ValueError(f"{label} possui dimensões incompatíveis")
+    if mask.shape != shape[:2]:
+        raise ValueError("visibility_mask possui dimensões incompatíveis")
+    _validated_grid((rows, columns))
+    if shape[0] % rows or shape[1] % columns:
+        raise ValueError("dimensões layered devem ser divisíveis pela grade")
+
+    expected_alpha = np.clip(
+        np.rint(
+            source_component[..., 3].astype(np.float64)
+            * mask.astype(np.float64)
+            / 255.0
+        ),
+        0.0,
+        255.0,
+    ).astype(np.uint8)
+    expected_component = source_component.copy()
+    expected_component[..., 3] = expected_alpha
+    expected_component[expected_alpha == 0, :3] = 0
+    character_error = _max_channel_error(output_character, source_character)
+    component_alpha_error = _max_channel_error(
+        output_component[..., 3], expected_component[..., 3]
+    )
+    component_rgb_error = _max_channel_error(
+        output_component[expected_alpha > 0, :3],
+        expected_component[expected_alpha > 0, :3],
+    ) if np.any(expected_alpha > 0) else 0
+    invisible_rgb_pixels = int(
+        np.count_nonzero(
+            (output_component[..., 3] == 0)
+            & np.any(output_component[..., :3] != 0, axis=-1)
+        )
+    )
+
+    character_image = Image.fromarray(output_character, mode="RGBA")
+    component_image = Image.fromarray(output_component, mode="RGBA")
+    try:
+        expected_preview = np.asarray(
+            Image.alpha_composite(character_image, component_image), dtype=np.uint8
+        ).copy()
+    finally:
+        character_image.close()
+        component_image.close()
+    preview_error = _max_channel_error(output_preview, expected_preview)
+    opaque_base = output_character[..., 3] == 255
+    opacity_holes = int(np.count_nonzero(opaque_base & (output_preview[..., 3] < 255)))
+    leaked_alpha = int(
+        np.count_nonzero(
+            output_component[..., 3].astype(np.int16)
+            > source_component[..., 3].astype(np.int16) + tolerance
+        )
+    )
+
+    checks = {
+        "character_immutable": character_error == 0,
+        "component_alpha_matches_visibility": component_alpha_error <= tolerance,
+        "component_rgb_preserved": component_rgb_error <= tolerance,
+        "transparent_rgb_clean": invisible_rgb_pixels == 0,
+        "preview_is_alpha_over": preview_error <= tolerance,
+        "opaque_character_stays_opaque": opacity_holes == 0,
+        "component_alpha_does_not_expand": leaked_alpha == 0,
+    }
+    violations = [name for name, passed in checks.items() if not passed]
+    report: dict[str, Any] = {
+        "schema": COMPOSITION_SCHEMA,
+        "validated": not violations,
+        "status": "pass" if not violations else "error",
+        "grid": [rows, columns],
+        "size": [int(shape[1]), int(shape[0])],
+        "tolerance": tolerance,
+        "checks": checks,
+        "violations": violations,
+        "metrics": {
+            "character_max_channel_error": character_error,
+            "component_alpha_max_error": component_alpha_error,
+            "component_rgb_max_error": component_rgb_error,
+            "preview_max_channel_error": preview_error,
+            "invisible_rgb_pixels": invisible_rgb_pixels,
+            "opaque_base_hole_pixels": opacity_holes,
+            "component_alpha_expansion_pixels": leaked_alpha,
+        },
+    }
+    if output_path is not None:
+        destination = Path(output_path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        report["report_path"] = str(destination)
+        temporary = destination.with_name(f".{destination.name}.tmp")
+        temporary.write_text(
+            json.dumps(report, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(destination)
+    if violations:
+        raise ValueError(
+            "composição layered inválida: " + ", ".join(violations)
+        )
+    return report
+
+
 __all__ = [
+    "COMPOSITION_SCHEMA",
     "DEFAULT_GRID",
     "DEFAULT_THRESHOLDS",
     "SCHEMA",
     "validate_holdout",
     "validate_holdout_cells",
     "validate_holdout_outputs",
+    "validate_layered_composition",
 ]

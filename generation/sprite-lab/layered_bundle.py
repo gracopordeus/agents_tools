@@ -16,7 +16,10 @@ from PIL import Image
 
 
 LAYERED_BUNDLE_SCHEMA = "sprite_lab.layered_sprite_bundle/v1"
+LAYERED_BUNDLE_SCHEMA_V1 = LAYERED_BUNDLE_SCHEMA
+LAYERED_BUNDLE_SCHEMA_V2 = "sprite_lab.layered_sprite_bundle/v2"
 GENERATION_MODE = "character_weapon_holdout"
+GENERATION_MODE_V2 = "character_component_holdout"
 GRID_ROWS = 8
 GRID_COLUMNS = 8
 EXPECTED_LAYERS = (("weapon", 0), ("character_holdout", 1))
@@ -68,6 +71,39 @@ LAYER_FIELDS = (
     {"id", "file", "z"},
     {"id", "file", "z", "holdout_source"},
 )
+V2_MANIFEST_FIELDS = {
+    "schema",
+    "generation_mode",
+    "layout",
+    "runtime",
+    "layers",
+    "preview",
+    "source",
+    "hashes",
+}
+V2_LAYOUT_FIELDS = {"rows", "columns", "cell_size"}
+V2_RUNTIME_FIELDS = {
+    "actions",
+    "fps",
+    "directions",
+    "frame_size",
+    "coordinate_space",
+    "pivot",
+    "foot_anchor",
+}
+V2_ACTION_FIELDS = {"id", "start_column", "frame_count", "loop"}
+V2_DIRECTION_FIELDS = {"id", "row", "vector"}
+V2_BASE_LAYER_FIELDS = {"id", "role", "file", "z", "immutable", "blend_mode"}
+V2_COMPONENT_LAYER_FIELDS = {
+    "id",
+    "role",
+    "kind",
+    "file",
+    "z",
+    "blend_mode",
+    "occlusion",
+}
+V2_OCCLUSION_FIELDS = {"mode", "visible_mask", "occluders"}
 
 
 def _sha256(path: Path) -> str:
@@ -709,13 +745,262 @@ def _artifact_paths(manifest: dict[str, Any]) -> list[tuple[str, str]]:
     ]
 
 
+def _finite_number(value: Any, field: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field} deve ser numérico")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"{field} deve ser finito")
+    return number
+
+
+def _validate_point_v2(value: Any, field: str, frame_size: list[int]) -> list[float | int]:
+    if not isinstance(value, list) or len(value) != 2:
+        raise ValueError(f"runtime.{field} deve conter duas coordenadas")
+    point = [_finite_number(item, f"runtime.{field}[{index}]") for index, item in enumerate(value)]
+    if not 0 <= point[0] <= frame_size[0] or not 0 <= point[1] <= frame_size[1]:
+        raise ValueError(f"runtime.{field} deve permanecer dentro do frame")
+    return value
+
+
+def _validate_runtime_v2(runtime: Any, *, rows: int, columns: int, cell_size: list[int]) -> dict[str, Any]:
+    if not isinstance(runtime, dict):
+        raise ValueError("runtime deve ser um objeto")
+    _reject_additional_properties(runtime, V2_RUNTIME_FIELDS, "runtime")
+    if runtime.get("coordinate_space") != "cell_pixels_top_left":
+        raise ValueError("runtime.coordinate_space deve ser cell_pixels_top_left")
+    frame_size = runtime.get("frame_size")
+    if frame_size != cell_size:
+        raise ValueError("runtime.frame_size deve corresponder a layout.cell_size")
+    fps = _finite_number(runtime.get("fps"), "runtime.fps")
+    if fps <= 0 or fps > 240:
+        raise ValueError("runtime.fps deve estar no intervalo (0, 240]")
+
+    actions = runtime.get("actions")
+    if not isinstance(actions, list) or not actions:
+        raise ValueError("runtime.actions deve conter ao menos uma ação")
+    action_ids: set[str] = set()
+    claimed_columns: set[int] = set()
+    for index, action in enumerate(actions):
+        field = f"runtime.actions[{index}]"
+        if not isinstance(action, dict):
+            raise ValueError(f"{field} deve ser um objeto")
+        _reject_additional_properties(action, V2_ACTION_FIELDS, field)
+        action_id = action.get("id")
+        if not isinstance(action_id, str) or not action_id.strip():
+            raise ValueError(f"{field}.id é obrigatório")
+        if action_id in action_ids:
+            raise ValueError("runtime.actions.id deve ser único")
+        action_ids.add(action_id)
+        start = action.get("start_column")
+        count = action.get("frame_count")
+        if type(start) is not int or type(count) is not int or start < 1 or count < 1:
+            raise ValueError(f"{field} exige start_column e frame_count inteiros positivos")
+        action_columns = set(range(start, start + count))
+        if max(action_columns) > columns:
+            raise ValueError(f"{field} ultrapassa as colunas do atlas")
+        if action_columns & claimed_columns:
+            raise ValueError("runtime.actions não pode sobrepor colunas")
+        claimed_columns.update(action_columns)
+        if type(action.get("loop")) is not bool:
+            raise ValueError(f"{field}.loop deve ser booleano")
+
+    directions = runtime.get("directions")
+    if not isinstance(directions, list) or len(directions) != rows:
+        raise ValueError("runtime.directions deve declarar exatamente uma direção por linha")
+    direction_ids: set[str] = set()
+    direction_rows: set[int] = set()
+    for index, direction in enumerate(directions):
+        field = f"runtime.directions[{index}]"
+        if not isinstance(direction, dict):
+            raise ValueError(f"{field} deve ser um objeto")
+        _reject_additional_properties(direction, V2_DIRECTION_FIELDS, field)
+        direction_id = direction.get("id")
+        row = direction.get("row")
+        vector = direction.get("vector")
+        if not isinstance(direction_id, str) or not direction_id.strip():
+            raise ValueError(f"{field}.id é obrigatório")
+        if direction_id in direction_ids:
+            raise ValueError("runtime.directions.id deve ser único")
+        if type(row) is not int or not 1 <= row <= rows:
+            raise ValueError(f"{field}.row deve identificar uma linha válida")
+        if row in direction_rows:
+            raise ValueError("runtime.directions.row deve ser único")
+        if not isinstance(vector, list) or len(vector) != 2:
+            raise ValueError(f"{field}.vector deve conter duas coordenadas")
+        for vector_index, item in enumerate(vector):
+            _finite_number(item, f"{field}.vector[{vector_index}]")
+        direction_ids.add(direction_id)
+        direction_rows.add(row)
+    if direction_rows != set(range(1, rows + 1)):
+        raise ValueError("runtime.directions deve cobrir todas as linhas")
+
+    _validate_point_v2(runtime.get("pivot"), "pivot", frame_size)
+    _validate_point_v2(runtime.get("foot_anchor"), "foot_anchor", frame_size)
+    return runtime
+
+
+def _artifact_paths_v2(manifest: dict[str, Any]) -> list[tuple[str, str]]:
+    result: list[tuple[str, str]] = []
+    for index, layer in enumerate(manifest["layers"]):
+        result.append((f"layers[{index}].file", layer["file"]))
+        if layer.get("role") == "component":
+            result.append(
+                (
+                    f"layers[{index}].occlusion.visible_mask",
+                    layer["occlusion"]["visible_mask"],
+                )
+            )
+    result.append(("preview", manifest["preview"]))
+    return result
+
+
+def validate_layered_bundle_v2(
+    manifest: Any,
+    root: Path | None = None,
+) -> dict[str, Any]:
+    """Validate a modular bundle with one immutable base and N visible layers."""
+    if not isinstance(manifest, dict):
+        raise ValueError("manifest deve ser um objeto JSON")
+    _reject_additional_properties(manifest, V2_MANIFEST_FIELDS, "manifest")
+    if manifest.get("schema") != LAYERED_BUNDLE_SCHEMA_V2:
+        raise ValueError(f"schema inválido: {manifest.get('schema')}")
+    if manifest.get("generation_mode") != GENERATION_MODE_V2:
+        raise ValueError(f"generation_mode inválido: {manifest.get('generation_mode')}")
+
+    layout = manifest.get("layout")
+    if not isinstance(layout, dict):
+        raise ValueError("layout deve ser um objeto")
+    _reject_additional_properties(layout, V2_LAYOUT_FIELDS, "layout")
+    rows = layout.get("rows")
+    columns = layout.get("columns")
+    cell_size = layout.get("cell_size")
+    if type(rows) is not int or type(columns) is not int or rows < 1 or columns < 1:
+        raise ValueError("layout.rows e layout.columns devem ser inteiros positivos")
+    if (
+        not isinstance(cell_size, list)
+        or len(cell_size) != 2
+        or any(type(value) is not int or value <= 0 for value in cell_size)
+    ):
+        raise ValueError("layout.cell_size deve conter dois inteiros positivos")
+    _validate_runtime_v2(
+        manifest.get("runtime"), rows=rows, columns=columns, cell_size=cell_size
+    )
+
+    layers = manifest.get("layers")
+    if not isinstance(layers, list) or len(layers) < 2:
+        raise ValueError("layers deve declarar uma base e ao menos um componente")
+    if any(not isinstance(layer, dict) for layer in layers):
+        raise ValueError("cada item de layers deve ser um objeto")
+    ids: list[str] = []
+    z_values: list[int] = []
+    for index, layer in enumerate(layers):
+        field = f"layers[{index}]"
+        role = layer.get("role")
+        allowed = V2_BASE_LAYER_FIELDS if index == 0 else V2_COMPONENT_LAYER_FIELDS
+        _reject_additional_properties(layer, allowed, field)
+        expected_role = "base" if index == 0 else "component"
+        if role != expected_role:
+            raise ValueError(f"{field}.role deve ser {expected_role}")
+        layer_id = layer.get("id")
+        if not isinstance(layer_id, str) or not layer_id.strip():
+            raise ValueError(f"{field}.id é obrigatório")
+        if layer_id in ids:
+            raise ValueError("layers.id deve ser único")
+        ids.append(layer_id)
+        z = layer.get("z")
+        if type(z) is not int:
+            raise ValueError(f"{field}.z deve ser inteiro")
+        z_values.append(z)
+        if layer.get("blend_mode") != "alpha_over":
+            raise ValueError(f"{field}.blend_mode deve ser alpha_over")
+        layer["file"] = _portable_path(layer.get("file"), f"{field}.file")
+        if index == 0:
+            if layer.get("immutable") is not True:
+                raise ValueError("layers[0].immutable deve ser true")
+            continue
+        kind = layer.get("kind")
+        if not isinstance(kind, str) or not kind.strip():
+            raise ValueError(f"{field}.kind é obrigatório")
+        occlusion = layer.get("occlusion")
+        if not isinstance(occlusion, dict):
+            raise ValueError(f"{field}.occlusion deve ser um objeto")
+        _reject_additional_properties(occlusion, V2_OCCLUSION_FIELDS, f"{field}.occlusion")
+        if occlusion.get("mode") != "baked_visible":
+            raise ValueError(f"{field}.occlusion.mode deve ser baked_visible")
+        occlusion["visible_mask"] = _portable_path(
+            occlusion.get("visible_mask"), f"{field}.occlusion.visible_mask"
+        )
+        occluders = occlusion.get("occluders")
+        if (
+            not isinstance(occluders, list)
+            or not occluders
+            or any(not isinstance(item, str) or not item.strip() for item in occluders)
+            or len(set(occluders)) != len(occluders)
+        ):
+            raise ValueError(f"{field}.occlusion.occluders deve conter ids únicos")
+
+    if len(set(z_values)) != len(z_values) or z_values != sorted(z_values):
+        raise ValueError("layers.z deve ser único e estar em ordem crescente")
+    known_ids = set(ids)
+    for index, layer in enumerate(layers[1:], start=1):
+        occluders = layer["occlusion"]["occluders"]
+        unknown = sorted(set(occluders) - known_ids)
+        if unknown or layer["id"] in occluders:
+            raise ValueError(
+                f"layers[{index}].occlusion.occluders deve referenciar outras layers válidas"
+            )
+
+    manifest["preview"] = _portable_path(manifest.get("preview"), "preview")
+    source = manifest.get("source")
+    if not isinstance(source, dict):
+        raise ValueError("source deve ser um objeto")
+    try:
+        json.dumps(source, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"source deve conter apenas valores JSON: {exc}") from None
+
+    hashes = manifest.get("hashes")
+    if not isinstance(hashes, dict):
+        raise ValueError("hashes deve ser um objeto")
+    artifact_paths = _artifact_paths_v2(manifest)
+    expected_paths = [path for _field, path in artifact_paths]
+    if len(set(expected_paths)) != len(expected_paths):
+        raise ValueError("todos os artefatos v2 devem usar paths únicos")
+    if set(hashes) != set(expected_paths):
+        raise ValueError("hashes deve cobrir exatamente todos os arquivos do bundle")
+    for path in expected_paths:
+        digest = hashes.get(path)
+        if not isinstance(digest, str) or not SHA256_PATTERN.fullmatch(digest):
+            raise ValueError(f"hashes[{path}] deve ser um SHA-256 hexadecimal")
+
+    if root is not None:
+        root_resolved = root.expanduser().resolve()
+        expected_size = (cell_size[0] * columns, cell_size[1] * rows)
+        for field, relative in artifact_paths:
+            path = (root_resolved / relative).resolve()
+            if not path.is_relative_to(root_resolved):
+                raise ValueError(f"{field} deve permanecer dentro da raiz do bundle")
+            if not path.is_file():
+                raise ValueError(f"{field} não existe: {relative}")
+            if _png_size(path, field) != expected_size:
+                raise ValueError(
+                    f"{field} possui dimensões diferentes do layout {expected_size}"
+                )
+            if _sha256(path) != hashes[relative]:
+                raise ValueError(f"hashes[{relative}] não corresponde ao arquivo")
+    return manifest
+
+
 def validate_layered_bundle(
     manifest: Any,
     root: Path | None = None,
 ) -> dict[str, Any]:
-    """Validate structure and, when root is supplied, files and hashes."""
+    """Validate a v1 or v2 bundle and optionally verify its files and hashes."""
     if not isinstance(manifest, dict):
         raise ValueError("manifest deve ser um objeto JSON")
+    if manifest.get("schema") == LAYERED_BUNDLE_SCHEMA_V2:
+        return validate_layered_bundle_v2(manifest, root)
     _reject_additional_properties(manifest, MANIFEST_FIELDS, "manifest")
     if manifest.get("schema") != LAYERED_BUNDLE_SCHEMA:
         raise ValueError(f"schema inválido: {manifest.get('schema')}")
@@ -865,6 +1150,205 @@ def build_layered_bundle(
         "hashes": hashes,
     }
     return validate_layered_bundle(manifest, root_resolved)
+
+
+def default_layered_runtime(
+    cell_size: Sequence[int],
+    *,
+    rows: int = GRID_ROWS,
+    columns: int = GRID_COLUMNS,
+    fps: float = 12.0,
+    action_id: str = "default",
+    loop: bool = True,
+    directions: Sequence[Mapping[str, Any]] | None = None,
+    pivot: Sequence[int | float] | None = None,
+    foot_anchor: Sequence[int | float] | None = None,
+) -> dict[str, Any]:
+    """Create explicit runtime metadata for a row-by-direction sprite atlas."""
+    size = list(cell_size)
+    if len(size) != 2 or any(type(value) is not int or value <= 0 for value in size):
+        raise ValueError("cell_size deve conter dois inteiros positivos")
+    if type(rows) is not int or type(columns) is not int or rows < 1 or columns < 1:
+        raise ValueError("rows e columns devem ser inteiros positivos")
+    if directions is None:
+        canonical = (
+            ("north", [0, 1]),
+            ("north_east", [1, 1]),
+            ("east", [1, 0]),
+            ("south_east", [1, -1]),
+            ("south", [0, -1]),
+            ("south_west", [-1, -1]),
+            ("west", [-1, 0]),
+            ("north_west", [-1, 1]),
+        )
+        direction_values = [
+            {
+                "id": canonical[index][0] if rows == 8 else f"direction_{index + 1}",
+                "row": index + 1,
+                "vector": canonical[index][1] if rows == 8 else [0, 0],
+            }
+            for index in range(rows)
+        ]
+    else:
+        direction_values = [copy.deepcopy(dict(value)) for value in directions]
+    runtime = {
+        "actions": [
+            {
+                "id": str(action_id).strip(),
+                "start_column": 1,
+                "frame_count": columns,
+                "loop": loop,
+            }
+        ],
+        "fps": fps,
+        "directions": direction_values,
+        "frame_size": size,
+        "coordinate_space": "cell_pixels_top_left",
+        "pivot": list(pivot) if pivot is not None else [size[0] / 2, size[1]],
+        "foot_anchor": (
+            list(foot_anchor)
+            if foot_anchor is not None
+            else [size[0] / 2, size[1]]
+        ),
+    }
+    return _validate_runtime_v2(runtime, rows=rows, columns=columns, cell_size=size)
+
+
+def build_layered_bundle_v2(
+    root: Path,
+    *,
+    base: Mapping[str, Any],
+    components: Sequence[Mapping[str, Any]],
+    preview: Path | str,
+    source: dict[str, Any],
+    runtime: Mapping[str, Any] | None = None,
+    rows: int = GRID_ROWS,
+    columns: int = GRID_COLUMNS,
+) -> dict[str, Any]:
+    """Build a modular manifest from an immutable base and visible components.
+
+    Each component ``file`` contains only pixels that remain visible after
+    holdout.  ``visible_mask`` records that visibility decision independently,
+    so consumers never need to cut or mutate the base character at runtime.
+    """
+    root_resolved = Path(root).expanduser().resolve()
+    if not isinstance(base, Mapping):
+        raise ValueError("base deve ser um objeto")
+    if not isinstance(components, Sequence) or isinstance(components, (str, bytes)) or not components:
+        raise ValueError("components deve conter ao menos um componente")
+    if any(not isinstance(component, Mapping) for component in components):
+        raise ValueError("cada component deve ser um objeto")
+
+    base_id = str(base.get("id") or "").strip()
+    if not base_id:
+        raise ValueError("base.id é obrigatório")
+    base_file = base.get("file")
+    if base_file is None:
+        raise ValueError("base.file é obrigatório")
+    base_path, base_relative = _source_path(root_resolved, base_file, "base.file")
+    entries: list[tuple[str, Path, str]] = [("base.file", base_path, base_relative)]
+    component_layers: list[dict[str, Any]] = []
+    for index, component in enumerate(components):
+        field = f"components[{index}]"
+        component_id = str(component.get("id") or "").strip()
+        kind = str(component.get("kind") or component.get("role") or "").strip()
+        if not component_id:
+            raise ValueError(f"{field}.id é obrigatório")
+        if not kind:
+            raise ValueError(f"{field}.kind é obrigatório")
+        if component.get("file") is None:
+            raise ValueError(f"{field}.file é obrigatório")
+        visible_mask = component.get("visible_mask")
+        if visible_mask is None and isinstance(component.get("occlusion"), Mapping):
+            visible_mask = component["occlusion"].get("visible_mask")
+        if visible_mask is None:
+            raise ValueError(f"{field}.visible_mask é obrigatório")
+        component_path, component_relative = _source_path(
+            root_resolved, component["file"], f"{field}.file"
+        )
+        mask_path, mask_relative = _source_path(
+            root_resolved, visible_mask, f"{field}.visible_mask"
+        )
+        entries.extend(
+            (
+                (f"{field}.file", component_path, component_relative),
+                (f"{field}.visible_mask", mask_path, mask_relative),
+            )
+        )
+        occluders = component.get("occluders")
+        if occluders is None and isinstance(component.get("occlusion"), Mapping):
+            occluders = component["occlusion"].get("occluders")
+        if occluders is None:
+            occluders = [base_id]
+        component_layers.append(
+            {
+                "id": component_id,
+                "role": "component",
+                "kind": kind,
+                "file": component_relative,
+                "z": component.get("z"),
+                "blend_mode": "alpha_over",
+                "occlusion": {
+                    "mode": "baked_visible",
+                    "visible_mask": mask_relative,
+                    "occluders": copy.deepcopy(occluders),
+                },
+            }
+        )
+    preview_path, preview_relative = _source_path(root_resolved, preview, "preview")
+    entries.append(("preview", preview_path, preview_relative))
+
+    for field, path, relative in entries:
+        if not path.is_file():
+            raise ValueError(f"{field} não existe: {relative}")
+    relative_paths = [relative for _field, _path, relative in entries]
+    if len(set(relative_paths)) != len(relative_paths):
+        raise ValueError("todos os artefatos v2 devem usar paths únicos")
+    dimensions = {field: _png_size(path, field) for field, path, _relative in entries}
+    if len(set(dimensions.values())) != 1:
+        detail = ", ".join(f"{field}={size}" for field, size in dimensions.items())
+        raise ValueError(f"os PNGs possuem dimensões diferentes: {detail}")
+    width, height = next(iter(dimensions.values()))
+    if type(rows) is not int or type(columns) is not int or rows < 1 or columns < 1:
+        raise ValueError("rows e columns devem ser inteiros positivos")
+    if width % columns or height % rows:
+        raise ValueError("as dimensões dos PNGs devem ser divisíveis pela grade")
+    cell_size = [width // columns, height // rows]
+
+    runtime_value = (
+        copy.deepcopy(dict(runtime))
+        if isinstance(runtime, Mapping)
+        else default_layered_runtime(cell_size, rows=rows, columns=columns)
+    )
+    base_z = base.get("z", 0)
+    manifest = {
+        "schema": LAYERED_BUNDLE_SCHEMA_V2,
+        "generation_mode": GENERATION_MODE_V2,
+        "layout": {"rows": rows, "columns": columns, "cell_size": cell_size},
+        "runtime": runtime_value,
+        "layers": [
+            {
+                "id": base_id,
+                "role": "base",
+                "file": base_relative,
+                "z": base_z,
+                "immutable": True,
+                "blend_mode": "alpha_over",
+            },
+            *component_layers,
+        ],
+        "preview": preview_relative,
+        "source": copy.deepcopy(source),
+        "hashes": {
+            relative: _sha256(path) for _field, path, relative in entries
+        },
+    }
+    return validate_layered_bundle_v2(manifest, root_resolved)
+
+
+# More descriptive aliases for new consumers.
+build_modular_layered_bundle = build_layered_bundle_v2
+validate_modular_layered_bundle = validate_layered_bundle_v2
 
 
 def _publication_source_path(
@@ -1037,5 +1521,161 @@ def publish_layered_bundle(
         raise
 
 
+def publish_layered_bundle_v2(
+    source_root: Path,
+    destination: Path,
+    *,
+    base: Mapping[str, Any],
+    components: Sequence[Mapping[str, Any]],
+    preview: Path | str,
+    source: dict[str, Any],
+    runtime: Mapping[str, Any],
+    rows: int = GRID_ROWS,
+    columns: int = GRID_COLUMNS,
+    provenance: Mapping[str, Any] | Sequence[Mapping[str, Any]] | None = None,
+    config: Any = None,
+    hash_file: Callable[[Path], str] | None = None,
+) -> dict[str, Any]:
+    """Atomically publish a v2 bundle while preserving portable artifact paths."""
+    root = Path(source_root).expanduser().resolve()
+    target = Path(destination).expanduser().resolve()
+    if not root.is_dir():
+        raise ValueError(f"source_root não existe: {root}")
+    if target.exists() or target.is_symlink():
+        raise FileExistsError(f"bundle publicado já existe: {target}")
+    if target == root or target.is_relative_to(root):
+        raise ValueError("destination deve ser separado da raiz de trabalho")
+    if not isinstance(base, Mapping):
+        raise ValueError("base deve ser um objeto")
+    if not isinstance(components, Sequence) or isinstance(components, (str, bytes)):
+        raise ValueError("components deve ser uma lista")
+
+    base_copy = copy.deepcopy(dict(base))
+    component_copies = [copy.deepcopy(dict(component)) for component in components]
+    specs: list[tuple[str, Any]] = [("base.file", base_copy.get("file"))]
+    for index, component in enumerate(component_copies):
+        specs.append((f"components[{index}].file", component.get("file")))
+        visible_mask = component.get("visible_mask")
+        if visible_mask is None and isinstance(component.get("occlusion"), Mapping):
+            visible_mask = component["occlusion"].get("visible_mask")
+        specs.append((f"components[{index}].visible_mask", visible_mask))
+    specs.append(("preview", preview))
+
+    source_paths: dict[str, Path] = {}
+    relative_paths: dict[str, str] = {}
+    for field, value in specs:
+        raw = value.as_posix() if isinstance(value, Path) else value
+        relative = _portable_path(raw, field)
+        path = (root / relative).resolve()
+        if not path.is_relative_to(root):
+            raise ValueError(f"{field} deve permanecer dentro da raiz de publicação")
+        if not path.is_file():
+            raise ValueError(f"{field} não existe: {relative}")
+        source_paths[field] = path
+        relative_paths[field] = relative
+    if len(set(relative_paths.values())) != len(relative_paths):
+        raise ValueError("todos os artefatos v2 devem usar paths únicos")
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(
+        tempfile.mkdtemp(prefix=f".{target.name}.staging-", dir=str(target.parent))
+    )
+    try:
+        for field, path in source_paths.items():
+            staged = staging / relative_paths[field]
+            staged.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, staged)
+        manifest = build_layered_bundle_v2(
+            staging,
+            base=base_copy,
+            components=component_copies,
+            preview=relative_paths["preview"],
+            source=copy.deepcopy(source),
+            runtime=copy.deepcopy(dict(runtime)),
+            rows=rows,
+            columns=columns,
+        )
+        manifest_path = staging / "layered_sprite_bundle.json"
+        manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False)
+            + "\n",
+            encoding="utf-8",
+        )
+        validate_layered_bundle_v2(
+            json.loads(manifest_path.read_text(encoding="utf-8")), staging
+        )
+
+        provenance_specs = _registry_specs(provenance)
+        explicit_roles = set(provenance_specs)
+        provenance_specs.setdefault(
+            "base_output",
+            {
+                "path": relative_paths["base.file"],
+                "root": "published",
+                "category": "processed_output",
+            },
+        )
+        for index, component in enumerate(component_copies):
+            provenance_specs.setdefault(
+                f"component_{index}_output",
+                {
+                    "path": relative_paths[f"components[{index}].file"],
+                    "root": "published",
+                    "category": "processed_output",
+                },
+            )
+            provenance_specs.setdefault(
+                f"component_{index}_visible_mask",
+                {
+                    "path": relative_paths[f"components[{index}].visible_mask"],
+                    "root": "published",
+                    "category": "final_mask",
+                },
+            )
+        provenance_specs.setdefault(
+            "preview_output",
+            {
+                "path": relative_paths["preview"],
+                "root": "published",
+                "category": "preview",
+            },
+        )
+        hasher = hash_file or _sha256
+        registry = build_artifact_hash_registry(
+            root,
+            provenance_specs,
+            manifest={
+                "path": manifest_path.name,
+                "root": "published",
+                "category": "manifest",
+            },
+            config=copy.deepcopy(config) if config is not None else copy.deepcopy(source),
+            roots={"source": root, "published": staging},
+            hash_file=hasher,
+            require_complete=False,
+            require_hashes=provenance is not None,
+            required_hash_roles=explicit_roles,
+        )
+        registry_path = staging / ARTIFACT_HASH_REGISTRY_FILENAME
+        registry_path.write_text(
+            json.dumps(registry, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False)
+            + "\n",
+            encoding="utf-8",
+        )
+        validate_artifact_hash_registry(
+            json.loads(registry_path.read_text(encoding="utf-8")),
+            {"source": root, "published": staging},
+            hash_file=hasher,
+        )
+        if target.exists() or target.is_symlink():
+            raise FileExistsError(f"bundle publicado já existe: {target}")
+        staging.replace(target)
+        return manifest
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+
 # Keep a concise alias for callers that refer to the operation as publishing.
 publish_bundle = publish_layered_bundle
+publish_modular_layered_bundle = publish_layered_bundle_v2

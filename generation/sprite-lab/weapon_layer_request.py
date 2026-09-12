@@ -92,7 +92,13 @@ def build_weapon_layer_request(
         if not path.is_file():
             raise FileNotFoundError(path)
 
-    weapon_item = _role_item(reference_manifest, "weapon_reference", "weapon_identity")
+    weapon_item = _role_item(
+        reference_manifest,
+        "weapon_reference",
+        "weapon_identity",
+        "component_reference",
+        "component_identity",
+    )
     character_item = _role_item(reference_manifest, "character_full", "character")
     weapon_index = reference_manifest.index(weapon_item)
     character_index = reference_manifest.index(character_item)

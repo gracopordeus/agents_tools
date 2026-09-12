@@ -57,7 +57,9 @@ const IMAGE_PROVIDER_DEFAULT_BACKGROUNDS = Object.freeze({
 });
 const AI_RENDER_REFERENCE_CHANNELS = Object.freeze(["beauty", "bones", "lineart", "frame_control"]);
 const IDENTITY_GUIDE_MODES = Object.freeze(["lineart_standard", "canny_edges"]);
-const AI_RENDER_GENERATION_MODES = Object.freeze(["single_sheet", "character_weapon_holdout"]);
+const AI_RENDER_GENERATION_MODES = Object.freeze([
+  "single_sheet", "character_component_holdout", "character_weapon_holdout",
+]);
 const DEFAULT_GEMINI_TEMPERATURE = 1;
 const DEFAULT_GEMINI_TOP_K = 64;
 const DEFAULT_HOLDOUT_DILATION = 0;
@@ -132,8 +134,10 @@ function selectedGeminiSource() {
 function weaponComponentsForSource(source = selectedGeminiSource()) {
   const components = source?.inherited?.component_specs;
   if (!Array.isArray(components)) return [];
+  const generic = selectedAiGenerationMode() === "character_component_holdout";
   return components.filter((component) => (
-    component && component.visible !== false && String(component.role || "").trim().toLocaleLowerCase() === "weapon"
+    component && component.visible !== false
+    && (generic || String(component.role || "").trim().toLocaleLowerCase() === "weapon")
     && String(component.id || "").trim()
   ));
 }
@@ -145,12 +149,12 @@ function renderWeaponComponents() {
   const selected = selectedWeaponComponentId();
   const components = weaponComponentsForSource();
   select.innerHTML = components.length
-    ? `<option value="">Selecione uma arma visível</option>${components.map((component) => {
+    ? `<option value="">Selecione roupa, arma ou equipamento</option>${components.map((component) => {
       const label = component.name || component.asset_id || component.id;
       const attachment = component.attach_to || component.hand;
       return `<option value="${esc(component.id)}">${esc(label)}${attachment ? ` · ${esc(attachment)}` : ""}</option>`;
     }).join("")}`
-    : `<option value="">Nenhuma arma visível detectada</option>`;
+    : `<option value="">Nenhum componente visível detectado</option>`;
   if (components.some((component) => component.id === selected)) {
     select.value = selected;
   } else if (components.length === 1) {
@@ -159,15 +163,15 @@ function renderWeaponComponents() {
   select.disabled = components.length === 0;
   if (help) {
     help.textContent = components.length === 1
-      ? `Arma detectada: ${components[0].name || components[0].asset_id || components[0].id}.`
+      ? `Componente detectado: ${components[0].name || components[0].asset_id || components[0].id}.`
       : components.length > 1
-        ? "Mais de uma arma visível foi detectada; a POC aceita somente uma."
-        : "Nenhuma arma visível foi detectada neste render estrutural.";
+        ? "Mais de um componente foi detectado; selecione o que será separado neste job."
+        : "Nenhum componente visível foi detectado neste render estrutural.";
   }
 }
 
 function updateHoldoutControls() {
-  const holdout = selectedAiGenerationMode() === "character_weapon_holdout";
+  const holdout = selectedAiGenerationMode() !== "single_sheet";
   const controls = $("#gemini-holdout-controls");
   const weaponReference = $("#gemini-weapon-reference-card");
   const modeHelp = $("#gemini-generation-mode-help");
@@ -175,7 +179,7 @@ function updateHoldoutControls() {
   if (weaponReference) weaponReference.hidden = !holdout;
   if (modeHelp) {
     modeHelp.textContent = holdout
-      ? "Executa personagem e arma em passes separados e compõe o holdout na saída final."
+      ? "Executa base e equipamento em passes separados e compõe a visibilidade na saída final."
       : "Gera uma única spritesheet, preservando o fluxo atual.";
   }
   renderWeaponComponents();
@@ -246,7 +250,7 @@ function updateAiRenderSummary() {
   const summary = $("#ai-render-summary");
   if (!summary) return;
   const issues = [];
-  const holdout = selectedAiGenerationMode() === "character_weapon_holdout";
+  const holdout = selectedAiGenerationMode() !== "single_sheet";
   if (!$("#gemini-render-name")?.value.trim()) issues.push("nome do render");
   if (!$("#gemini-source")?.value) issues.push("render estrutural");
   if (!$("#gemini-reference")?.files?.length && !$("#gemini-reference-cache")?.value) issues.push("referência de identidade");
@@ -254,10 +258,10 @@ function updateAiRenderSummary() {
   if (!channels.length) issues.push("referência estrutural");
   if (selectedImageProvider() === "qwen" && channels.length > 1) issues.push("limite de 1 referência estrutural do Qwen");
   if (holdout) {
-    if (!weaponComponentsForSource().length) issues.push("arma visível no render estrutural");
-    if (!selectedWeaponComponentId()) issues.push("componente weapon");
+    if (!weaponComponentsForSource().length) issues.push("equipamento visível no render estrutural");
+    if (!selectedWeaponComponentId()) issues.push("componente destacável");
     if (!$("#weapon-reference")?.files?.length && !$("#weapon-reference-cache")?.value) {
-      issues.push("referência visual da arma");
+      issues.push("referência visual do equipamento");
     }
   }
   summary.classList.toggle("error", issues.length > 0);
@@ -452,7 +456,21 @@ function readAiRenderSpecFromForm() {
   };
   spec.version = "2.0";
   spec.generation_mode = selectedAiGenerationMode();
-  if (spec.generation_mode === "character_weapon_holdout") {
+  if (spec.generation_mode === "character_component_holdout") {
+    const componentId = selectedWeaponComponentId();
+    const component = weaponComponentsForSource().find((item) => item.id === componentId);
+    spec.layer_contract = {
+      base_id: "character_full",
+      component_ids: [componentId],
+      generation_order: ["character_full", componentId],
+      composition_order: ["character_full", componentId],
+      layers: [
+        { id: "character_full", role: "base", z: 0 },
+        { id: componentId, role: "component", kind: component?.role || "equipment", z: 1 },
+      ],
+      preview: null,
+    };
+  } else if (spec.generation_mode === "character_weapon_holdout") {
     spec.layer_contract = {
       weapon_component_id: selectedWeaponComponentId(),
       generation_order: ["character", "weapon"],
@@ -639,6 +657,10 @@ const HANDEDNESS_OPTIONS = [
 ];
 const COMPOSITION_ROLE_OPTIONS = [
   ["prop", "Prop"],
+  ["clothing", "Roupa"],
+  ["armor", "Armadura"],
+  ["hair", "Cabelo"],
+  ["accessory", "Acessório"],
   ["weapon", "Arma"],
   ["shield", "Escudo"],
   ["attachment", "Anexo"],
@@ -2188,6 +2210,23 @@ function populateSpriteCompositions() {
   const selected = select.value;
   select.innerHTML = `<option value="">Selecione uma composição</option>${options(state.relationships, selected, relationshipLabel)}`;
   if (selected && state.relationships.some((row) => row.id === selected)) select.value = selected;
+  populateSpriteLayerComponents();
+}
+
+function populateSpriteLayerComponents() {
+  const select = $("#sprite-layer-component");
+  if (!select) return;
+  const selected = select.value;
+  const relationship = state.relationships.find(
+    (item) => item.id === $("#sprite-composition")?.value,
+  );
+  const components = componentsFromRelationship(relationship).filter(
+    (component) => component.visible !== false && component.id,
+  );
+  select.innerHTML = `<option value="">Nenhuma · render combinado</option>${components.map(
+    (component) => `<option value="${esc(component.id)}">${esc(component.id)} · ${esc(component.role)}</option>`,
+  ).join("")}`;
+  if (components.some((component) => component.id === selected)) select.value = selected;
 }
 
 function populateRenderProfiles() {
@@ -2504,6 +2543,21 @@ async function renderSprites() {
     light_preset: "default",
     light_intensity: state.spriteLighting.intensity,
   };
+  const relationship = state.relationships.find((item) => item.id === relationshipId);
+  const selectedComponentId = $("#sprite-layer-component")?.value || "";
+  const selectedComponent = componentsFromRelationship(relationship).find(
+    (component) => component.id === selectedComponentId,
+  );
+  if (selectedComponent) {
+    payload.character_pass = true;
+    payload.component_holdout_pass = true;
+    payload.component_holdout_id = selectedComponent.id;
+    if (selectedComponent.role === "weapon") {
+      payload.weapon_pass = true;
+      payload.weapon_front_mask = true;
+      payload.weapon_component_id = selectedComponent.id;
+    }
+  }
   try {
     const job = await api("/api/sprite-render", { method: "POST", body: { payload } });
     state.spriteJobs = [...state.spriteJobs, job];
@@ -2520,6 +2574,8 @@ function initializeSprites() {
   populateCameraPresets();
   syncCameraRenderProfile();
   syncSpriteOutputMode();
+  const composition = $("#sprite-composition");
+  if (composition) composition.onchange = populateSpriteLayerComponents;
   ["sprite-render-profile", "sprite-output-mode", "sprite-profile", "sprite-resolution", "sprite-fps", "sprite-elevation", "sprite-azimuth", "sprite-camera-preset", "sprite-scale-mode", "sprite-asset-type", "sprite-representation", "sprite-capabilities"].forEach((id) => {
     const field = $("#" + id);
     if (!field) return;
@@ -2602,7 +2658,9 @@ function pipelineStageLabel(stage) {
 }
 
 function isLayeredGeminiJob(job) {
-  return job?.payload?.render_spec?.generation_mode === "character_weapon_holdout"
+  return ["character_weapon_holdout", "character_component_holdout"].includes(
+    job?.payload?.render_spec?.generation_mode,
+  )
     || job?.payload?.publish_layered_bundle === true
     || Boolean(job?.outputs?.character || job?.outputs?.weapon || job?.outputs?.layered_bundle);
 }
@@ -2780,12 +2838,13 @@ function layeredResultMarkup(job) {
   const layered = job.report?.layered || {};
   const publication = layered.publication || outputs.layered_bundle || {};
   const manifest = publication.manifest || {};
+  const modular = manifest.schema === "sprite_lab.layered_sprite_bundle/v2";
   const stages = [
     ["character", "Personagem", outputs.character || "character_full.png"],
-    ["weapon", "Arma", outputs.weapon || "weapon_full.png"],
-    ["composition", "Composição holdout", manifest.preview || "layered_sprite_bundle.json"],
+    ["weapon", modular ? "Equipamento visível" : "Arma", outputs.weapon || "weapon_full.png"],
+    ["composition", "Composição Alpha Over", manifest.preview || "layered_sprite_bundle.json"],
   ];
-  return `<section class="layered-result" data-layered-result="true"><div class="pipeline-output-head"><div><h3>Resultado das etapas</h3><p>Character → weapon → holdout, com cada checkpoint preservado.</p></div><span class="job-status done">${esc(pipelineStatusLabel("done"))}</span></div><div class="layered-result-grid">${stages.map(([id, label, artifact]) => `<div class="layered-result-card" data-result-layer="${esc(id)}"><strong>${esc(label)}</strong><span class="job-status done">${esc(pipelineStatusLabel("done"))}</span><small>${esc(String(artifact))}</small></div>`).join("")}</div></section>`;
+  return `<section class="layered-result" data-layered-result="true"><div class="pipeline-output-head"><div><h3>Resultado das etapas</h3><p>Base imutável → componente visível → composição, com cada checkpoint preservado.</p></div><span class="job-status done">${esc(pipelineStatusLabel("done"))}</span></div><div class="layered-result-grid">${stages.map(([id, label, artifact]) => `<div class="layered-result-card" data-result-layer="${esc(id)}"><strong>${esc(label)}</strong><span class="job-status done">${esc(pipelineStatusLabel("done"))}</span><small>${esc(String(artifact))}</small></div>`).join("")}</div></section>`;
 }
 
 function failedGeminiLayer(job) {
@@ -2851,13 +2910,17 @@ function renderGeminiJob(job) {
 }
 
 const PUBLISHED_LAYERED_ARTIFACT_KEYS = Object.freeze([
-  "character_holdout", "weapon", "holdout_source", "preview", "manifest", "hashes",
+  "character_full", "component_visible", "component_visibility_mask",
+  "preview", "manifest", "hashes",
 ]);
 
 function layeredBundleArtifacts(bundle) {
   if (Array.isArray(bundle?.artifacts)) return bundle.artifacts;
   const outputs = bundle?.outputs || {};
   const labels = {
+    character_full: "Personagem completo",
+    component_visible: "Equipamento visível",
+    component_visibility_mask: "Máscara de visibilidade",
     character_holdout: "Personagem · holdout",
     weapon: "Arma",
     holdout_source: "Máscara holdout",
@@ -2866,7 +2929,11 @@ function layeredBundleArtifacts(bundle) {
     hashes: "Registro de hashes",
   };
   const kinds = { character_holdout: "image", weapon: "image", holdout_source: "image", preview: "image", manifest: "json", hashes: "json" };
+  Object.assign(kinds, { character_full: "image", component_visible: "image", component_visibility_mask: "image" });
   const filenames = {
+    character_full: "character_full_spritesheet.png",
+    component_visible: "component_visible_spritesheet.png",
+    component_visibility_mask: "component_visibility_mask.png",
     character_holdout: "character_holdout_spritesheet.png",
     weapon: "weapon_spritesheet.png",
     holdout_source: "holdout_cut_mask.png",
@@ -2886,8 +2953,14 @@ function layeredBundleArtifacts(bundle) {
 function isPublishedLayeredBundle(bundle) {
   const layers = bundle?.manifest?.layers;
   if (!Array.isArray(layers) || layers.length < 2) return false;
+  if (bundle?.manifest?.schema === "sprite_lab.layered_sprite_bundle/v2") {
+    return layers[0]?.role === "base"
+      && layers[0]?.immutable === true
+      && layers.slice(1).every((layer) => layer?.role === "component");
+  }
   const ids = new Set(layers.map((layer) => String(layer?.id || "").trim()));
-  return ids.has("weapon") && ids.has("character_holdout");
+  return (ids.has("weapon") && ids.has("character_holdout"))
+    || (layers[0]?.role === "base" && layers.slice(1).every((layer) => layer?.role === "component"));
 }
 
 function decodePublishedLayeredUrl(value) {
@@ -3109,7 +3182,9 @@ function duplicateAiRenderJob(job, { announce = true } = {}) {
   renderGeminiReferences();
   renderWeaponReferences();
   updateHoldoutControls();
-  const weaponComponentId = payload.render_spec?.layer_contract?.weapon_component_id || "";
+  const weaponComponentId = payload.render_spec?.layer_contract?.weapon_component_id
+    || payload.render_spec?.layer_contract?.component_ids?.[0]
+    || "";
   const weaponComponent = $("#gemini-weapon-component");
   if (weaponComponent && [...weaponComponent.options].some((option) => option.value === weaponComponentId)) {
     weaponComponent.value = weaponComponentId;
@@ -3211,7 +3286,8 @@ async function generateGemini() {
   const file = $("#gemini-reference")?.files?.[0];
   let referenceId = $("#gemini-reference-cache")?.value || "";
   const weaponFile = $("#weapon-reference")?.files?.[0];
-  let weaponReferenceId = generationMode === "character_weapon_holdout"
+  const layeredMode = generationMode !== "single_sheet";
+  let weaponReferenceId = layeredMode
     ? $("#weapon-reference-cache")?.value || ""
     : "";
   const prompt = $("#gemini-prompt")?.value.trim() || "";
@@ -3259,12 +3335,12 @@ async function generateGemini() {
     toast("Selecione ou envie uma imagem de referência", true);
     return;
   }
-  if (generationMode === "character_weapon_holdout" && !selectedWeaponComponentId()) {
+  if (layeredMode && !selectedWeaponComponentId()) {
     toast("Selecione o componente weapon detectado", true);
     $("#gemini-weapon-component")?.focus();
     return;
   }
-  if (generationMode === "character_weapon_holdout" && !weaponFile && !weaponReferenceId) {
+  if (layeredMode && !weaponFile && !weaponReferenceId) {
     toast("Selecione ou envie uma referência visual da arma", true);
     return;
   }
@@ -3281,7 +3357,7 @@ async function generateGemini() {
       $("#gemini-reference-cache").value = cached.reference.id;
       referenceId = cached.reference.id;
     }
-    if (generationMode === "character_weapon_holdout" && weaponFile) {
+    if (layeredMode && weaponFile) {
       const cached = await api("/api/weapon/references", { method: "POST", body: { name: weaponFile.name, reference_data: await fileToDataUrl(weaponFile) } });
       state.weaponReferences = [cached.reference, ...state.weaponReferences];
       renderWeaponReferences();
@@ -3309,7 +3385,7 @@ async function generateGemini() {
         reference_name: state.geminiReferences.find((reference) => reference.id === referenceId)?.name || file?.name || "identity reference",
         identity_lineart_mode: selectedIdentityGuideMode(),
         reference_data: "",
-        publish_layered_bundle: generationMode === "character_weapon_holdout",
+        publish_layered_bundle: layeredMode,
         holdout_dilation: selectedHoldoutDilation(),
         holdout_tolerance: selectedHoldoutTolerance(),
       },

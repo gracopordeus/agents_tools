@@ -19,9 +19,11 @@ SUPPORTED_OUTPUT_SIZES = (1024, 2048)
 DEFAULT_BACKGROUND = "transparent"
 GENERATION_MODE_SINGLE_SHEET = "single_sheet"
 GENERATION_MODE_CHARACTER_WEAPON_HOLDOUT = "character_weapon_holdout"
+GENERATION_MODE_CHARACTER_COMPONENT_HOLDOUT = "character_component_holdout"
 GENERATION_MODES = (
     GENERATION_MODE_SINGLE_SHEET,
     GENERATION_MODE_CHARACTER_WEAPON_HOLDOUT,
+    GENERATION_MODE_CHARACTER_COMPONENT_HOLDOUT,
 )
 HOLDOUT_GENERATION_ORDER = ("character", "weapon")
 HOLDOUT_COMPOSITION_ORDER = ("weapon", "character_holdout")
@@ -344,6 +346,124 @@ def select_weapon_component(
     }
 
 
+def select_layer_components(
+    source_contract: Any,
+    *,
+    component_ids: list[str] | tuple[str, ...] | None = None,
+) -> list[dict[str, Any]]:
+    """Select visible source components in deterministic composition order."""
+    raw_components = (
+        source_contract.get("components")
+        if isinstance(source_contract, dict)
+        else None
+    )
+    components = (
+        [component for component in raw_components if isinstance(component, dict)]
+        if isinstance(raw_components, list)
+        else []
+    )
+    visible = [component for component in components if _bool(component.get("visible"), True)]
+    by_id: dict[str, dict[str, Any]] = {}
+    for component in visible:
+        component_id = _clean_text(component.get("id"))
+        if not component_id:
+            raise ValueError("todo componente visível deve declarar id")
+        if component_id in by_id:
+            raise ValueError(f"id de componente visível duplicado: {component_id}")
+        by_id[component_id] = component
+    requested = list(component_ids) if component_ids is not None else list(by_id)
+    if not requested:
+        raise ValueError("component_ids deve selecionar ao menos um componente visível")
+    if any(not isinstance(item, str) or not item.strip() for item in requested):
+        raise ValueError("component_ids deve conter ids não vazios")
+    if len(set(requested)) != len(requested):
+        raise ValueError("component_ids não pode conter ids duplicados")
+    missing = [component_id for component_id in requested if component_id not in by_id]
+    if missing:
+        raise ValueError(
+            "component_ids não identifica componentes visíveis: " + ", ".join(missing)
+        )
+    return [copy.deepcopy(by_id[component_id]) for component_id in requested]
+
+
+def _normalize_modular_layer_contract(
+    value: Any,
+    source_contract: Any,
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(
+            "layer_contract deve ser um objeto no modo character_component_holdout"
+        )
+    base_id = _clean_text(_aliased_value(value, "base_id", "baseId"), "character_full")
+    raw_component_ids = _aliased_value(value, "component_ids", "componentIds")
+    if not isinstance(raw_component_ids, list):
+        raise ValueError("layer_contract.component_ids deve ser uma lista")
+    component_ids = [_clean_text(item) for item in raw_component_ids]
+    selected = select_layer_components(source_contract, component_ids=component_ids)
+    expected_order = [base_id, *component_ids]
+    generation_order = _aliased_value(value, "generation_order", "generationOrder")
+    composition_order = _aliased_value(value, "composition_order", "compositionOrder")
+    if generation_order != expected_order:
+        raise ValueError(
+            "layer_contract.generation_order deve listar a base seguida dos component_ids"
+        )
+    if composition_order != expected_order:
+        raise ValueError(
+            "layer_contract.composition_order deve listar a base seguida dos component_ids"
+        )
+
+    layers = value.get("layers")
+    if not isinstance(layers, list) or len(layers) != len(expected_order):
+        raise ValueError("layer_contract.layers deve declarar a base e todos os componentes")
+    normalized_layers: list[dict[str, Any]] = []
+    z_values: list[int] = []
+    selected_by_id = {_clean_text(component.get("id")): component for component in selected}
+    for index, expected_id in enumerate(expected_order):
+        layer = layers[index]
+        if not isinstance(layer, dict) or _clean_text(layer.get("id")) != expected_id:
+            raise ValueError("layer_contract.layers deve seguir composition_order")
+        try:
+            z = int(layer.get("z"))
+        except (TypeError, ValueError):
+            raise ValueError(f"layer_contract.layers[{index}].z deve ser inteiro") from None
+        if isinstance(layer.get("z"), bool) or z != layer.get("z"):
+            raise ValueError(f"layer_contract.layers[{index}].z deve ser inteiro")
+        z_values.append(z)
+        normalized_layer: dict[str, Any] = {
+            "id": expected_id,
+            "role": "base" if index == 0 else "component",
+            "z": z,
+        }
+        if index:
+            component = selected_by_id[expected_id]
+            normalized_layer["kind"] = _clean_text(
+                layer.get("kind") or component.get("role"), "component"
+            )
+            normalized_layer["source_component_id"] = expected_id
+        file_name = _relative_artifact_path(
+            layer.get("file"), f"layer_contract.layers[{index}].file"
+        )
+        if file_name:
+            normalized_layer["file"] = file_name
+        normalized_layers.append(normalized_layer)
+    if len(set(z_values)) != len(z_values) or z_values != sorted(z_values):
+        raise ValueError("layer_contract.layers.z deve ser único e crescente")
+
+    preview_value = value.get("preview")
+    if preview_value is not None and not isinstance(preview_value, str):
+        raise ValueError("layer_contract.preview deve ser string ou null")
+    preview = _relative_artifact_path(preview_value, "layer_contract.preview")
+    return {
+        "version": 2,
+        "base_id": base_id,
+        "component_ids": component_ids,
+        "generation_order": expected_order,
+        "composition_order": expected_order,
+        "layers": normalized_layers,
+        "preview": preview or None,
+    }
+
+
 def _normalize_layer_contract(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(
@@ -441,12 +561,19 @@ def normalize_render_spec(
     )
     if generation_mode not in GENERATION_MODES:
         raise ValueError(
-            "generation_mode deve ser single_sheet ou character_weapon_holdout"
+            "generation_mode deve ser single_sheet, character_weapon_holdout "
+            "ou character_component_holdout"
         )
     spec["generation_mode"] = generation_mode
+    source_contract = incoming.get("source_contract")
     if generation_mode == GENERATION_MODE_CHARACTER_WEAPON_HOLDOUT:
         layer_contract = _aliased_value(incoming, "layer_contract", "layerContract")
         spec["layer_contract"] = _normalize_layer_contract(layer_contract)
+    elif generation_mode == GENERATION_MODE_CHARACTER_COMPONENT_HOLDOUT:
+        layer_contract = _aliased_value(incoming, "layer_contract", "layerContract")
+        spec["layer_contract"] = _normalize_modular_layer_contract(
+            layer_contract, source_contract
+        )
 
     output = incoming.get("output") if isinstance(incoming.get("output"), dict) else {}
     requested_width = output.get("width", OUTPUT_SIZE)
@@ -561,7 +688,6 @@ def normalize_render_spec(
             }
 
     spec["version"] = "2.0"
-    source_contract = incoming.get("source_contract")
     if isinstance(source_contract, dict):
         spec["source_contract"] = copy.deepcopy(source_contract)
     if generation_mode == GENERATION_MODE_CHARACTER_WEAPON_HOLDOUT:
@@ -1402,6 +1528,109 @@ Preserve the exact gripping hand pose, finger placement, wrist angle and spacing
 Do not compose, position, infer or preview the weapon layer in this step. Composition is outside this prompt.
 Keep every empty pixel outside the character fully transparent RGBA."""
     return layer_contract + "\n\n" + shared_prompt
+
+
+def compile_modular_layer_prompt(
+    spec: dict[str, Any],
+    reference_manifest: list[dict[str, Any]],
+    *,
+    layer_id: str,
+    additional_instructions: str = "",
+) -> str:
+    """Compile an isolated base or arbitrary equipment layer for the v2 flow."""
+    normalized = normalize_render_spec(spec)
+    if normalized["generation_mode"] != GENERATION_MODE_CHARACTER_COMPONENT_HOLDOUT:
+        raise ValueError(
+            "compile_modular_layer_prompt exige generation_mode character_component_holdout"
+        )
+    contract = normalized["layer_contract"]
+    requested_id = _clean_text(layer_id)
+    known_ids = contract["composition_order"]
+    if requested_id not in known_ids:
+        raise ValueError(
+            f"layer_id desconhecido: {requested_id}; esperado um de {known_ids}"
+        )
+    extra = _clean_text(additional_instructions)
+    source_contract = normalized.get("source_contract")
+    source_contract = source_contract if isinstance(source_contract, dict) else {}
+    conflicts = validate_additional_instructions(
+        extra,
+        mode=normalized["asset"]["mode"],
+        direction_rows=source_contract.get("directions"),
+    )
+    if conflicts:
+        raise ValueError(
+            "Instruções adicionais conflitam com o contrato fixo: " + "; ".join(conflicts)
+        )
+
+    if requested_id == contract["base_id"]:
+        base_spec = copy.deepcopy(normalized)
+        base_source = base_spec.get("source_contract")
+        if isinstance(base_source, dict):
+            base_source["components"] = []
+        shared_prompt = _compile_character_prompt(
+            base_spec, reference_manifest, extra
+        ).replace(
+            "the uploaded 8x8 beauty spritesheet",
+            "the uploaded 8x8 character-only structural reference",
+            1,
+        )
+        excluded = ", ".join(contract["component_ids"])
+        return (
+            "IMMUTABLE BASE LAYER CONTRACT — REQUIRED\n"
+            "Generate only the complete character base. Do not draw any detachable "
+            f"component selected for another layer ({excluded}). Preserve pose, hands, "
+            "camera, frame registration and foot anchor. Empty pixels must be transparent "
+            "RGBA. This base will be reused unchanged with every equipment combination; "
+            "never pre-cut holes for another layer.\n\n"
+            + shared_prompt
+        )
+
+    selected = select_layer_components(
+        source_contract, component_ids=[requested_id]
+    )[0]
+    layer = next(item for item in contract["layers"] if item["id"] == requested_id)
+    output = normalized["output"]
+    grid = output["grid"]
+    references = "\n".join(
+        f"IMAGE {item.get('index', index)} — "
+        f"{_clean_text(item.get('name') or item.get('type'), 'reference')}"
+        for index, item in enumerate(reference_manifest, start=1)
+    ) or "No image references were declared."
+    component_contract = {
+        "id": requested_id,
+        "kind": layer["kind"],
+        "source": selected,
+        "grid": {
+            "rows": grid["rows"],
+            "columns": grid["columns"],
+            "width": output["width"],
+            "height": output["height"],
+        },
+        "composition": {
+            "base_id": contract["base_id"],
+            "z": layer["z"],
+            "visibility": "computed after generation from Blender holdout/depth",
+        },
+    }
+    supplemental = (
+        f"\n\nSUPPLEMENTAL USER INSTRUCTIONS\n{extra}" if extra else ""
+    )
+    return f"""MODULAR COMPONENT LAYER CONTRACT — REQUIRED
+Generate only component {requested_id!r} ({layer['kind']}) on a transparent RGBA background. Do not draw the character, hands, body, another garment, another weapon, shadows, labels, grid lines or detached fragments from another component.
+
+Generate the complete component in its exact animated position, including portions that pass behind the character or another component. Do not cut it to the character silhouette and do not invent visibility. A deterministic Blender holdout/depth pass will create the visible mask after this image is generated.
+
+Preserve exactly {grid['rows']} rows by {grid['columns']} columns ({grid['rows'] * grid['columns']} cells), row directions, animation phase, camera, scale, pivot, foot anchor and cell boundaries. Keep all pixels inside their corresponding cell.
+
+REFERENCE ORDER
+{references}
+
+machineReadableComponentContract:
+{json.dumps(component_contract, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False)}
+
+Before returning the PNG, verify that every cell contains exactly one complete instance of {requested_id!r}, aligned to its structural guide, with no character pixels and no component from another layer.{supplemental}
+""".strip() + "\n"
 
 
 def compile_provider_prompt(

@@ -42,6 +42,14 @@ class SpriteRenderTests(unittest.TestCase):
             sprite_render.weapon_front_mask_requested({"weapon_front_mask": True})
         )
 
+    def test_component_holdout_request_is_explicitly_opt_in(self) -> None:
+        self.assertFalse(sprite_render.component_holdout_requested({}))
+        self.assertTrue(
+            sprite_render.component_holdout_requested(
+                {"component_holdout_pass": True}
+            )
+        )
+
     def test_layered_outputs_is_explicitly_opt_in(self) -> None:
         self.assertFalse(sprite_render.layered_outputs_requested({}))
         self.assertFalse(

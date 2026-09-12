@@ -13,6 +13,59 @@ import layered_compositor  # noqa: E402
 
 
 class LayeredCompositorTests(unittest.TestCase):
+    def test_v2_masks_component_and_never_changes_character(self) -> None:
+        character = np.array([[[10, 20, 30, 255], [40, 50, 60, 96]]], dtype=np.uint8)
+        component = np.array([[[200, 10, 20, 255], [30, 210, 40, 128]]], dtype=np.uint8)
+        visibility = np.array([[0, 255]], dtype=np.uint8)
+        original_character = character.copy()
+
+        visible, report = layered_compositor.apply_component_visibility(
+            component,
+            visibility,
+            grid=(1, 1),
+        )
+
+        np.testing.assert_array_equal(character, original_character)
+        self.assertEqual(visible.getpixel((0, 0)), (0, 0, 0, 0))
+        self.assertEqual(visible.getpixel((1, 0)), (30, 210, 40, 128))
+        self.assertTrue(report["character_preserved"])
+        self.assertTrue(report["component_masked"])
+
+    def test_v2_alpha_128_over_opaque_character_stays_opaque(self) -> None:
+        character = Image.new("RGBA", (1, 1), (0, 0, 255, 255))
+        component = Image.new("RGBA", (1, 1), (255, 0, 0, 128))
+        visibility = Image.new("L", (1, 1), 255)
+
+        visible, _report = layered_compositor.apply_component_visibility(
+            component,
+            visibility,
+            grid=(1, 1),
+        )
+        preview = layered_compositor.composite_component_over_character(
+            character,
+            visible,
+        )
+
+        self.assertEqual(visible.getpixel((0, 0)), (255, 0, 0, 128))
+        self.assertEqual(preview.getpixel((0, 0)), (128, 0, 127, 255))
+
+    def test_v2_visibility_dilation_never_crosses_cell_boundaries(self) -> None:
+        component_alpha = np.full((4, 4), 255, dtype=np.uint8)
+        visibility = np.zeros((4, 4), dtype=np.uint8)
+        visibility[1, 1] = 255
+
+        result = layered_compositor.calculate_component_visible_alpha(
+            component_alpha,
+            visibility,
+            grid=(2, 2),
+            dilation=1,
+        )
+
+        self.assertEqual(int(result[1, 1]), 255)
+        self.assertEqual(int(result[0, 0]), 255)
+        self.assertEqual(int(result[1, 2]), 0)
+        self.assertEqual(int(result[2, 1]), 0)
+
     def test_front_weapon_removes_character_alpha_without_changing_weapon(self) -> None:
         character_alpha = np.full((2, 2), 255, dtype=np.uint8)
         weapon_alpha = np.array([[255, 0], [0, 0]], dtype=np.uint8)

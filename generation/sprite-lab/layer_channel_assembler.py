@@ -18,6 +18,9 @@ LAYER_CHANNELS = {
     "weapon_silhouette": "weapon_silhouette_path",
     "weapon_front_mask": "weapon_front_mask_path",
 }
+OPTIONAL_LAYER_CHANNELS = {
+    "component_visible": "component_visible_path",
+}
 
 
 def _sha256(path: Path) -> str:
@@ -78,12 +81,19 @@ def assemble_channel(
 
 
 def assemble_layer_channels(output: Path, render_metadata: dict[str, Any]) -> dict[str, Any]:
-    return {
+    channels = {
         channel: assemble_channel(
             output, channel, render_metadata["cells"], path_field=path_field
         )
         for channel, path_field in LAYER_CHANNELS.items()
     }
+    cells = render_metadata.get("cells", [])
+    for channel, path_field in OPTIONAL_LAYER_CHANNELS.items():
+        if cells and all(str(cell.get(path_field) or "").strip() for cell in cells):
+            channels[channel] = assemble_channel(
+                output, channel, cells, path_field=path_field
+            )
+    return channels
 
 
 def layer_channels_metadata(
@@ -97,6 +107,9 @@ def layer_channels_metadata(
         "layer_channels": copy.deepcopy(channels),
         "weapon_component_id": weapon_component_id,
         "front_mask": "weapon_front_mask",
+        "visible_component": (
+            "component_visible" if "component_visible" in channels else None
+        ),
         "directions": list(render_metadata["directions"]),
         "sampled_frames": list(render_metadata["sampled_frames"]),
         "camera": copy.deepcopy(render_metadata["camera"]),

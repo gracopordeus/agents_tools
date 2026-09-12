@@ -20,6 +20,7 @@ def run_weapon_layer(
     provider: Any,
     update_state: Callable[[dict[str, Any]], None],
     additional_instructions: str = "",
+    layer_id: str = "weapon",
 ) -> dict[str, Any]:
     """Run or resume the weapon layer through the provider boundary."""
     # Check the approval boundary before request construction. This keeps an
@@ -31,12 +32,23 @@ def run_weapon_layer(
         weapon_layer_persistence.record_weapon_blocked(output_dir, str(exc))
         update_state({"stage": "weapon_blocked", "percent": 50})
         raise
-    prompt = ai_render_spec.compile_layer_prompt(
-        render_spec,
-        reference_manifest,
-        layer="weapon",
-        additional_instructions=additional_instructions,
-    )
+    if (
+        render_spec.get("generation_mode")
+        == ai_render_spec.GENERATION_MODE_CHARACTER_COMPONENT_HOLDOUT
+    ):
+        prompt = ai_render_spec.compile_modular_layer_prompt(
+            render_spec,
+            reference_manifest,
+            layer_id=layer_id,
+            additional_instructions=additional_instructions,
+        )
+    else:
+        prompt = ai_render_spec.compile_layer_prompt(
+            render_spec,
+            reference_manifest,
+            layer="weapon",
+            additional_instructions=additional_instructions,
+        )
     try:
         request = weapon_layer_request.build_weapon_layer_request(
             job_id=job_id,

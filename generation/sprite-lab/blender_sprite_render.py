@@ -49,6 +49,8 @@ from blender_conditioning_export import (  # noqa: E402
 from blender_layer_visibility import (  # noqa: E402
     character_pass_metadata,
     character_only_visibility,
+    component_holdout_pass_metadata,
+    component_holdout_visibility,
     component_id,
     weapon_only_visibility,
     weapon_pass_metadata,
@@ -838,6 +840,26 @@ def main() -> int:
             key: _material(f"__generation_front_mask_{key}", color)
             for key, color in front_mask_palette().items()
         }
+    component_holdout_pass = request.get("component_holdout_pass") is True
+    component_holdout_id = str(
+        request.get("component_holdout_id") or weapon_component_id
+    ).strip()
+    component_holdout_meta = next(
+        (item for item in component_meta if item.get("id") == component_holdout_id),
+        None,
+    )
+    component_holdout_occluders = request.get("component_holdout_occluder_ids")
+    if component_holdout_occluders is not None and (
+        not isinstance(component_holdout_occluders, list)
+        or any(not str(value).strip() for value in component_holdout_occluders)
+    ):
+        raise RuntimeError("component_holdout_occluder_ids inválido")
+    if component_holdout_pass:
+        if component_holdout_meta is None:
+            raise RuntimeError(
+                f"component_holdout_id '{component_holdout_id}' não identifica um componente anexado"
+            )
+        (output / "component_visible").mkdir(parents=True, exist_ok=True)
     dynamic_x = bool(effective_profile and effective_profile.get("dynamic_x", False))
     dynamic_y = bool(effective_profile and effective_profile.get("dynamic_y", False))
     for row, direction_yaw in enumerate(direction_yaws):
@@ -932,6 +954,18 @@ def main() -> int:
                     }
                 )
                 front_mask_reports.append(front_mask_report)
+            component_visible_path = None
+            if component_holdout_pass:
+                component_visible_path = (
+                    output / "component_visible" / f"row{row}_col{column}.png"
+                )
+                with component_holdout_visibility(
+                    semantic_objects,
+                    component_holdout_id,
+                    occluder_component_ids=component_holdout_occluders,
+                ):
+                    scene.render.filepath = str(component_visible_path)
+                    bpy.ops.render.render(write_still=True)
             cell = {
                 "row": row,
                 "direction": row_names[row],
@@ -951,6 +985,8 @@ def main() -> int:
                     front_segmentation_path
                 )
                 cell["weapon_front_mask_path"] = str(front_mask_path)
+            if component_holdout_pass:
+                cell["component_visible_path"] = str(component_visible_path)
             if dynamic_fit is not None:
                 offsets_world = dynamic_fit["offset_world"]
                 offsets_pixels = dynamic_fit["offset_pixels"]
@@ -1075,6 +1111,12 @@ def main() -> int:
     if front_mask_pass:
         metadata["weapon_front_mask"] = front_mask_metadata(
             metadata, front_mask_reports, front_mask_dilation
+        )
+    if component_holdout_pass:
+        metadata["component_holdout_pass"] = component_holdout_pass_metadata(
+            metadata,
+            component_holdout_meta,
+            component_holdout_occluders,
         )
     metadata_path = output / "render_metadata.json"
     metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")

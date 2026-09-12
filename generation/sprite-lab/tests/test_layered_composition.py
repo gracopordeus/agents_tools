@@ -70,6 +70,50 @@ class LayeredCompositionTests(unittest.TestCase):
                 self.assertEqual(character_sheet.getpixel((0, 0)), (0, 0, 0, 0))
                 self.assertEqual(character_sheet.getpixel((2, 0)), (10, 21, 30, 255))
 
+    def test_v2_keeps_character_full_and_masks_component_in_each_cell(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cells = self._cells(root)
+            random.Random(7).shuffle(cells)
+
+            outputs = layered_compositor.compose_layered_spritesheets_v2(
+                cells,
+                root / "out_v2",
+            )
+
+            self.assertEqual(outputs["schema"], "sprite_lab.layered_composition/v2")
+            self.assertEqual(
+                outputs["composition_order"],
+                ["character_full", "component_visible"],
+            )
+            self.assertTrue(outputs["character_immutable"])
+            self.assertEqual(outputs["cell_count"], 64)
+            self.assertEqual(outputs["grid"], [8, 8])
+            self.assertEqual(outputs["cell_size"], [2, 2])
+            self.assertEqual(
+                set(outputs["outputs"]),
+                {
+                    "character_full_spritesheet",
+                    "component_visible_spritesheet",
+                    "component_visibility_mask",
+                    "composite_preview",
+                },
+            )
+
+            with Image.open(outputs["character_full_spritesheet"]) as character:
+                self.assertEqual(character.size, (16, 16))
+                self.assertEqual(character.getpixel((0, 0)), (10, 20, 30, 255))
+                self.assertEqual(character.getpixel((2, 0)), (10, 21, 30, 255))
+            with Image.open(outputs["component_visible_spritesheet"]) as component:
+                self.assertEqual(component.getpixel((0, 0)), (180, 40, 70, 255))
+                self.assertEqual(component.getpixel((2, 0)), (0, 0, 0, 0))
+            with Image.open(outputs["component_visibility_mask"]) as mask:
+                self.assertEqual(mask.getpixel((0, 0)), (255, 255, 255, 255))
+                self.assertEqual(mask.getpixel((2, 0)), (255, 255, 255, 0))
+            with Image.open(outputs["composite_preview"]) as preview:
+                self.assertEqual(preview.getpixel((0, 0)), (180, 40, 70, 255))
+                self.assertEqual(preview.getpixel((2, 0)), (10, 21, 30, 255))
+
     def test_preview_places_weapon_below_character_or_exposes_front_weapon(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

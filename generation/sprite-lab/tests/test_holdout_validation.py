@@ -176,6 +176,69 @@ class HoldoutValidationTests(unittest.TestCase):
             persisted = json.loads(serialized)
             self.assertEqual(persisted, report)
 
+    def test_v2_gate_accepts_immutable_base_and_straight_alpha_over(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            character = Image.new("RGBA", (2, 1), (200, 100, 50, 255))
+            component = Image.new("RGBA", (2, 1), (20, 120, 220, 128))
+            mask = Image.new("L", (2, 1))
+            mask.putdata([255, 0])
+            visible = component.copy()
+            visible.putpixel((1, 0), (0, 0, 0, 0))
+            preview = Image.alpha_composite(character, visible)
+            paths = {}
+            for name, image in (
+                ("character_source", character),
+                ("character_full", character),
+                ("component_source", component),
+                ("visibility_mask", mask),
+                ("component_visible", visible),
+                ("preview", preview),
+            ):
+                path = root / f"{name}.png"
+                image.save(path, format="PNG")
+                paths[name] = path
+
+            report = holdout_validation.validate_layered_composition(
+                **paths,
+                grid=(1, 2),
+                output_path=root / "layered_validation.json",
+            )
+
+            self.assertTrue(report["validated"])
+            self.assertTrue(report["checks"]["character_immutable"])
+            self.assertTrue(report["checks"]["preview_is_alpha_over"])
+            self.assertEqual(preview.getpixel((0, 0))[3], 255)
+            self.assertTrue((root / "layered_validation.json").is_file())
+
+    def test_v2_gate_blocks_mutated_base_before_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            character = Image.new("RGBA", (1, 1), (200, 100, 50, 255))
+            changed_character = Image.new("RGBA", (1, 1), (200, 100, 50, 127))
+            component = Image.new("RGBA", (1, 1), (20, 120, 220, 128))
+            mask = Image.new("L", (1, 1), 255)
+            visible = component.copy()
+            preview = Image.alpha_composite(changed_character, visible)
+            paths = {}
+            for name, image in (
+                ("character_source", character),
+                ("character_full", changed_character),
+                ("component_source", component),
+                ("visibility_mask", mask),
+                ("component_visible", visible),
+                ("preview", preview),
+            ):
+                path = root / f"{name}.png"
+                image.save(path, format="PNG")
+                paths[name] = path
+
+            with self.assertRaisesRegex(ValueError, "character_immutable"):
+                holdout_validation.validate_layered_composition(
+                    **paths,
+                    grid=(1, 1),
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

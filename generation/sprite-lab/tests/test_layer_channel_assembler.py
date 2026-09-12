@@ -73,7 +73,36 @@ class LayerChannelAssemblerTests(unittest.TestCase):
         self.assertEqual(metadata["sampled_frames"], list(range(8)))
         self.assertEqual(metadata["camera"], {"type": "ORTHO"})
         self.assertEqual(metadata["front_mask"], "weapon_front_mask")
+        self.assertIsNone(metadata["visible_component"])
         self.assertEqual(metadata["layer_channels"]["weapon_beauty"]["path"], "weapon_beauty.png")
+
+    def test_assembles_optional_native_holdout_channel_when_present(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cells = self._cells(root)
+            required_fields = tuple(layer_channel_assembler.LAYER_CHANNELS.values())
+            for cell in cells:
+                source = cell["channel_path"]
+                for field in required_fields:
+                    cell[field] = source
+                cell["component_visible_path"] = source
+
+            channels = layer_channel_assembler.assemble_layer_channels(
+                root, {"cells": cells}
+            )
+            metadata = layer_channel_assembler.layer_channels_metadata(
+                {
+                    "directions": [f"r{i}" for i in range(8)],
+                    "sampled_frames": list(range(8)),
+                    "camera": {"type": "ORTHO"},
+                },
+                weapon_component_id="weapon_1",
+                channels=channels,
+            )
+
+            self.assertIn("component_visible", channels)
+            self.assertEqual(metadata["visible_component"], "component_visible")
+            self.assertTrue((root / "component_visible.png").is_file())
 
 
 if __name__ == "__main__":

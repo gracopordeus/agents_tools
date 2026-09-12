@@ -72,6 +72,11 @@ def weapon_front_mask_requested(payload: dict[str, Any]) -> bool:
     return payload.get("weapon_front_mask") is True
 
 
+def component_holdout_requested(payload: dict[str, Any]) -> bool:
+    """Keep the native Blender component holdout pass explicitly opt-in."""
+    return payload.get("component_holdout_pass") is True
+
+
 def layered_outputs_requested(payload: dict[str, Any]) -> bool:
     """Keep the complete structural atlas export explicitly opt-in."""
     return payload.get("layered_outputs") is True
@@ -823,6 +828,19 @@ def generate_sprite_render(
         "weapon_front_mask": layered_outputs or weapon_front_mask_requested(payload),
         "weapon_front_mask_dilation": payload.get(
             "weapon_front_mask_dilation", 0
+        ),
+        # The v2 channel is the actual Blender Holdout result used by modular
+        # consumers.  Legacy full-weapon and segmentation channels remain in
+        # the request so existing post-processing jobs stay reproducible.
+        "component_holdout_pass": (
+            layered_outputs or component_holdout_requested(payload)
+        ),
+        "component_holdout_id": (
+            payload.get("component_holdout_id")
+            or payload.get("weapon_component_id")
+        ),
+        "component_holdout_occluder_ids": payload.get(
+            "component_holdout_occluder_ids"
         ),
         "character_path": str(character_path),
         "animation_path": str(animation_path),

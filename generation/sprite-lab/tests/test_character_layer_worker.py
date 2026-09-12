@@ -15,6 +15,54 @@ from image_generation_provider import GenerationResult  # noqa: E402
 
 
 class CharacterLayerWorkerTests(unittest.TestCase):
+    def _modular_spec(self):
+        spec = ai_render_spec.default_render_spec(name="hero")
+        spec.update({
+            "generation_mode": "character_component_holdout",
+            "output": {**spec["output"], "width": 1024, "height": 1024},
+            "source_contract": {
+                "components": [{"id": "coat_1", "role": "clothing", "visible": True}],
+            },
+            "layer_contract": {
+                "base_id": "character_full",
+                "component_ids": ["coat_1"],
+                "generation_order": ["character_full", "coat_1"],
+                "composition_order": ["character_full", "coat_1"],
+                "layers": [
+                    {"id": "character_full", "role": "base", "z": 0},
+                    {"id": "coat_1", "role": "component", "kind": "clothing", "z": 1},
+                ],
+            },
+        })
+        return spec
+
+    def test_modular_mode_generates_an_immutable_base_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            identity, beauty = root / "identity.png", root / "beauty.png"
+            Image.new("RGBA", (1024, 1024)).save(identity)
+            Image.new("RGBA", (1024, 1024)).save(beauty)
+            provider = mock.Mock()
+
+            def generate(request):
+                Image.new("RGBA", (1024, 1024)).save(request.output_path)
+                return GenerationResult("ok", "fake", request.model, request.output_path, {})
+
+            provider.generate.side_effect = generate
+            result = character_layer_worker.run_character_layer(
+                job_id="job",
+                render_spec=self._modular_spec(),
+                reference_manifest=ai_render_spec.build_reference_manifest(["beauty"]),
+                input_images=[identity, beauty],
+                output_dir=root,
+                model="model",
+                provider=provider,
+                update_state=lambda _state: None,
+            )
+
+            self.assertIn("IMMUTABLE BASE LAYER CONTRACT", result["prompt"])
+            self.assertIn("coat_1", result["prompt"])
+
     def test_integrates_prompt_request_provider_state_and_resume(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
