@@ -5,6 +5,7 @@ import argparse
 import json
 import subprocess
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,8 @@ from PIL import Image
 import chroma_despill
 import huggingface_realesrgan
 import sprite_render
+from source_alpha_intersection import intersect_with_source_alpha
+from postprocess_runtime import add_runtime_arguments, validate_parallelism
 
 
 def _run(command: list[str], label: str) -> dict[str, Any]:
@@ -35,6 +38,53 @@ def _run(command: list[str], label: str) -> dict[str, Any]:
         ) from error
 
 
+def _cleanup_cell(task: tuple[Path, Path, str, str, bool, float, float, float, int, float, int]) -> tuple[str, dict[str, Any], bool]:
+    (
+        output,
+        cleanup_masks,
+        name,
+        cleanup_scope,
+        allow_skip,
+        edge_radius,
+        tolerance,
+        strength,
+        bleed_radius,
+        key_distance,
+        max_island_size,
+    ) = task
+    path = output / name
+    with Image.open(path) as opened:
+        original = opened.convert("RGBA")
+    try:
+        result, report = chroma_despill.process_frame(
+            original,
+            edge_radius=edge_radius,
+            tolerance=tolerance,
+            strength=strength,
+            bleed_radius=bleed_radius,
+            key_color=None,
+            scope=cleanup_scope,
+            remove_islands=cleanup_scope == "foreground",
+            key_distance=key_distance,
+            max_island_size=max_island_size,
+        )
+    except ValueError as error:
+        if not allow_skip or "chroma estimado" not in str(error):
+            original.close()
+            raise
+        result = original.copy()
+        report = {"applied": False, "reason": str(error)}
+        applied = False
+    else:
+        report["applied"] = True
+        applied = True
+    result.save(path, format="PNG")
+    result.getchannel("A").save(cleanup_masks / name, format="PNG")
+    original.close()
+    result.close()
+    return name, report, applied
+
+
 def _apply_chroma_cleanup(
     output: Path,
     rows: int,
@@ -46,6 +96,7 @@ def _apply_chroma_cleanup(
     bleed_radius: int,
     key_distance: float,
     max_island_size: int,
+    cpu_workers: int = 1,
 ) -> dict[str, Any]:
     """Polish generated foregrounds while keeping raw BiRefNet masks intact."""
     if mode == "none":
@@ -56,38 +107,32 @@ def _apply_chroma_cleanup(
     cleanup_masks.mkdir(parents=True, exist_ok=True)
     reports: dict[str, dict[str, Any]] = {}
     skipped = 0
-    for row in range(rows):
-        for column in range(phases):
-            name = f"row{row}_col{column}.png"
-            path = output / name
-            with Image.open(path) as opened:
-                original = opened.convert("RGBA")
-            try:
-                result, report = chroma_despill.process_frame(
-                    original,
-                    edge_radius=edge_radius,
-                    tolerance=tolerance,
-                    strength=strength,
-                    bleed_radius=bleed_radius,
-                    key_color=None,
-                    scope=cleanup_scope,
-                    remove_islands=cleanup_scope == "foreground",
-                    key_distance=key_distance,
-                    max_island_size=max_island_size,
-                )
-            except ValueError as error:
-                if mode != "auto" or "chroma estimado" not in str(error):
-                    raise
-                result = original.copy()
-                report = {"applied": False, "reason": str(error)}
-                skipped += 1
-            else:
-                report["applied"] = True
-            result.save(path, format="PNG")
-            result.getchannel("A").save(cleanup_masks / name, format="PNG")
+    names = [
+        f"row{row}_col{column}.png"
+        for row in range(rows)
+        for column in range(phases)
+    ]
+    tasks = [
+        (
+            output,
+            cleanup_masks,
+            name,
+            cleanup_scope,
+            mode == "auto",
+            edge_radius,
+            tolerance,
+            strength,
+            bleed_radius,
+            key_distance,
+            max_island_size,
+        )
+        for name in names
+    ]
+    with ThreadPoolExecutor(max_workers=max(1, cpu_workers)) as executor:
+        for name, report, applied in executor.map(_cleanup_cell, tasks):
             reports[name] = report
-            original.close()
-            result.close()
+            if not applied:
+                skipped += 1
 
     return {
         "mode": mode,
@@ -106,6 +151,7 @@ def _apply_chroma_cleanup(
     }
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    add_runtime_arguments(parser)
     parser.add_argument("source", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--rows", type=int, default=8)
@@ -150,6 +196,7 @@ def main() -> None:
         raise FileNotFoundError(args.source)
     if not 1 <= args.rows <= 8 or args.phases < 1:
         raise ValueError("grade inválida")
+    validate_parallelism(args.batch_size, args.cpu_workers)
     args.output.mkdir(parents=True, exist_ok=True)
 
     with Image.open(args.source) as opened:
@@ -180,6 +227,10 @@ def main() -> None:
                 str(Path(__file__).with_name("realesrgan_anime_scale.py")),
                 str(raw_dir),
                 str(upscaled_dir),
+                "--device", args.device,
+                "--precision", args.precision,
+                "--batch-size", str(args.batch_size),
+                "--cpu-workers", str(args.cpu_workers),
                 "--realesrgan-repo",
                 str(args.realesrgan_repo),
                 "--model-profile",
@@ -214,6 +265,10 @@ def main() -> None:
                 str(Path(__file__).with_name("birefnet_lite_remove.py")),
                 str(upscaled_dir),
                 str(args.output),
+                "--device", args.device,
+                "--precision", args.precision,
+                "--batch-size", str(args.batch_size),
+                "--cpu-workers", str(args.cpu_workers),
                 "--mask-output",
                 str(masks_dir),
                 "--model",
@@ -228,6 +283,10 @@ def main() -> None:
             "BiRefNet-Lite",
         )
 
+        source_alpha_report = intersect_with_source_alpha(
+            args.source, args.output, masks_dir, args.rows, args.phases
+        )
+
     chroma_report = _apply_chroma_cleanup(
         args.output,
         args.rows,
@@ -239,6 +298,7 @@ def main() -> None:
         args.chroma_bleed_radius,
         args.chroma_key_distance,
         args.chroma_max_island_size,
+        args.cpu_workers,
     )
 
     output_cell = source_cell * args.scale
@@ -271,7 +331,12 @@ def main() -> None:
         "realesrgan": esrgan_report,
         "model_profile": args.model_profile,
         "birefnet": birefnet_report,
+        "source_alpha_intersection": source_alpha_report,
         "chroma_cleanup": chroma_report,
+        "parallelism": {
+            "gpu_batch_size": args.batch_size,
+            "cpu_workers": args.cpu_workers,
+        },
         "cells": [
             f"row{row}_col{column}.png"
             for row in range(args.rows)

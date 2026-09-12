@@ -23,6 +23,10 @@ function animationLeafName(value) {
   return String(value || "").split("|").filter(Boolean).pop()?.trim().toLowerCase() || "";
 }
 
+// Shared, renderer-independent retargeting keeps the browser and Blender
+// paths on the same semantic mapping contract.
+import { createRuntimeRetarget, applyRuntimeRetarget } from './retarget.js?v=6';
+
 function findAnimationClip(clips, name) {
   const exact = clips.find((clip) => clip.name === name);
   if (exact) return exact;
@@ -48,9 +52,14 @@ function findAttachmentTarget(root, name) {
   return found;
 }
 
+function isHandObjectName(value) {
+  const normalized = normalizedObjectName(value);
+  const aliases = ["handr", "handl", "righthand", "lefthand", "handright", "handleft"];
+  return aliases.some((alias) => normalized === alias || normalized.endsWith(alias));
+}
+
 function palmCenterOffset(hand) {
-  const handName = normalizedObjectName(hand?.name);
-  if (!hand || !["handr", "handl", "righthand", "lefthand", "handright", "handleft"].includes(handName)) {
+  if (!hand || !isHandObjectName(hand.name)) {
     return new THREE.Vector3();
   }
   const thumbBases = [];
@@ -103,9 +112,12 @@ class SpriteViewer {
     this.token = 0;
     this.mixer = null;
     this.action = null;
+    this.animationModel = null;
+    this.retargetState = null;
     this.model = null;
     this.character = null;
     this.componentRoots = new Map();
+    this.socketAttachedRoots = new Set();
     this.twoHandedRoots = new Set();
     this.selectedComponentRoot = null;
     this.selectionHelper = null;
@@ -265,6 +277,12 @@ class SpriteViewer {
   }
 
   clearModel() {
+    if (this.animationModel) {
+      this.scene.remove(this.animationModel);
+      this.animationModel.traverse((object) => {
+        disposeObjectResources(object);
+      });
+    }
     if (this.model) {
       this.scene.remove(this.model);
       this.model.traverse((object) => {
@@ -280,9 +298,12 @@ class SpriteViewer {
     this.model = null;
     this.character = null;
     this.componentRoots.clear();
+    this.socketAttachedRoots.clear();
     this.twoHandedRoots.clear();
     this.mixer = null;
     this.action = null;
+    this.animationModel = null;
+    this.retargetState = null;
   }
 
   prepareRenderable(root) {
@@ -432,7 +453,13 @@ class SpriteViewer {
     // Evaluate the first pose even while paused so the composition opens as a
     // stable frame instead of briefly showing the bind pose.
     this.mixer.update(0);
+    if (this.retargetState) this.retargetState.first = null;
+    this.applyRetarget();
     this.playButton.textContent = this.action.paused ? "Play" : "Pausar";
+  }
+
+  applyRetarget() {
+    if (this.retargetState) applyRuntimeRetarget(this.retargetState);
   }
 
   toggleAnimation() {
@@ -479,19 +506,22 @@ class SpriteViewer {
       : parentName === "scene" ? this.model : this.componentRoots.get(parentName);
     if (!parent) throw new Error(`parent do componente não encontrado: ${parentName}`);
     const secondaryName = component.attach_to_secondary || "";
-    let target = component.attach_to ? findAttachmentTarget(parent, component.attach_to) : parent;
+    const attachmentTarget = component.attach_to
+      ? findAttachmentTarget(parent, component.attach_to)
+      : null;
+    let target = attachmentTarget || parent;
     if (secondaryName) {
       if (parentName !== "character" || !component.attach_to) {
         throw new Error("componente de duas mãos exige parent character e socket primário");
       }
       const secondary = findAttachmentTarget(this.character, secondaryName);
-      if (!target) throw new Error(`socket ${component.attach_to} não encontrado no personagem`);
+      if (!attachmentTarget) throw new Error(`socket ${component.attach_to} não encontrado no personagem`);
       if (!secondary) throw new Error(`socket ${secondaryName} não encontrado no personagem`);
       target = this.character;
       root.userData.twoHanded = {
-        primary: findAttachmentTarget(this.character, component.attach_to),
+        primary: attachmentTarget,
         secondary,
-        primaryOffset: palmCenterOffset(findAttachmentTarget(this.character, component.attach_to)),
+        primaryOffset: palmCenterOffset(attachmentTarget),
         secondaryOffset: palmCenterOffset(secondary),
         axis: component.two_hand_axis || "z",
         basePosition: new THREE.Vector3(...position),
@@ -502,6 +532,33 @@ class SpriteViewer {
         )),
       };
       this.twoHandedRoots.add(root);
+    }
+    const singleSocketAttachment = Boolean(
+      attachmentTarget && !secondaryName && parentName === "character",
+    );
+    if (component.attach_to && !attachmentTarget) {
+      throw new Error(`socket ${component.attach_to} não encontrado no componente ${parentName}`);
+    }
+    if (singleSocketAttachment) {
+      // Do not parent the prop directly to a Mixamo bone. Mixamo GLBs often
+      // keep a 0.01 armature scale on the bone chain while standalone props
+      // are exported at scene scale; direct bone parenting then applies that
+      // scale a second time and makes the prop effectively disappear.
+      // Instead, keep the root in character space and reconstruct the socket
+      // world transform every frame from the evaluated target node.
+      target = this.character;
+      root.userData.socketAttachment = {
+        target: attachmentTarget,
+        palmOffset: palmCenterOffset(attachmentTarget),
+        basePosition: new THREE.Vector3(...position),
+        baseQuaternion: new THREE.Quaternion().setFromEuler(new THREE.Euler(
+          THREE.MathUtils.degToRad(rotation[0] || 0),
+          THREE.MathUtils.degToRad(rotation[1] || 0),
+          THREE.MathUtils.degToRad(rotation[2] || 0),
+        )),
+        baseScale: new THREE.Vector3(...baseScale),
+      };
+      this.socketAttachedRoots.add(root);
     }
     if (!target) throw new Error(`socket ${component.attach_to} não encontrado no componente ${parentName}`);
     target.add(root);
@@ -521,11 +578,46 @@ class SpriteViewer {
       : new THREE.Vector3();
     root.userData.attachmentOffset = attachmentOffset.clone();
     root.userData.fitScale = fitScale;
-    if (attachmentOffset.lengthSq()) root.position.add(attachmentOffset);
+    if (!singleSocketAttachment && attachmentOffset.lengthSq()) root.position.add(attachmentOffset);
     root.visible = component.visible !== false;
     root.add(componentScene);
     this.componentRoots.set(String(component.id), root);
     if (secondaryName) this.updateTwoHandedComponents();
+    else if (singleSocketAttachment) this.updateSocketComponents();
+  }
+
+  updateSocketComponents() {
+    if (!this.socketAttachedRoots.size || !this.character) return;
+    this.character.updateMatrixWorld(true);
+    const characterInverse = this.character.matrixWorld.clone().invert();
+    const characterQuaternion = this.character.getWorldQuaternion(new THREE.Quaternion());
+    const characterScale = this.character.scale;
+    this.socketAttachedRoots.forEach((root) => {
+      const definition = root.userData.socketAttachment;
+      const target = definition?.target;
+      if (!definition || !target) return;
+
+      const localPoint = definition.palmOffset.clone().add(definition.basePosition);
+      const worldPoint = localPoint.applyMatrix4(target.matrixWorld);
+      root.position.copy(worldPoint.applyMatrix4(characterInverse));
+
+      const targetQuaternion = target.getWorldQuaternion(new THREE.Quaternion());
+      const worldQuaternion = targetQuaternion.multiply(definition.baseQuaternion);
+      root.quaternion.copy(characterQuaternion.clone().invert().multiply(worldQuaternion));
+
+      // fitScale is already expressed in canonical scene units. Keep it out
+      // of the armature/socket scale and compensate only for a non-unit scale
+      // on the character root itself; the model framing scale must still be
+      // inherited by the component together with the character.
+      const desiredScale = definition.baseScale.clone().multiplyScalar(
+        Number(root.userData.fitScale) || 1,
+      );
+      root.scale.set(
+        desiredScale.x / Math.max(Math.abs(characterScale.x), 1e-8),
+        desiredScale.y / Math.max(Math.abs(characterScale.y), 1e-8),
+        desiredScale.z / Math.max(Math.abs(characterScale.z), 1e-8),
+      );
+    });
   }
 
   publishAttachmentTargets() {
@@ -591,6 +683,29 @@ class SpriteViewer {
   readRootTransform(root, position = root.position.clone(), quaternion = root.quaternion.clone()) {
     const fitScale = Number(root.userData.fitScale) || 1;
     const attachmentOffset = root.userData.attachmentOffset || new THREE.Vector3();
+    const socketAttachment = root.userData.socketAttachment;
+    if (socketAttachment?.target) {
+      const target = socketAttachment.target;
+      this.character.updateMatrixWorld(true);
+      target.updateMatrixWorld(true);
+      const worldPosition = root.getWorldPosition(new THREE.Vector3());
+      const targetPosition = target.worldToLocal(worldPosition);
+      socketAttachment.basePosition.copy(targetPosition).sub(socketAttachment.palmOffset);
+      const targetQuaternion = target.getWorldQuaternion(new THREE.Quaternion()).invert();
+      const rootQuaternion = root.getWorldQuaternion(new THREE.Quaternion());
+      socketAttachment.baseQuaternion.copy(targetQuaternion.multiply(rootQuaternion)).normalize();
+      socketAttachment.baseScale.set(
+        root.scale.x / fitScale,
+        root.scale.y / fitScale,
+        root.scale.z / fitScale,
+      );
+      return {
+        position: socketAttachment.basePosition.toArray(),
+        rotation: new THREE.Euler().setFromQuaternion(socketAttachment.baseQuaternion, "XYZ")
+          .toArray().slice(0, 3).map((value) => THREE.MathUtils.radToDeg(value)),
+        scale: socketAttachment.baseScale.toArray(),
+      };
+    }
     const localPosition = position.clone().sub(attachmentOffset);
     const euler = new THREE.Euler().setFromQuaternion(quaternion, "XYZ");
     return {
@@ -763,13 +878,15 @@ class SpriteViewer {
       const primary = await this.loadCanonical(config);
       if (token !== this.token) return;
       let clips = primary.animations || [];
+      let animationAsset = null;
       if (config.animationModelKey && config.animationModelKey !== config.modelKey) {
-        const animationAsset = await this.loadCanonical({
+        animationAsset = await this.loadCanonical({
           sourceFormat: config.animationFormat || config.sourceFormat,
           modelUrl: config.animationModelUrl,
         });
         if (token !== this.token) return;
-        const selected = findAnimationClip(animationAsset.animations, config.animationName) || animationAsset.animations[0];
+        const selected = config.animationName ? findAnimationClip(animationAsset.animations, config.animationName) : animationAsset.animations[0];
+        if (config.animationName && !selected) throw new Error('Action solicitada não encontrada: ' + config.animationName);
         if (selected) clips = [selected];
       }
       // Finish every network/conversion load before touching the live scene.
@@ -793,8 +910,17 @@ class SpriteViewer {
       this.character.visible = true;
       this.model.add(this.character);
       this.scene.add(this.model);
+      if (animationAsset) {
+        removePreviewHelpers(animationAsset.scene);
+        animationAsset.scene.visible = false;
+        animationAsset.scene.updateMatrixWorld(true);
+        this.animationModel = animationAsset.scene;
+        this.scene.add(this.animationModel);
+        this.retargetState = createRuntimeRetarget(this.animationModel, this.character, { mapping: config.boneMapping, inPlace: config.inPlace });
+      }
       this.clips = clips;
-      this.mixer = this.clips.length ? new THREE.AnimationMixer(this.character) : null;
+      const animationRoot = this.retargetState ? this.animationModel : this.character;
+      this.mixer = this.clips.length ? new THREE.AnimationMixer(animationRoot) : null;
       this.publishAttachmentTargets();
 
       const pendingComponents = componentAssets.map((entry) => ({
@@ -865,6 +991,8 @@ class SpriteViewer {
     this.renderFrame += 1;
     const delta = this.clock.getDelta();
     if (this.mixer && this.action && !this.action.paused) this.mixer.update(delta * Number(this.speed.value || 0.5));
+    this.applyRetarget();
+    this.updateSocketComponents();
     this.updateTwoHandedComponents();
     this.model?.updateMatrixWorld(true);
     this.selectionHelper?.update();

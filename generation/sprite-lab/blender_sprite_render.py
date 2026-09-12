@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import sys
+import time
 from pathlib import Path
 
 import bpy
@@ -37,17 +39,28 @@ from blender_semantic_preview import (  # noqa: E402
     update_two_hand_components,
 )
 from blender_conditioning_export import (  # noqa: E402
-    _configure_depth_compositor,
-    _convert_depth_exr,
-    _convert_depth_render_result,
-    _render_depth_material,
+    NEUTRAL_COMPONENT_COLOR,
+    ROLES,
+    ROLE_COLORS,
+    _component_role,
     _material,
     _render_with_overrides,
-    _render_vertex_segmentation,
-    _role,
-    ROLE_COLORS,
-    _write_skeleton,
-    _write_pose_heatmap,
+)
+from blender_layer_visibility import (  # noqa: E402
+    character_pass_metadata,
+    character_only_visibility,
+    component_holdout_pass_metadata,
+    component_holdout_visibility,
+    component_id,
+    weapon_only_visibility,
+    weapon_pass_metadata,
+    weapon_objects,
+)
+from weapon_front_mask import (  # noqa: E402
+    extract_weapon_front_mask,
+    front_mask_metadata,
+    front_mask_palette,
+    front_mask_palette_key,
 )
 
 
@@ -511,9 +524,12 @@ def fit_ortho_scale(
     ground: float,
     profile: dict,
     resolution: int,
+    *,
+    overflow_only: bool = False,
 ) -> tuple[dict, dict[str, object] | None]:
     """Optimize the camera scale while keeping the requested cell dimensions."""
-    if profile.get("ortho_scale_mode", "fixed") != "fit":
+    requested_mode = profile.get("ortho_scale_mode", "fixed")
+    if requested_mode != "fit" and not overflow_only:
         return profile, None
     maximum_width = 0.0
     maximum_height = 0.0
@@ -533,6 +549,9 @@ def fit_ortho_scale(
         vertical_margin_px=float(profile.get("vertical_margin_px", 1.0)),
         safety_px=safety_px,
     )
+    if requested_mode != "fit" and optimized <= float(profile["ortho_scale"]) + 1e-9:
+        render_root.location = (0.0, 0.0, 0.0)
+        return profile, None
     effective_profile = {**profile, "ortho_scale": float(optimized)}
     configure_locked_camera(
         camera,
@@ -546,7 +565,7 @@ def fit_ortho_scale(
     scene.render.resolution_y = resolution
     render_root.location = (0.0, 0.0, 0.0)
     return effective_profile, {
-        "mode": "fit",
+        "mode": "fit" if requested_mode == "fit" else "overflow_fit",
         "cell": list(profile["cell_size"]),
         "base_ortho_scale": float(profile["ortho_scale"]),
         "effective_ortho_scale": float(optimized),
@@ -561,6 +580,7 @@ def fit_ortho_scale(
 
 
 def main() -> int:
+    started = time.monotonic()
     request_path, result_path = request_paths()
     request = json.loads(request_path.read_text(encoding="utf-8"))
     output = Path(request["output"]).expanduser().resolve()
@@ -572,6 +592,7 @@ def main() -> int:
 
     bpy.ops.wm.read_factory_settings(use_empty=True)
     scene = bpy.context.scene
+    print("STAGE import", flush=True)
     import_asset(Path(request["character_path"]).expanduser().resolve())
     armature = find_armature()
     if armature is None:
@@ -580,6 +601,8 @@ def main() -> int:
         armature,
         Path(request["animation_path"]).expanduser().resolve(),
         request.get("action_name"),
+        mapping_override=request.get("bone_mapping"),
+        in_place=bool(request.get("in_place", True)),
     )
     root_motion_lock = root_motion_lock_metadata(action)
     component_meta = []
@@ -600,7 +623,10 @@ def main() -> int:
         include_studio_lights=False,
     )
     start, end = brc.action_range(action, scene)
-    cycle = brc.find_cycle(armature, scene, start, end) if action else None
+    print("STAGE animation_bounds", flush=True)
+    timing_hint = request.get("animation_metadata") or {}
+    loop_hint = timing_hint.get("loop_recommended", timing_hint.get("loop"))
+    cycle = brc.find_cycle(armature, scene, start, end) if action and loop_hint is not False else None
     if cycle:
         phases = brc.phase_frames(start, start + cycle, phases_count, looping=True)
     else:
@@ -627,7 +653,7 @@ def main() -> int:
     else:
         camera = brc.make_camera(
             scene,
-            math.radians(float(request.get("elevation", 35.264))),
+            math.radians(float(request.get("elevation", 30.0))),
             math.radians(float(request.get("azimuth", 45.0))),
             height,
             extent,
@@ -740,26 +766,110 @@ def main() -> int:
             ground,
             effective_profile,
             resolution,
+            overflow_only=bool(
+                effective_profile.get("dynamic_x", False)
+                or effective_profile.get("dynamic_y", False)
+            ),
         )
     lighting = configure_sprite_lighting(scene, render_root, request, camera)
     semantic_objects = [obj for obj in scene.objects if obj.type == "MESH" and obj.visible_get()]
-    semantic_materials = {
-        role: _material(f"__generation_seg_{role}", color)
-        for role, color in ROLE_COLORS.items()
-    }
-    depth_enabled = bool(request.get("depth", False))
-    depth_near, depth_far = (float(value) for value in request.get("depth_range", [0.1, 20.0]))
-    if depth_near >= depth_far:
-        raise RuntimeError("depth_range inválido")
-    depth_mode = None
+    # This dedicated worker exports only beauty. Keep material assignments stable
+    # across frames so EEVEE can reuse shaders instead of invalidating them twice
+    # per cell. The process exits after the render; no source asset is modified.
+    if str(request.get("beauty_mode", "neutral")).casefold() != "original":
+        clay = _material("__generation_neutral_clay", (128, 128, 128, 255))
+        component = _material("__generation_neutral_component", NEUTRAL_COMPONENT_COLOR)
+        for obj in semantic_objects:
+            material = component if _component_role(obj) is not None else clay
+            if obj.material_slots:
+                for slot in obj.material_slots:
+                    slot.material = material
+            else:
+                obj.data.materials.append(material)
+    preparation_seconds = time.monotonic() - started
+    render_threads = int(request.get("render_threads", 0))
+    scene.render.threads_mode = "FIXED" if render_threads else "AUTO"
+    if render_threads:
+        scene.render.threads = render_threads
+    assigned_rows = request.get("assigned_rows", list(range(rows)))
+    if (not isinstance(assigned_rows, list) or not assigned_rows
+            or any(type(row) is not int or row < 0 or row >= rows for row in assigned_rows)
+            or len(set(assigned_rows)) != len(assigned_rows)):
+        raise RuntimeError("assigned_rows inválido")
+    print(f"STAGE render preparation_seconds={preparation_seconds:.3f}", flush=True)
     cells = []
+    character_pass = request.get("character_pass") is True
+    weapon_meshes = weapon_objects(semantic_objects)
+    character_objects = [
+        obj for obj in semantic_objects if obj not in weapon_meshes
+    ]
+    if character_pass:
+        (output / "character_beauty").mkdir(parents=True, exist_ok=True)
+        (output / "character_lineart").mkdir(parents=True, exist_ok=True)
+    weapon_pass = request.get("weapon_pass") is True
+    weapon_component_id = str(request.get("weapon_component_id") or "").strip()
+    selected_weapon_meta = next(
+        (
+            item
+            for item in component_meta
+            if item.get("id") == weapon_component_id and item.get("role") == "weapon"
+        ),
+        None,
+    )
+    if weapon_pass:
+        if selected_weapon_meta is None:
+            raise RuntimeError(
+                f"weapon_component_id '{weapon_component_id}' não identifica a arma anexada"
+            )
+        (output / "weapon_beauty").mkdir(parents=True, exist_ok=True)
+        (output / "weapon_silhouette").mkdir(parents=True, exist_ok=True)
+        silhouette_material = _material(
+            "__generation_weapon_silhouette", (255, 255, 255, 255)
+        )
+    front_mask_pass = request.get("weapon_front_mask") is True
+    front_mask_dilation = request.get("weapon_front_mask_dilation", 0)
+    front_mask_reports = []
+    if front_mask_pass:
+        if selected_weapon_meta is None:
+            raise RuntimeError(
+                f"weapon_component_id '{weapon_component_id}' não identifica a arma anexada"
+            )
+        (output / "weapon_front_segmentation").mkdir(parents=True, exist_ok=True)
+        (output / "weapon_front_mask").mkdir(parents=True, exist_ok=True)
+        semantic_materials = {
+            key: _material(f"__generation_front_mask_{key}", color)
+            for key, color in front_mask_palette().items()
+        }
+    component_holdout_pass = request.get("component_holdout_pass") is True
+    component_holdout_id = str(
+        request.get("component_holdout_id") or weapon_component_id
+    ).strip()
+    component_holdout_meta = next(
+        (item for item in component_meta if item.get("id") == component_holdout_id),
+        None,
+    )
+    component_holdout_occluders = request.get("component_holdout_occluder_ids")
+    if component_holdout_occluders is not None and (
+        not isinstance(component_holdout_occluders, list)
+        or any(not str(value).strip() for value in component_holdout_occluders)
+    ):
+        raise RuntimeError("component_holdout_occluder_ids inválido")
+    if component_holdout_pass:
+        if component_holdout_meta is None:
+            raise RuntimeError(
+                f"component_holdout_id '{component_holdout_id}' não identifica um componente anexado"
+            )
+        (output / "component_visible").mkdir(parents=True, exist_ok=True)
     dynamic_x = bool(effective_profile and effective_profile.get("dynamic_x", False))
     dynamic_y = bool(effective_profile and effective_profile.get("dynamic_y", False))
     for row, direction_yaw in enumerate(direction_yaws):
+        if row not in assigned_rows:
+            continue
         print(f"DIRECTION row={row_names[row]} yaw={math.degrees(direction_yaw):.3f}", flush=True)
         render_root.rotation_mode = "XYZ"
         render_root.rotation_euler[2] = direction_yaw
         for column, frame in enumerate(phases):
+            cell_started = time.monotonic()
             position_render_root(
                 scene, armature, render_root, frame, direction_yaw, ground
             )
@@ -769,52 +879,114 @@ def main() -> int:
                     scene, camera, render_root, effective_profile, resolution
                 )
             path = output / f"row{row}_col{column}.png"
-            if depth_enabled:
-                scene.use_nodes = False
             scene.render.filepath = str(path)
             bpy.ops.render.render(write_still=True)
-            segmentation_path = output / "segmentation" / f"row{row}_col{column}.png"
-            _render_vertex_segmentation(
-                scene,
-                semantic_objects,
-                {role: semantic_materials[role] for role in ROLE_COLORS},
-                segmentation_path,
-            )
-            mesh_path = output / "mesh" / f"row{row}_col{column}.png"
-            render_mesh_wireframe(scene, mesh_path)
-            lineart_path = output / "lineart" / f"row{row}_col{column}.png"
-            render_mesh_lineart(scene, semantic_objects, lineart_path)
-            bones_path = output / "bones" / f"row{row}_col{column}.png"
-            bones_meta = _write_skeleton(
-                scene, camera, bones_path, resolution, resolution
-            )
-            heatmap_path = output / "heatmap" / f"row{row}_col{column}.png"
-            _write_pose_heatmap(scene, camera, heatmap_path, resolution, resolution)
+            character_beauty_path = None
+            character_lineart_path = None
+            if character_pass:
+                character_beauty_path = (
+                    output / "character_beauty" / f"row{row}_col{column}.png"
+                )
+                character_lineart_path = (
+                    output / "character_lineart" / f"row{row}_col{column}.png"
+                )
+                with character_only_visibility(semantic_objects):
+                    scene.render.filepath = str(character_beauty_path)
+                    bpy.ops.render.render(write_still=True)
+                    render_mesh_lineart(
+                        scene,
+                        character_objects,
+                        character_lineart_path,
+                    )
+            weapon_beauty_path = None
+            weapon_silhouette_path = None
+            if weapon_pass:
+                weapon_beauty_path = (
+                    output / "weapon_beauty" / f"row{row}_col{column}.png"
+                )
+                weapon_silhouette_path = (
+                    output / "weapon_silhouette" / f"row{row}_col{column}.png"
+                )
+                with weapon_only_visibility(
+                    semantic_objects, weapon_component_id
+                ) as selected_weapon_objects:
+                    scene.render.filepath = str(weapon_beauty_path)
+                    bpy.ops.render.render(write_still=True)
+                    _render_with_overrides(
+                        scene,
+                        selected_weapon_objects,
+                        {role: silhouette_material for role in ROLES},
+                        weapon_silhouette_path,
+                    )
+            front_mask_path = None
+            front_segmentation_path = None
+            if front_mask_pass:
+                front_segmentation_path = (
+                    output
+                    / "weapon_front_segmentation"
+                    / f"row{row}_col{column}.png"
+                )
+                front_mask_path = (
+                    output / "weapon_front_mask" / f"row{row}_col{column}.png"
+                )
+                _render_with_overrides(
+                    scene,
+                    semantic_objects,
+                    semantic_materials,
+                    front_segmentation_path,
+                    material_resolver=lambda obj: semantic_materials[
+                        front_mask_palette_key(
+                            component_id(obj), weapon_component_id
+                        )
+                    ],
+                )
+                front_mask_report = extract_weapon_front_mask(
+                    front_segmentation_path,
+                    front_mask_path,
+                    dilation=front_mask_dilation,
+                )
+                front_mask_report.update(
+                    {
+                        "row": row,
+                        "direction": row_names[row],
+                        "column": column,
+                        "frame": frame,
+                    }
+                )
+                front_mask_reports.append(front_mask_report)
+            component_visible_path = None
+            if component_holdout_pass:
+                component_visible_path = (
+                    output / "component_visible" / f"row{row}_col{column}.png"
+                )
+                with component_holdout_visibility(
+                    semantic_objects,
+                    component_holdout_id,
+                    occluder_component_ids=component_holdout_occluders,
+                ):
+                    scene.render.filepath = str(component_visible_path)
+                    bpy.ops.render.render(write_still=True)
             cell = {
                 "row": row,
                 "direction": row_names[row],
                 "column": column,
                 "frame": frame,
                 "path": str(path),
-                "segmentation_path": str(segmentation_path),
-                "mesh_path": str(mesh_path),
-                "lineart_path": str(lineart_path),
-                "bones_path": str(bones_path),
-                "heatmap_path": str(heatmap_path),
-                "bones": bones_meta["bones"],
+                "elapsed_seconds": round(time.monotonic() - cell_started, 3),
             }
-            if depth_enabled:
-                depth_path = output / "depth" / f"row{row}_col{column}.png"
-                depth_mode = "material"
-                _render_depth_material(
-                    scene,
-                    semantic_objects,
-                    depth_path,
-                    depth_near,
-                    depth_far,
+            if character_pass:
+                cell["character_beauty_path"] = str(character_beauty_path)
+                cell["character_lineart_path"] = str(character_lineart_path)
+            if weapon_pass:
+                cell["weapon_beauty_path"] = str(weapon_beauty_path)
+                cell["weapon_silhouette_path"] = str(weapon_silhouette_path)
+            if front_mask_pass:
+                cell["weapon_front_segmentation_path"] = str(
+                    front_segmentation_path
                 )
-                cell["depth_path"] = str(depth_path)
-                scene.use_nodes = False
+                cell["weapon_front_mask_path"] = str(front_mask_path)
+            if component_holdout_pass:
+                cell["component_visible_path"] = str(component_visible_path)
             if dynamic_fit is not None:
                 offsets_world = dynamic_fit["offset_world"]
                 offsets_pixels = dynamic_fit["offset_pixels"]
@@ -847,6 +1019,10 @@ def main() -> int:
 
     metadata = {
         "schema": "sprite_lab.sprite_render/v1",
+        "timing": {
+            "preparation_seconds": round(preparation_seconds, 3),
+            "total_seconds": round(time.monotonic() - started, 3),
+        },
         "asset": asset_spec,
         "animation_source": {
             key: animation_metadata.get(key)
@@ -880,15 +1056,16 @@ def main() -> int:
                 if effective_profile
                 else request.get("camera_preset")
             ),
-            "elevation": float(request.get("elevation", 35.264)),
+            "elevation": float(request.get("elevation", 30.0)),
             "azimuth": float(request.get("azimuth", 45.0)),
             "ortho_scale": float(camera.data.ortho_scale),
         },
-        "depth": {
-            "enabled": depth_enabled,
-            "mode": depth_mode,
-            "range": [depth_near, depth_far],
+        "channel_sources": {
+            "beauty": "blender",
+            "lineart": "generated_after_blender_by_controlnet",
+            "bones": "generated_after_blender_by_controlnet",
         },
+        "render_backend": str(os.environ.get("SPRITE_LAB_RENDER_BACKEND", "gpu")),
         "lighting": lighting,
         "horizontal_fit": {
             "enabled": dynamic_x,
@@ -923,6 +1100,24 @@ def main() -> int:
         "bounds": {"min": list(minimum), "max": list(maximum)},
         "cells": cells,
     }
+    if character_pass:
+        metadata["character_pass"] = character_pass_metadata(
+            metadata, effective_profile
+        )
+    if weapon_pass:
+        metadata["weapon_pass"] = weapon_pass_metadata(
+            metadata, selected_weapon_meta
+        )
+    if front_mask_pass:
+        metadata["weapon_front_mask"] = front_mask_metadata(
+            metadata, front_mask_reports, front_mask_dilation
+        )
+    if component_holdout_pass:
+        metadata["component_holdout_pass"] = component_holdout_pass_metadata(
+            metadata,
+            component_holdout_meta,
+            component_holdout_occluders,
+        )
     metadata_path = output / "render_metadata.json"
     metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     result_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")

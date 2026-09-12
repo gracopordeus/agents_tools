@@ -1,0 +1,2 @@
+# Google GenAI SDK used by the Sprite Lab AI Render provider.
+google-genai==2.22.0

@@ -13,15 +13,19 @@ import mimetypes
 import os
 import re
 import shutil
+import subprocess
 import sys
 import threading
+import tempfile
+import time
 import uuid
 import zipfile
 from datetime import datetime, timezone
 from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from collections.abc import Mapping, Sequence
+from pathlib import Path, PurePosixPath
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 # Keep direct `python3 server.py` launches compatible with the project-local
 # environment used for optional provider SDKs such as `openai`.
@@ -36,11 +40,18 @@ if LOCAL_VENV_SITE.is_dir() and str(LOCAL_VENV_SITE) not in sys.path:
     sys.path.insert(0, str(LOCAL_VENV_SITE))
 
 import relationship_catalog as rel
+import observability as obs
+import job_queue as jq
 import ai_render_spec
 import composition_export
 import gemini_sprite_postprocess
+import layered_bundle
+import layered_compositor
+import holdout_validation
 import huggingface_realesrgan
 import image_generation_provider
+import character_layer_worker
+import weapon_layer_worker
 import model_cache
 import sprite_render
 import render_profile
@@ -62,14 +73,23 @@ SPRITE_JOBS_PATH = STATE / "sprite_jobs.json"
 ACTION_ANNOTATIONS_PATH = rel.DEFAULT_ANNOTATIONS.with_name("action_annotations.json")
 SPRITE_WORK = BASE / "work" / "sprite-renders"
 GEMINI_WORK = BASE / "work" / "gemini-renders"
+GEMINI_IDENTITY_LINEART_CACHE = BASE / "work" / "gemini-identity-lineart"
 POSTPROCESS_WORK = BASE / "work" / "gemini-postprocess"
+POSTPROCESS_BENCHMARK_WORK = BASE / "work" / "postprocess-benchmark"
+# Final layered bundles are published outside every work tree.  The only
+# public access path is the scoped endpoint below, which keeps intermediate
+# post-processing artifacts private and allows an atomic job-level promotion.
+LAYERED_PUBLISHED_ROOT = BASE / "published" / "layered"
 GEMINI_JOBS_PATH = STATE / "gemini_jobs.json"
 POSTPROCESS_JOBS_PATH = STATE / "postprocess_jobs.json"
+ENV_ATLAS_JOBS_PATH = STATE / "env_atlas_jobs.json"
 GEMINI_CONFIG_PATH = STATE / "gemini_config.json"
 OPENAI_CONFIG_PATH = STATE / "openai_config.json"
 QWEN_CONFIG_PATH = STATE / "qwen_config.json"
 GEMINI_REFERENCES_PATH = STATE / "gemini_references.json"
 GEMINI_REFERENCES_WORK = BASE / "work" / "gemini-references"
+WEAPON_REFERENCES_PATH = STATE / "weapon_references.json"
+WEAPON_REFERENCES_WORK = BASE / "work" / "weapon-references"
 GEMINI_PROMPT_PATH = STATE / "gemini_prompt.txt"
 AI_RENDER_JOB_PREFIX = "ai_render_"
 GEMINI_CHANNEL_FILES = {
@@ -79,6 +99,7 @@ GEMINI_CHANNEL_FILES = {
 }
 AI_RENDER_REFERENCE_CHANNELS = (*GEMINI_CHANNEL_FILES, "frame_control")
 DEFAULT_GEMINI_CHANNELS = tuple(GEMINI_CHANNEL_FILES)
+IDENTITY_GUIDE_MODES = ("lineart_standard", "canny_edges")
 JOB_LOCK = threading.Lock()
 BUG_TYPES = {
     "render_failure": "Falha em renderizar",
@@ -461,6 +482,72 @@ def gemini_reference_path(reference_id: str) -> Path:
     return path
 
 
+def read_weapon_references() -> list[dict]:
+    if not WEAPON_REFERENCES_PATH.is_file():
+        return []
+    try:
+        data = json.loads(WEAPON_REFERENCES_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    return data if isinstance(data, list) else []
+
+
+def save_weapon_reference(data_url: str, name: str) -> dict:
+    reference_id = f"weapon_reference_{uuid.uuid4().hex[:16]}"
+    destination = WEAPON_REFERENCES_WORK / f"{reference_id}.png"
+    report = _decode_reference(data_url, destination)
+    reference = {
+        "id": reference_id,
+        "type": "weapon_identity",
+        "name": str(name or "referência da arma").strip()[:240] or "referência da arma",
+        "file": destination.name,
+        "size": report["size"],
+        "bytes": destination.stat().st_size,
+        "sha256": sha256_file(destination),
+        "created_at": utc_now(),
+    }
+    references = read_weapon_references()
+    references.append(reference)
+    write_json_atomic(WEAPON_REFERENCES_PATH, references)
+    return reference
+
+
+def get_weapon_reference(reference_id: str) -> dict | None:
+    return next(
+        (item for item in read_weapon_references() if item.get("id") == reference_id),
+        None,
+    )
+
+
+def weapon_reference_path(reference_id: str) -> Path:
+    reference = get_weapon_reference(reference_id)
+    if reference is None:
+        raise ValueError("referência da arma não encontrada")
+    path = _safe_work_child(WEAPON_REFERENCES_WORK, str(reference.get("file", "")))
+    if not path.is_file() or sha256_file(path) != reference.get("sha256"):
+        raise ValueError("arquivo da referência da arma inválido")
+    return path
+
+
+def require_weapon_reference(render_spec: dict, reference_id: str | None) -> None:
+    mode = render_spec.get("generation_mode")
+    if not str(reference_id or "").strip():
+        if mode == ai_render_spec.GENERATION_MODE_CHARACTER_WEAPON_HOLDOUT:
+            raise ValueError("modo holdout exige uma referência visual da arma")
+        if mode == ai_render_spec.GENERATION_MODE_CHARACTER_COMPONENT_HOLDOUT:
+            raise ValueError("modo holdout exige uma referência visual do componente")
+
+
+def resolve_weapon_reference_for_render(
+    render_spec: dict, reference_id: str | None
+) -> str:
+    normalized_id = str(reference_id or "").strip()
+    require_weapon_reference(render_spec, normalized_id)
+    if normalized_id:
+        weapon_reference_path(normalized_id)
+    return normalized_id
+
+
 def _update_job_file(path: Path, job_id: str, patch: dict) -> dict | None:
     with JOB_LOCK:
         jobs = _read_jobs(path)
@@ -488,11 +575,200 @@ def get_postprocess_job(job_id: str) -> dict | None:
     return next((job for job in read_postprocess_jobs() if job.get("id") == job_id), None)
 
 
+def read_env_atlas_jobs() -> list[dict]:
+    return _read_jobs(ENV_ATLAS_JOBS_PATH)
+
+
+def get_env_atlas_job(job_id: str) -> dict | None:
+    return next((job for job in read_env_atlas_jobs() if job.get("id") == job_id), None)
+
+
+def _create_env_atlas_job(payload: dict) -> dict:
+    job = {
+        "id": f"env_atlas_{uuid.uuid4().hex[:12]}",
+        "status": "queued",
+        "created_at": utc_now(),
+        "payload": payload,
+    }
+    with JOB_LOCK:
+        jobs = read_env_atlas_jobs()
+        jobs.append(job)
+        write_json_atomic(ENV_ATLAS_JOBS_PATH, jobs)
+    return job
+
+
+def _run_env_atlas_job(
+    job_id: str,
+    cmd: list[str],
+    output_dir: Path,
+    *,
+    cwd: str,
+    timeout: float = 300.0,
+) -> None:
+    """Execute one env-atlas render in a background thread (SaaS-safe).
+
+    The historical sync ``POST /api/env-atlas`` path blocked the HTTP handler
+    thread for up to 5 minutes. Async jobs reuse this worker; the sync path
+    stays available for the current frontend.
+    """
+    _update_job_file(
+        ENV_ATLAS_JOBS_PATH,
+        job_id,
+        {"status": "running", "started_at": utc_now()},
+    )
+    obs.log_event("env_atlas_started", job_id=job_id)
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=cwd,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"Blender falhou: {(result.stderr or '')[-500:]}")
+        atlas_path = output_dir / "env_atlas.png"
+        if not atlas_path.exists():
+            raise RuntimeError("Atlas não foi gerado")
+        _update_job_file(
+            ENV_ATLAS_JOBS_PATH,
+            job_id,
+            {
+                "status": "done",
+                "finished_at": utc_now(),
+                "outputs": {"atlas_path": "/env-atlas/output/env_atlas.png"},
+            },
+        )
+        obs.log_event("env_atlas_finished", job_id=job_id, status="done")
+    except Exception as exc:  # noqa: BLE001 - job errors are returned to the UI.
+        _update_job_file(
+            ENV_ATLAS_JOBS_PATH,
+            job_id,
+            {"status": "error", "finished_at": utc_now(), "error": str(exc)},
+        )
+        obs.log_event("env_atlas_finished", job_id=job_id, status="error", error=str(exc)[:300])
+
+
+def _wants_sync(payload: dict) -> bool:
+    """Backwards-compat escape hatch: ``{"mode": "sync"}`` runs inline.
+
+    New clients (the web UI) use the async default: 202 + poll. Old scripts
+    may opt into the historical blocking behaviour explicitly.
+    """
+    return isinstance(payload, dict) and str(payload.get("mode", "")).lower() == "sync"
+
+
+def build_env_atlas_selection(payload: dict) -> dict:
+    """Translate a ``POST /api/env-atlas`` payload into a selection document.
+
+    Entries carry ``asset_id`` (resolved via ``model_cache.source_path`` to a
+    local ``fbx_path``) or a legacy absolute ``fbx_path``. Every path is
+    verified up-front so a typo fails fast with 400 instead of burning a
+    5-minute Blender job. Raises ``ValueError`` on any problem.
+    """
+    selected = payload.get("selected_assets", None)
+    if not isinstance(selected, list) or not selected:
+        raise ValueError("selecione ao menos um asset")
+    if len(selected) > 64:
+        raise ValueError("no máximo 64 assets por atlas")
+    assets: list[dict] = []
+    for index, entry in enumerate(selected):
+        if not isinstance(entry, dict):
+            raise ValueError(f"asset #{index} inválido")
+        asset_id = str(entry.get("asset_id") or "").strip()
+        if asset_id:
+            try:
+                fbx_path = str(model_cache.source_path(asset_id))
+            except (KeyError, ValueError, FileNotFoundError) as exc:
+                raise ValueError(f"asset {asset_id}: {exc}") from exc
+        else:
+            fbx_path = str(entry.get("fbx_path") or "")
+            if not fbx_path or not Path(fbx_path).is_file():
+                raise ValueError(f"asset #{index}: fbx_path inexistente")
+        try:
+            col = int(entry.get("col", index))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"asset #{index}: col inválida") from exc
+        assets.append(
+            {
+                "col": col,
+                "name": str(entry.get("name") or Path(fbx_path).stem),
+                "tile_key": str(entry.get("tile_key") or "prop"),
+                "category": str(entry.get("category") or "prop"),
+                "fbx_path": fbx_path,
+            }
+        )
+    return {
+        "schema": "sprite_lab.asset_selection/v1",
+        "render_profile": str(payload.get("render_profile", "env_atlas_v1")),
+        "assets": assets,
+    }
+    """Backwards-compat escape hatch: ``{"mode": "sync"}`` runs inline.
+
+    New clients (the web UI) use the async default: 202 + poll. Old scripts
+    may opt into the historical blocking behaviour explicitly.
+    """
+    return isinstance(payload, dict) and str(payload.get("mode", "")).lower() == "sync"
+
+
+def _maintenance_reindex_worker() -> dict:
+    manifest = rel.build_relationship_catalog()
+    result = {
+        "ok": True,
+        "asset_count": manifest["asset_count"],
+        "animation_count": manifest["animation_count"],
+    }
+    obs.log_event(
+        "maintenance_reindex_done",
+        asset_count=result["asset_count"],
+        animation_count=result["animation_count"],
+    )
+    return result
+
+
+def _relationships_save_worker(body: dict) -> dict:
+    relationship = rel.add_relationship(body)
+    try:
+        export = composition_export.export_relationship(relationship)
+    except (OSError, ValueError, RuntimeError, KeyError) as exc:
+        # Historical behaviour answered 500 *after* persisting. As a job we
+        # persist that nuance in the result instead of failing the job: the
+        # composition exists, only the GLB export failed.
+        manifest = rel.build_relationship_catalog()
+        result = {
+            "relationship": relationship,
+            "export": None,
+            "export_error": str(exc),
+            "catalog_generated_at": manifest["generated_at"],
+        }
+        obs.log_event("maintenance_relationship_saved", export="failed")
+        return result
+    manifest = rel.build_relationship_catalog()
+    result = {
+        "relationship": {**relationship, "export": export},
+        "export": export,
+        "catalog_generated_at": manifest["generated_at"],
+    }
+    obs.log_event("maintenance_relationship_saved", export="ok")
+    return result
+
+
+def _relationships_delete_worker(relationship_id: str) -> dict:
+    relationship = rel.delete_relationship(relationship_id)
+    manifest = rel.build_relationship_catalog()
+    result = {"relationship": relationship, "catalog_generated_at": manifest["generated_at"]}
+    obs.log_event("maintenance_relationship_deleted")
+    return result
+
+
 def pipeline_python_executable() -> str:
-    """Use the dependency-complete CPU environment for worker subprocesses."""
+    """Prefer the local CUDA-capable runtime; explicit configuration wins."""
     configured = os.environ.get("SPRITE_LAB_PYTHON", "").strip()
     if configured:
         return configured
+    gpu_python = Path.home() / "pose-venv" / "bin" / "python"
+    if gpu_python.is_file():
+        return str(gpu_python)
     local = BASE / "work" / "teed-venv" / "bin" / "python"
     return str(local) if local.is_file() else sys.executable
 
@@ -504,6 +780,7 @@ def update_pipeline_progress(
     stage: str,
     percent: int,
     eta_seconds: int | None = None,
+    layers: dict | None = None,
 ) -> None:
     update = {
         "progress": {
@@ -512,6 +789,8 @@ def update_pipeline_progress(
             "eta_seconds": eta_seconds,
         }
     }
+    if layers is not None:
+        update["progress"]["layers"] = copy.deepcopy(layers)
     update_job = _update_job_file(path, job_id, update)
     if update_job is None:
         raise KeyError(f"job não encontrado: {job_id}")
@@ -522,6 +801,930 @@ def _safe_work_child(root: Path, relative: str) -> Path:
     if not candidate.is_relative_to(root.resolve()):
         raise ValueError("caminho de job inválido")
     return candidate
+
+
+def _layered_bundle_destination(job_id: str) -> Path:
+    """Return one job directory without allowing nested or absolute IDs."""
+    value = str(job_id or "").strip()
+    if (
+        not value
+        or value in {".", ".."}
+        or value.startswith(".")
+        or "/" in value
+        or "\\" in value
+    ):
+        raise ValueError("job_id de bundle inválido")
+    return _safe_work_child(LAYERED_PUBLISHED_ROOT, value)
+
+
+def _layered_bundle_urls(job_id: str, manifest: dict) -> dict[str, str]:
+    base = f"/layered-outputs/{quote(job_id, safe='')}"
+    if manifest.get("schema") == layered_bundle.LAYERED_BUNDLE_SCHEMA_V2:
+        component = manifest["layers"][1]
+        return {
+            "character_full": (
+                f"{base}/{quote(manifest['layers'][0]['file'], safe='/')}"
+            ),
+            "component_visible": f"{base}/{quote(component['file'], safe='/')}",
+            "component_visibility_mask": (
+                f"{base}/{quote(component['occlusion']['visible_mask'], safe='/')}"
+            ),
+            "preview": f"{base}/{quote(manifest['preview'], safe='/')}",
+        }
+    return {
+        "weapon": f"{base}/{quote(manifest['layers'][0]['file'], safe='/')}",
+        "character_holdout": f"{base}/{quote(manifest['layers'][1]['file'], safe='/')}",
+        "holdout_source": f"{base}/{quote(manifest['layers'][1]['holdout_source'], safe='/')}",
+        "preview": f"{base}/{quote(manifest['preview'], safe='/')}",
+    }
+
+
+def _normalize_layered_integration_specs(
+    layers: Mapping[str, Mapping[str, object]] | Sequence[Mapping[str, object]],
+) -> dict[str, Mapping[str, object]]:
+    if isinstance(layers, Mapping):
+        specs = dict(layers)
+    elif isinstance(layers, Sequence) and not isinstance(layers, (str, bytes)):
+        specs = {}
+        for item in layers:
+            if not isinstance(item, Mapping):
+                raise ValueError("cada camada deve ser um objeto")
+            layer_id = str(item.get("layer_id") or item.get("id") or "").strip()
+            if not layer_id:
+                raise ValueError("layer_id é obrigatório")
+            if layer_id in specs:
+                raise ValueError(f"camada duplicada: {layer_id}")
+            specs[layer_id] = item
+    else:
+        raise ValueError("layers deve ser um objeto ou sequência")
+    if set(specs) != {"character", "weapon"}:
+        raise ValueError("layers deve conter exatamente character e weapon")
+    if any(not isinstance(value, Mapping) for value in specs.values()):
+        raise ValueError("cada camada deve declarar seus paths")
+    return specs
+
+
+def _resolve_layered_local_path(value: object, base: Path, field: str) -> Path:
+    if not isinstance(value, (str, Path)) or not str(value).strip():
+        raise ValueError(f"{field} deve declarar um path")
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = base / path
+    return path.resolve()
+
+
+def _front_mask_paths_for_layer(
+    layer_spec: Mapping[str, object],
+    *,
+    rows: int,
+    phases: int,
+) -> dict[tuple[int, int], Path]:
+    """Resolve one auditable front-mask PNG for each compositor cell."""
+    structural_raw = layer_spec.get("structural_dir") or layer_spec.get("structural")
+    structural_dir = _resolve_layered_local_path(
+        structural_raw, Path.cwd(), "camada weapon structural_dir"
+    )
+    expected = [(row, column) for row in range(rows) for column in range(phases)]
+    explicit = layer_spec.get("front_mask_paths") or layer_spec.get("front_masks")
+    values: dict[tuple[int, int], object] = {}
+    if isinstance(explicit, Mapping):
+        for row, column in expected:
+            for key in (
+                (row, column),
+                f"{row},{column}",
+                f"row{row}_col{column}",
+                f"row{row}_col{column}.png",
+            ):
+                if key in explicit:
+                    values[(row, column)] = explicit[key]
+                    break
+    elif isinstance(explicit, Sequence) and not isinstance(explicit, (str, bytes)):
+        if len(explicit) == len(expected):
+            values.update(zip(expected, explicit))
+    if len(values) != len(expected):
+        mask_dir_raw = layer_spec.get("front_mask_dir") or layer_spec.get("front_mask_directory")
+        mask_dir = None
+        if mask_dir_raw is not None:
+            mask_dir = _resolve_layered_local_path(
+                mask_dir_raw, structural_dir, "camada weapon front_mask_dir"
+            )
+        metadata_path = structural_dir / "render_metadata.json"
+        if len(values) != len(expected) and metadata_path.is_file():
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ValueError(f"metadata estrutural inválido: {metadata_path}") from exc
+            for cell in metadata.get("cells", []) if isinstance(metadata, Mapping) else []:
+                if not isinstance(cell, Mapping):
+                    continue
+                key = (cell.get("row"), cell.get("column"))
+                value = cell.get("weapon_front_mask_path") or cell.get("front_mask_path")
+                if key in expected and value is not None:
+                    values[key] = value
+        if len(values) != len(expected):
+            mask_dir = mask_dir or structural_dir / "weapon_front_mask"
+            if not mask_dir.is_dir():
+                mask_dir = structural_dir / "front_mask"
+            if mask_dir.is_dir():
+                for key in expected:
+                    row, column = key
+                    candidate = mask_dir / f"row{row}_col{column}.png"
+                    if candidate.is_file():
+                        values[key] = candidate
+    if len(values) != len(expected):
+        missing = [key for key in expected if key not in values]
+        raise ValueError(
+            "camada weapon deve declarar front_mask para cada célula; "
+            f"ausente: {missing[0]}"
+        )
+    return {
+        key: _resolve_layered_local_path(value, structural_dir, f"front_mask{key}")
+        for key, value in values.items()
+    }
+
+
+def _extract_layered_sheet_cells(
+    sheet: Path,
+    destination: Path,
+    *,
+    rows: int,
+    phases: int,
+) -> dict[tuple[int, int], Path]:
+    from PIL import Image
+
+    if not sheet.is_file():
+        raise ValueError(f"spritesheet processado ausente: {sheet}")
+    destination.mkdir(parents=True, exist_ok=True)
+    try:
+        opened = Image.open(sheet)
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"spritesheet processado inválido: {sheet}") from exc
+    try:
+        if opened.width % phases or opened.height % rows:
+            raise ValueError(f"spritesheet incompatível com a grade {rows}x{phases}: {sheet}")
+        cell_width = opened.width // phases
+        cell_height = opened.height // rows
+        if cell_width != cell_height:
+            raise ValueError(f"células não quadradas no spritesheet: {sheet}")
+        rgba = opened.convert("RGBA")
+        paths: dict[tuple[int, int], Path] = {}
+        for row in range(rows):
+            for column in range(phases):
+                path = destination / f"row{row}_col{column}.png"
+                cell = rgba.crop(
+                    (
+                        column * cell_width,
+                        row * cell_height,
+                        (column + 1) * cell_width,
+                        (row + 1) * cell_height,
+                    )
+                )
+                cell.save(path, format="PNG")
+                cell.close()
+                paths[(row, column)] = path
+        rgba.close()
+        return paths
+    finally:
+        opened.close()
+
+
+def _normalize_layered_input_sheet(
+    generated_sheet: Path,
+    destination: Path,
+    *,
+    rows: int,
+    phases: int,
+    target_cell: int,
+) -> tuple[Path, dict[str, object]]:
+    """Normalize each generated cell to the postprocess working resolution.
+
+    AI Render may return either a 1K sheet (128px cells) or a 2K sheet
+    (256px cells), while local fixtures and dry-runs can use any square cell
+    size.  The postprocessor's ``source_cell`` is the contract for both
+    layers, so resizing the complete sheet would allow pixels to bleed across
+    animation cells.  Resize each cell independently and keep the normalized
+    file in a temporary input tree owned by the orchestrator.
+    """
+    from PIL import Image
+
+    generated_sheet = Path(generated_sheet).expanduser().resolve()
+    if not generated_sheet.is_file():
+        raise ValueError(f"spritesheet gerado ausente: {generated_sheet}")
+    if (
+        type(rows) is not int
+        or type(phases) is not int
+        or rows <= 0
+        or phases <= 0
+        or type(target_cell) is not int
+        or target_cell <= 0
+    ):
+        raise ValueError("grade e target_cell devem ser inteiros positivos")
+    with Image.open(generated_sheet) as opened:
+        source_size = opened.size
+        expected_size = (target_cell * phases, target_cell * rows)
+        if source_size == expected_size:
+            return generated_sheet, {
+                "applied": False,
+                "source_size": list(source_size),
+                "working_size": list(source_size),
+                "method": "none",
+            }
+        if opened.width % phases or opened.height % rows:
+            raise ValueError(
+                "spritesheet gerado incompatível com a grade "
+                f"{rows}x{phases}: {generated_sheet}"
+            )
+        source_cell = opened.width // phases
+        if source_cell != opened.height // rows or source_cell <= 0:
+            raise ValueError(
+                f"spritesheet gerado possui células não quadradas: {generated_sheet}"
+            )
+        source = opened.convert("RGBA")
+
+    destination = Path(destination).expanduser().resolve()
+    destination.mkdir(parents=True, exist_ok=True)
+    working = Image.new("RGBA", expected_size, (0, 0, 0, 0))
+    try:
+        for row in range(rows):
+            for column in range(phases):
+                box = (
+                    column * source_cell,
+                    row * source_cell,
+                    (column + 1) * source_cell,
+                    (row + 1) * source_cell,
+                )
+                cell = source.crop(box)
+                try:
+                    resized = cell.resize(
+                        (target_cell, target_cell), Image.Resampling.LANCZOS
+                    )
+                    try:
+                        working.alpha_composite(
+                            resized, (column * target_cell, row * target_cell)
+                        )
+                    finally:
+                        resized.close()
+                finally:
+                    cell.close()
+        target = destination / f"{generated_sheet.stem}_normalized.png"
+        working.save(target, format="PNG")
+    finally:
+        source.close()
+        working.close()
+    return target, {
+        "applied": True,
+        "source_size": list(source_size),
+        "working_size": list(expected_size),
+        "source_cell": source_cell,
+        "target_cell": target_cell,
+        "method": "per_cell_lanczos",
+        "path": str(target),
+    }
+
+
+def _normalize_layered_mask_paths(
+    mask_paths: Mapping[tuple[int, int], Path],
+    destination: Path,
+    *,
+    cell_size: tuple[int, int],
+) -> dict[tuple[int, int], Path]:
+    """Copy/scale structural masks to the final compositor cell size."""
+    from PIL import Image
+
+    destination = Path(destination).expanduser().resolve()
+    destination.mkdir(parents=True, exist_ok=True)
+    normalized: dict[tuple[int, int], Path] = {}
+    for key, source_path in mask_paths.items():
+        source_path = Path(source_path).expanduser().resolve()
+        if not source_path.is_file():
+            raise ValueError(f"front_mask ausente: {source_path}")
+        target = destination / f"row{key[0]}_col{key[1]}.png"
+        try:
+            with Image.open(source_path) as opened:
+                if opened.format != "PNG":
+                    raise ValueError(f"front_mask deve ser PNG: {source_path}")
+                if opened.size == cell_size:
+                    opened.save(target, format="PNG")
+                else:
+                    if opened.width <= 0 or opened.height <= 0:
+                        raise ValueError(f"front_mask inválido: {source_path}")
+                    resized = opened.resize(cell_size, Image.Resampling.NEAREST)
+                    try:
+                        resized.save(target, format="PNG")
+                    finally:
+                        resized.close()
+        except OSError as exc:
+            raise ValueError(f"front_mask não é um PNG válido: {source_path}") from exc
+        normalized[key] = target
+    return normalized
+
+
+def _mark_layered_holdout_complete(
+    processed_root: Path,
+    report: dict,
+    composition: Mapping[str, object],
+) -> dict:
+    composition_outputs = composition.get("outputs")
+    holdout_report = {
+        "schema": composition.get("schema"),
+        "grid": composition.get("grid"),
+        "cell_size": composition.get("cell_size"),
+        "dilation": composition.get("dilation", 0),
+        "outputs": sorted(composition_outputs)
+        if isinstance(composition_outputs, Mapping)
+        else [],
+        "validation": copy.deepcopy(composition.get("validation")),
+    }
+    report["holdout_stage"] = "after_final_resolution"
+    report["holdout_applied"] = True
+    report["holdout_report"] = holdout_report
+    for layer in report.get("layers", {}).values():
+        if isinstance(layer, dict):
+            layer["holdout_stage"] = "after_final_resolution"
+            layer["holdout_applied"] = True
+            layer["holdout_report"] = holdout_report
+    metadata_path = processed_root / "layered_postprocess.json"
+    if metadata_path.is_file():
+        try:
+            persisted = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"manifest pós-processado inválido: {metadata_path}") from exc
+        if isinstance(persisted, dict):
+            persisted.update({
+                "holdout_stage": report["holdout_stage"],
+                "holdout_applied": True,
+                "holdout_report": holdout_report,
+            })
+            for layer in persisted.get("layers", {}).values():
+                if isinstance(layer, dict):
+                    layer["holdout_stage"] = "after_final_resolution"
+                    layer["holdout_applied"] = True
+                    layer["holdout_report"] = holdout_report
+            write_json_atomic(metadata_path, persisted)
+    for layer_id in ("character", "weapon"):
+        layer_metadata_path = processed_root / layer_id / "render_metadata.json"
+        if not layer_metadata_path.is_file():
+            continue
+        try:
+            layer_metadata = json.loads(
+                layer_metadata_path.read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"metadata pós-processado inválido: {layer_metadata_path}"
+            ) from exc
+        if isinstance(layer_metadata, dict):
+            layer_metadata.update({
+                "holdout_stage": "after_final_resolution",
+                "holdout_applied": True,
+                "holdout_report": holdout_report,
+            })
+            write_json_atomic(layer_metadata_path, layer_metadata)
+    return report
+
+
+def run_layered_postprocess_compose_publish(
+    job_id: str,
+    layers: Mapping[str, Mapping[str, object]] | Sequence[Mapping[str, object]],
+    *,
+    source: Mapping[str, object],
+    profile_id: str = "bicubic",
+    rows: int = 8,
+    phases: int = 8,
+    source_cell: int = 256,
+    output_cell: int | None = None,
+    dilation: int = 0,
+    tolerance: int = 1,
+    component_id: str = "equipment",
+    component_kind: str = "equipment",
+    postprocess_output: Path | None = None,
+    process_fn=None,
+    composer_fn=None,
+    publish_fn=None,
+    process_kwargs: Mapping[str, object] | None = None,
+    provenance=None,
+    config=None,
+) -> dict:
+    """Run the local layered chain and publish exactly its composed outputs."""
+    from PIL import Image
+
+    audit_source = layered_bundle.validate_auditable_source(source)
+    specs = _normalize_layered_integration_specs(layers)
+    process_output = Path(postprocess_output or POSTPROCESS_WORK / str(job_id) / "layered")
+    # Normalize each generated sheet in a private input tree.  This keeps the
+    # postprocessor's source-cell contract stable when AI Render returns 1K
+    # sheets, while preserving cell boundaries for every animation frame.
+    with tempfile.TemporaryDirectory(prefix=f".layered-input-{job_id}-") as input_temporary:
+        input_root = Path(input_temporary)
+        process_specs: dict[str, dict[str, object]] = {}
+        input_normalization: dict[str, dict[str, object]] = {}
+        for layer_id, spec in specs.items():
+            generated_value = (
+                spec.get("generated_sheet")
+                or spec.get("source")
+                or spec.get("input")
+            )
+            generated_path = _resolve_layered_local_path(
+                generated_value, Path.cwd(), f"camada {layer_id} generated_sheet"
+            )
+            normalized_path, normalization = _normalize_layered_input_sheet(
+                generated_path,
+                input_root / layer_id,
+                rows=rows,
+                phases=phases,
+                target_cell=source_cell,
+            )
+            # The normalized file is intentionally ephemeral; do not return
+            # a path that becomes dangling when the input tree is removed.
+            normalization = dict(normalization)
+            normalization.pop("path", None)
+            process_specs[layer_id] = {
+                **dict(spec),
+                "generated_sheet": normalized_path,
+            }
+            input_normalization[layer_id] = normalization
+        processed = gemini_sprite_postprocess.process_layer_bundle(
+            process_specs,
+            process_output,
+            profile_id=profile_id,
+            process_fn=process_fn,
+            rows=rows,
+            phases=phases,
+            source_cell=source_cell,
+            output_cell=output_cell,
+            **dict(process_kwargs or {}),
+        )
+        processed["input_normalization"] = input_normalization
+    reports = processed.get("layers")
+    if not isinstance(reports, Mapping):
+        raise ValueError("pós-processamento layered não retornou as duas camadas")
+    try:
+        character_sheet = Path(reports["character"]["spritesheet"])
+        weapon_sheet = Path(reports["weapon"]["spritesheet"])
+    except (KeyError, TypeError) as exc:
+        raise ValueError("relatório pós-processado não declarou spritesheets finais") from exc
+    if not character_sheet.is_absolute():
+        character_sheet = process_output / character_sheet
+    if not weapon_sheet.is_absolute():
+        weapon_sheet = process_output / weapon_sheet
+    mask_paths = _front_mask_paths_for_layer(specs["weapon"], rows=rows, phases=phases)
+    composer = (
+        layered_compositor.compose_layered_spritesheets_v2
+        if composer_fn is None
+        else composer_fn
+    )
+    publisher = publish_layered_job_v2 if publish_fn is None else publish_fn
+    with tempfile.TemporaryDirectory(prefix=f".layered-compose-{job_id}-") as temporary:
+        compose_root = Path(temporary) / "composition"
+        character_cells = _extract_layered_sheet_cells(
+            character_sheet, compose_root / "character", rows=rows, phases=phases
+        )
+        weapon_cells = _extract_layered_sheet_cells(
+            weapon_sheet, compose_root / "weapon", rows=rows, phases=phases
+        )
+        with Image.open(next(iter(character_cells.values()))) as first_cell:
+            final_cell_size = first_cell.size
+        mask_paths = _normalize_layered_mask_paths(
+            mask_paths,
+            compose_root / "masks",
+            cell_size=final_cell_size,
+        )
+        cells = [
+            {
+                "row": row,
+                "column": column,
+                "character_path": str(character_cells[(row, column)]),
+                "weapon_path": str(weapon_cells[(row, column)]),
+                "front_mask_path": str(mask_paths[(row, column)]),
+            }
+            for row in range(rows)
+            for column in range(phases)
+        ]
+        composition = composer(
+            cells,
+            compose_root,
+            grid=(rows, phases),
+            dilation=dilation,
+        )
+        if not isinstance(composition, Mapping):
+            raise ValueError("compositor layered não retornou relatório")
+        output_paths = {}
+        output_contract = {
+            "character_full": "character_full_spritesheet",
+            "component_visible": "component_visible_spritesheet",
+            "component_visibility_mask": "component_visibility_mask",
+            "preview": "composite_preview",
+        }
+        for key, report_key in output_contract.items():
+            value = composition.get(report_key)
+            if value is None and isinstance(composition.get("outputs"), Mapping):
+                value = composition["outputs"].get(report_key)
+            if value is None:
+                raise ValueError(f"compositor não retornou {report_key}")
+            path = Path(value).expanduser()
+            if not path.is_absolute():
+                path = compose_root / path
+            path = path.resolve()
+            if not path.is_file():
+                raise ValueError(f"compositor não produziu {report_key}")
+            try:
+                output_paths[key] = path.relative_to(compose_root).as_posix()
+            except ValueError:
+                raise ValueError(
+                    f"{report_key} deve permanecer na árvore do compositor"
+                ) from None
+        validation = holdout_validation.validate_layered_composition(
+            character_source=character_sheet,
+            character_full=compose_root / output_paths["character_full"],
+            component_source=weapon_sheet,
+            visibility_mask=compose_root / output_paths["component_visibility_mask"],
+            component_visible=compose_root / output_paths["component_visible"],
+            preview=compose_root / output_paths["preview"],
+            grid=(rows, phases),
+            tolerance=tolerance,
+            output_path=process_output / "layered_composition_validation.json",
+        )
+        composition = {**dict(composition), "validation": validation}
+        processed = _mark_layered_holdout_complete(
+            process_output, processed, composition
+        )
+        character_report = reports.get("character", {})
+        foot_anchor = (
+            character_report.get("foot_anchor")
+            if isinstance(character_report, Mapping)
+            else None
+        )
+        runtime = layered_bundle.default_layered_runtime(
+            list(final_cell_size),
+            rows=rows,
+            columns=phases,
+            fps=float(dict(process_kwargs or {}).get("fps", 10.0)),
+            action_id=str(audit_source.get("render_id") or "default"),
+            foot_anchor=foot_anchor,
+        )
+        publication = publisher(
+            str(job_id),
+            compose_root,
+            source=audit_source,
+            provenance=provenance,
+            config=config,
+            require_auditable_source=True,
+            runtime=runtime,
+            rows=rows,
+            columns=phases,
+            component_id=component_id,
+            component_kind=component_kind,
+            **output_paths,
+        )
+    return {
+        "job_id": str(job_id),
+        "source": audit_source,
+        "holdout_stage": "after_final_resolution",
+        "postprocess": processed,
+        "composition": composition,
+        "publication": publication,
+    }
+
+
+def publish_layered_job(
+    job_id: str,
+    source_root: Path,
+    *,
+    source: dict | None = None,
+    provenance: dict | list[dict] | None = None,
+    config=None,
+    require_auditable_source: bool = False,
+    **artifact_paths,
+) -> dict:
+    """Publish a compositor output tree and return public, relative URLs."""
+    if require_auditable_source:
+        source = layered_bundle.validate_auditable_source(source)
+    supported = {
+        "character_holdout",
+        "weapon",
+        "holdout_source",
+        "preview",
+    }
+    unknown = sorted(set(artifact_paths) - supported)
+    if unknown:
+        raise ValueError(f"artefatos de bundle desconhecidos: {', '.join(unknown)}")
+    destination = _layered_bundle_destination(job_id)
+    manifest = layered_bundle.publish_layered_bundle(
+        source_root,
+        destination,
+        source=source,
+        provenance=provenance,
+        config=config,
+        # Keep one hashing implementation for server-side provenance and
+        # the bundle's existing four-file integrity map.
+        hash_file=sha256_file,
+        **artifact_paths,
+    )
+    registry_path = destination / layered_bundle.ARTIFACT_HASH_REGISTRY_FILENAME
+    registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    layered_bundle.validate_artifact_hash_registry(
+        registry,
+        {"published": destination},
+        scopes={"published"},
+        hash_file=sha256_file,
+    )
+    urls = _layered_bundle_urls(str(job_id), manifest)
+    return {
+        "job_id": str(job_id),
+        "manifest": manifest,
+        "artifact_hashes": registry,
+        "manifest_url": f"/api/layered-bundles/{quote(str(job_id), safe='')}",
+        "artifact_hashes_url": (
+            f"/layered-outputs/{quote(str(job_id), safe='')}/"
+            f"{layered_bundle.ARTIFACT_HASH_REGISTRY_FILENAME}"
+        ),
+        "outputs": urls,
+    }
+
+
+def publish_layered_job_v2(
+    job_id: str,
+    source_root: Path,
+    *,
+    character_full: Path | str,
+    component_visible: Path | str,
+    component_visibility_mask: Path | str,
+    preview: Path | str,
+    runtime: Mapping[str, object],
+    rows: int = 8,
+    columns: int = 8,
+    source: dict | None = None,
+    provenance: dict | list[dict] | None = None,
+    config=None,
+    require_auditable_source: bool = False,
+    character_id: str = "character",
+    component_id: str = "equipment",
+    component_kind: str = "equipment",
+) -> dict:
+    """Publish the immutable-base modular contract used by the v2 pipeline."""
+    if require_auditable_source:
+        source = layered_bundle.validate_auditable_source(source)
+    destination = _layered_bundle_destination(job_id)
+    manifest = layered_bundle.publish_layered_bundle_v2(
+        source_root,
+        destination,
+        base={"id": character_id, "file": character_full, "z": 0},
+        components=[
+            {
+                "id": component_id,
+                "kind": component_kind,
+                "file": component_visible,
+                "visible_mask": component_visibility_mask,
+                "occluders": [character_id],
+                "z": 1,
+            }
+        ],
+        preview=preview,
+        source=source or {},
+        runtime=runtime,
+        rows=rows,
+        columns=columns,
+        provenance=provenance,
+        config=config,
+        hash_file=sha256_file,
+    )
+    registry_path = destination / layered_bundle.ARTIFACT_HASH_REGISTRY_FILENAME
+    registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    layered_bundle.validate_artifact_hash_registry(
+        registry,
+        {"published": destination},
+        scopes={"published"},
+        hash_file=sha256_file,
+    )
+    return {
+        "job_id": str(job_id),
+        "manifest": manifest,
+        "artifact_hashes": registry,
+        "manifest_url": f"/api/layered-bundles/{quote(str(job_id), safe='')}",
+        "artifact_hashes_url": (
+            f"/layered-outputs/{quote(str(job_id), safe='')}/"
+            f"{layered_bundle.ARTIFACT_HASH_REGISTRY_FILENAME}"
+        ),
+        "outputs": _layered_bundle_urls(str(job_id), manifest),
+    }
+
+
+# Explicit name for callers that prefer the bundle-oriented API vocabulary.
+publish_layered_bundle_for_job = publish_layered_job
+
+
+def _read_published_layered_manifest(job_id: str) -> dict | None:
+    destination = _layered_bundle_destination(job_id)
+    manifest_path = destination / "layered_sprite_bundle.json"
+    if not manifest_path.is_file():
+        return None
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    return layered_bundle.validate_layered_bundle(manifest, destination)
+
+
+def _read_published_layered_registry(job_id: str) -> dict:
+    destination = _layered_bundle_destination(job_id)
+    registry_path = destination / layered_bundle.ARTIFACT_HASH_REGISTRY_FILENAME
+    if not registry_path.is_file():
+        raise ValueError("registro de hashes do bundle ausente")
+    try:
+        registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"registro de hashes inválido: {exc}") from None
+    return layered_bundle.validate_artifact_hash_registry(
+        registry,
+        {"published": destination},
+        scopes={"published"},
+        hash_file=sha256_file,
+    )
+
+
+def _published_layered_descriptor(
+    job_id: str,
+    manifest: dict,
+    registry: dict | None = None,
+) -> dict:
+    outputs = _layered_bundle_urls(job_id, manifest)
+    descriptor = {
+        "job_id": job_id,
+        "manifest": manifest,
+        "manifest_url": f"/api/layered-bundles/{quote(job_id, safe='')}",
+        "outputs": outputs,
+        "artifacts": _published_layered_artifacts(job_id, manifest),
+    }
+    if registry is not None:
+        descriptor.update(
+            {
+                "artifact_hashes": registry,
+                "artifact_hashes_url": (
+                    f"/layered-outputs/{quote(job_id, safe='')}/"
+                    f"{layered_bundle.ARTIFACT_HASH_REGISTRY_FILENAME}"
+                ),
+            }
+        )
+    return descriptor
+
+
+def _published_layered_artifacts(job_id: str, manifest: dict) -> list[dict[str, str]]:
+    """Describe only manifest-declared public artifacts for the results UI."""
+    encoded_job = quote(str(job_id), safe="")
+    layers = manifest.get("layers") or []
+    if len(layers) < 2:
+        raise ValueError("manifest layered sem as duas camadas canônicas")
+    if manifest.get("schema") == layered_bundle.LAYERED_BUNDLE_SCHEMA_V2:
+        component = layers[1]
+        names = {
+            "character_full": str(layers[0]["file"]),
+            "component_visible": str(component["file"]),
+            "component_visibility_mask": str(
+                component["occlusion"]["visible_mask"]
+            ),
+            "preview": str(manifest["preview"]),
+            "manifest": "layered_sprite_bundle.json",
+            "hashes": layered_bundle.ARTIFACT_HASH_REGISTRY_FILENAME,
+        }
+        labels = {
+            "character_full": "Personagem completo",
+            "component_visible": "Equipamento visível",
+            "component_visibility_mask": "Máscara de visibilidade",
+            "preview": "Composição final",
+            "manifest": "Manifesto do bundle",
+            "hashes": "Registro de hashes",
+        }
+        kinds = {
+            key: "image"
+            for key in (
+                "character_full",
+                "component_visible",
+                "component_visibility_mask",
+                "preview",
+            )
+        }
+        kinds.update({"manifest": "json", "hashes": "json"})
+        return [
+            {
+                "key": key,
+                "label": labels[key],
+                "kind": kinds[key],
+                "filename": filename,
+                "url": f"/layered-outputs/{encoded_job}/{quote(filename, safe='/')}",
+                "download_url": (
+                    f"/api/layered-bundles/{encoded_job}/download/{key}"
+                ),
+            }
+            for key, filename in names.items()
+        ]
+    names = {
+        "weapon": str(layers[0].get("file") or "weapon_spritesheet.png"),
+        "character_holdout": str(layers[1].get("file") or "character_holdout_spritesheet.png"),
+        "holdout_source": str(layers[1].get("holdout_source") or "holdout_cut_mask.png"),
+        "preview": str(manifest.get("preview") or "composite_preview.png"),
+        "manifest": "layered_sprite_bundle.json",
+        "hashes": layered_bundle.ARTIFACT_HASH_REGISTRY_FILENAME,
+    }
+    labels = {
+        "character_holdout": "Personagem · holdout",
+        "weapon": "Arma",
+        "holdout_source": "Máscara holdout",
+        "preview": "Composição final",
+        "manifest": "Manifesto do bundle",
+        "hashes": "Registro de hashes",
+    }
+    kinds = {key: "image" for key in ("character_holdout", "weapon", "holdout_source", "preview")}
+    kinds.update({"manifest": "json", "hashes": "json"})
+    return [
+        {
+            "key": key,
+            "label": labels[key],
+            "kind": kinds[key],
+            "filename": filename,
+            "url": f"/layered-outputs/{encoded_job}/{quote(filename, safe='/')}",
+            "download_url": f"/api/layered-bundles/{encoded_job}/download/{key}",
+        }
+        for key, filename in names.items()
+    ]
+
+
+def list_published_layered_bundles() -> list[dict]:
+    """List valid promoted bundles without exposing staging/work paths."""
+    root = LAYERED_PUBLISHED_ROOT
+    if not root.is_dir():
+        return []
+    bundles: list[dict] = []
+    for candidate in sorted(root.iterdir(), key=lambda path: path.name, reverse=True):
+        if not candidate.is_dir() or candidate.name.startswith("."):
+            continue
+        try:
+            manifest = _read_published_layered_manifest(candidate.name)
+            if manifest is None:
+                continue
+            registry = _read_published_layered_registry(candidate.name)
+            bundles.append(_published_layered_descriptor(candidate.name, manifest, registry))
+        except (OSError, ValueError, json.JSONDecodeError):
+            # A partial/invalid publication is not discoverable through the
+            # manager; the scoped artifact endpoint remains fail-closed.
+            continue
+    return bundles
+
+
+def _resolve_layered_download(job_id: str, artifact: str) -> tuple[Path, str] | None:
+    """Resolve a fixed artifact key and return a stable attachment name."""
+    allowed = {
+        "character_holdout": ("character_holdout_spritesheet.png", "png"),
+        "weapon": ("weapon_spritesheet.png", "png"),
+        "holdout_source": ("holdout_cut_mask.png", "png"),
+        "character_full": ("character_full_spritesheet.png", "png"),
+        "component_visible": ("component_visible_spritesheet.png", "png"),
+        "component_visibility_mask": ("component_visibility_mask.png", "png"),
+        "preview": ("composite_preview.png", "png"),
+        "manifest": ("layered_sprite_bundle.json", "json"),
+        "hashes": (layered_bundle.ARTIFACT_HASH_REGISTRY_FILENAME, "json"),
+    }
+    requested = allowed.get(str(artifact or "").strip())
+    if requested is None:
+        return None
+    filename, suffix = requested
+    target = _resolve_published_layered_artifact(f"{job_id}/{filename}")
+    if target is None or not target.is_file():
+        return None
+    safe_job = re.sub(r"[^A-Za-z0-9._-]+", "_", str(job_id)).strip("._-") or "bundle"
+    return target, f"sprite_lab_{safe_job}_{str(artifact).strip()}.{suffix}"
+
+
+def _resolve_published_layered_artifact(relative: str) -> Path | None:
+    """Resolve only a manifest-declared artifact in a promoted job tree."""
+    portable = layered_bundle._portable_path(relative, "layered output path")
+    parts = PurePosixPath(portable).parts
+    if len(parts) != 2:
+        raise ValueError("layered output path deve conter job e arquivo")
+    job_id, filename = parts
+    destination = _layered_bundle_destination(job_id)
+    manifest = _read_published_layered_manifest(job_id)
+    if manifest is None:
+        return None
+    _read_published_layered_registry(job_id)
+    allowed = {
+        layer["file"]
+        for layer in manifest["layers"]
+    }
+    for layer in manifest["layers"]:
+        if isinstance(layer.get("occlusion"), dict):
+            allowed.add(layer["occlusion"]["visible_mask"])
+        if layer.get("holdout_source"):
+            allowed.add(layer["holdout_source"])
+    allowed.update(
+        {
+            manifest["preview"],
+            "layered_sprite_bundle.json",
+            layered_bundle.ARTIFACT_HASH_REGISTRY_FILENAME,
+        }
+    )
+    if filename not in allowed:
+        return None
+    target = (destination / filename).resolve()
+    if not target.is_relative_to(destination):
+        raise ValueError("layered artifact deve permanecer no job publicado")
+    return target
 
 
 def normalize_gemini_channels(value) -> list[str]:
@@ -540,6 +1743,61 @@ def normalize_gemini_channels(value) -> list[str]:
     if not channels:
         raise ValueError("selecione ao menos uma referência estrutural")
     return channels
+
+
+def normalize_identity_guide_mode(value) -> str:
+    """Validate the detector used for the derived identity guide input."""
+    mode = str(value or "lineart_standard").strip().casefold()
+    if mode not in IDENTITY_GUIDE_MODES:
+        raise ValueError(
+            f"identity_lineart_mode inválido: {value!r}; "
+            f"use um de {', '.join(IDENTITY_GUIDE_MODES)}"
+        )
+    return mode
+
+
+def normalize_holdout_dilation(value) -> int:
+    """Validate the UI holdout expansion without allowing unbounded work."""
+    if value is None or value == "":
+        return 0
+    if isinstance(value, bool):
+        raise ValueError("holdout_dilation deve ser um inteiro entre 0 e 32")
+    if isinstance(value, str) and not re.fullmatch(r"[0-9]+", value.strip()):
+        raise ValueError("holdout_dilation deve ser um inteiro entre 0 e 32")
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError):
+        raise ValueError("holdout_dilation deve ser um inteiro entre 0 e 32") from None
+    if (
+        normalized < 0
+        or normalized > 32
+        or isinstance(value, float)
+        and value != normalized
+    ):
+        raise ValueError("holdout_dilation deve ser um inteiro entre 0 e 32")
+    return normalized
+
+
+def normalize_holdout_tolerance(value) -> int:
+    """Validate the UI's finite border-review tolerance in pixels."""
+    if value is None or value == "":
+        return 4
+    if isinstance(value, bool):
+        raise ValueError("holdout_tolerance deve ser um inteiro entre 0 e 32")
+    if isinstance(value, str) and not re.fullmatch(r"[0-9]+", value.strip()):
+        raise ValueError("holdout_tolerance deve ser um inteiro entre 0 e 32")
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError):
+        raise ValueError("holdout_tolerance deve ser um inteiro entre 0 e 32") from None
+    if (
+        normalized < 0
+        or normalized > 32
+        or isinstance(value, float)
+        and value != normalized
+    ):
+        raise ValueError("holdout_tolerance deve ser um inteiro entre 0 e 32")
+    return normalized
 
 
 def list_gemini_sources() -> list[dict]:
@@ -597,6 +1855,14 @@ def list_gemini_sources() -> list[dict]:
         sources_result["inherited"] = {
             "action": action.get("clip_name") or action.get("name") or None,
             "components": component_labels,
+            # The UI needs stable component ids to build an explicit
+            # holdout layer contract.  Keep the existing display labels for
+            # older clients and expose the normalized inventory separately.
+            "component_specs": [
+                copy.deepcopy(item)
+                for item in inherited.get("components", [])
+                if isinstance(item, dict)
+            ],
             "foot_anchor": inherited.get("framing", {}).get("foot_anchor"),
         }
         sources.append(sources_result)
@@ -634,6 +1900,126 @@ def _decode_reference(data_url: str, destination: Path) -> dict:
     return {"mime": mime.removeprefix("data:"), "bytes": len(raw), "size": size}
 
 
+UPLOAD_MAX_BYTES = 1_073_741_824  # 1 GiB
+UPLOAD_FILENAME_RE = re.compile(r"[\w][\w .()\[\]-]*\.zip\Z", re.IGNORECASE)
+
+
+class UploadTooLargeError(ValueError):
+    """Raised when a catalog upload exceeds UPLOAD_MAX_BYTES."""
+
+
+class BodyTooLargeError(ValueError):
+    """Raised when a JSON body exceeds MAX_BODY_BYTES."""
+
+
+# Global ceiling for JSON request bodies. Large but bounded: Gemini identity
+# references (data URLs of ~25MB images ≈ 33MB base64) must pass, while
+# unbounded reads cannot exhaust RAM. The ZIP upload and /api/events paths
+# enforce their own stricter limits before reaching _body.
+MAX_BODY_BYTES = 64 * 1024 * 1024
+
+
+def catalog_upload_root() -> Path:
+    """Inbox directory watched by the catalog indexer (auto_discover)."""
+    root = rel.DEFAULT_OUTPUT.parent.parent
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def sanitize_upload_filename(name: str) -> str:
+    base = Path(str(name or "").replace("\\", "/")).name.strip()
+    if not base or base.startswith(".") or not UPLOAD_FILENAME_RE.fullmatch(base):
+        raise ValueError("nome de arquivo inválido: envie um .zip com nome simples")
+    return base
+
+
+def incoming_source_id(filename: str) -> str:
+    stem = Path(filename).stem.casefold()
+    slug = re.sub(r"[^a-z0-9]+", "_", stem).strip("_") or "upload"
+    return f"incoming__{slug}"
+
+
+def save_catalog_upload(handler: BaseHTTPRequestHandler, filename: str) -> dict:
+    """Stream a raw ZIP body into the catalog inbox atomically."""
+    safe = sanitize_upload_filename(filename)
+    try:
+        total = int(handler.headers.get("Content-Length", 0) or 0)
+    except (TypeError, ValueError):
+        total = 0
+    if total <= 0:
+        raise ValueError("corpo ZIP vazio ou sem Content-Length")
+    if total > UPLOAD_MAX_BYTES:
+        raise UploadTooLargeError("ZIP acima do limite de 1 GiB")
+    root = catalog_upload_root()
+    destination = root / safe
+    counter = 2
+    while destination.exists():
+        destination = root / f"{Path(safe).stem}_{counter}.zip"
+        counter += 1
+    temporary = destination.with_name(f".{destination.name}.upload")
+    remaining = total
+    with open(temporary, "wb") as output:
+        while remaining > 0:
+            chunk = handler.rfile.read(min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            output.write(chunk)
+            remaining -= len(chunk)
+    try:
+        if remaining > 0 or temporary.stat().st_size != total:
+            raise ValueError("upload incompleto, tente novamente")
+        if not zipfile.is_zipfile(temporary):
+            raise ValueError("arquivo não é um ZIP válido")
+        temporary.replace(destination)
+    except (OSError, ValueError):
+        temporary.unlink(missing_ok=True)
+        raise
+    obs.log_event(
+        "catalog_upload_received",
+        file=destination.name,
+        bytes=total,
+        source_id_hint=incoming_source_id(destination.name),
+    )
+    return {
+        "file": destination.name,
+        "bytes": total,
+        "source_id_hint": incoming_source_id(destination.name),
+    }
+
+
+def list_catalog_uploads() -> list[dict]:
+    root = catalog_upload_root()
+    rows = []
+    for child in sorted(root.iterdir(), key=lambda item: item.name.casefold()):
+        if not child.is_file() or child.suffix.lower() != ".zip" or child.name.startswith("."):
+            continue
+        stat = child.stat()
+        rows.append(
+            {
+                "file": child.name,
+                "bytes": stat.st_size,
+                "modified_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
+                .replace(microsecond=0)
+                .isoformat(),
+                "source_id_hint": incoming_source_id(child.name),
+            }
+        )
+    return rows
+
+
+def _model_cache_stats() -> dict:
+    """Lightweight cache counters for ``GET /api/health`` (never runs Blender)."""
+    try:
+        cached = sum(1 for item in model_cache.MODEL_CACHE_PATH.iterdir() if item.suffix == ".glb")
+    except OSError:
+        cached = 0
+    try:
+        sources = sum(1 for item in model_cache.SOURCE_CACHE_PATH.iterdir() if item.is_dir())
+    except OSError:
+        sources = 0
+    return {"converted_glb": cached, "extracted_sources": sources}
+
+
 def update_sprite_job(job_id: str, patch: dict) -> dict | None:
     with JOB_LOCK:
         jobs = read_sprite_jobs()
@@ -649,8 +2035,8 @@ def get_sprite_job(job_id: str) -> dict | None:
     return next((job for job in read_sprite_jobs() if job.get("id") == job_id), None)
 
 
-def build_sprite_download(job_id: str) -> tuple[bytes, str]:
-    """Package every deliverable from a completed sprite job in one archive."""
+def _sprite_download_files(job_id: str) -> tuple[list[tuple[Path, str]], str]:
+    """Collect deliverables for the sprite-job ZIP download."""
     job = get_sprite_job(job_id)
     if job is None:
         raise KeyError("renderização de sprites não encontrada")
@@ -681,12 +2067,35 @@ def build_sprite_download(job_id: str) -> tuple[bytes, str]:
             files.append((path, name if name == "spritesheet.png" else f"metadata/{name}"))
     if not files:
         raise FileNotFoundError("nenhum artefato encontrado para download")
+    return files, f"sprites_{job_id}.zip"
 
+
+def build_sprite_download(job_id: str) -> tuple[bytes, str]:
+    """Package every deliverable from a completed sprite job in one archive."""
+    files, filename = _sprite_download_files(job_id)
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for path, archive_name in files:
             archive.write(path, archive_name)
-    return buffer.getvalue(), f"sprites_{job_id}.zip"
+    return buffer.getvalue(), filename
+
+
+def build_sprite_download_file(job_id: str, directory: Path | None = None) -> tuple[Path, str]:
+    """Same archive as :func:`build_sprite_download` but spooled to disk.
+
+    Preferred for the HTTP layer: the ZIP is streamed from the file instead
+    of being held whole in RAM (see ``_download_path``).
+    """
+    files, filename = _sprite_download_files(job_id)
+    target_dir = directory or SPRITE_WORK
+    target_dir.mkdir(parents=True, exist_ok=True)
+    temporary = target_dir / f".{filename}.tmp.zip"
+    with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for path, archive_name in files:
+            archive.write(path, archive_name)
+    destination = target_dir / filename
+    temporary.replace(destination)
+    return destination, filename
 
 
 def read_bug_reports() -> list[dict]:
@@ -823,6 +2232,11 @@ def run_sprite_job(job: dict) -> None:
             "spritesheet": f"{job['id']}/spritesheet.png",
             "gif": f"{job['id']}/animation.gif" if report.get("gif") else None,
             "gifs": direction_gifs,
+            "controlnet_channels": {
+                "lineart": f"{job['id']}/spritesheet_lineart.png",
+                "bones": f"{job['id']}/spritesheet_bones.png",
+                "report": f"{job['id']}/controlnet_channels.json",
+            },
             "ai_base_pages": {
                 direction: f"{job['id']}/{Path(path).name}"
                 for direction, path in (report.get("ai_base_pages") or {}).items()
@@ -890,15 +2304,19 @@ def ai_render_source_contract(source: Path) -> dict:
     for item in raw_components if isinstance(raw_components, list) else []:
         if not isinstance(item, dict) or item.get("visible") is False:
             continue
+        component_id = str(item.get("id") or "component").strip() or "component"
         asset_id = str(item.get("asset_id") or "").strip()
         attach_to = str(item.get("attach_to") or "").strip()
         hand = "right" if attach_to.endswith("_r") else "left" if attach_to.endswith("_l") else ""
+        role = str(item.get("role") or "component").strip() or "component"
         components.append(
             {
-                "id": str(item.get("id") or "component"),
-                "role": str(item.get("role") or "component"),
+                "id": component_id,
+                "role": role,
                 "asset_id": asset_id or None,
-                "name": asset_names.get(asset_id) or str(item.get("role") or "component"),
+                "name": asset_names.get(asset_id)
+                or str(item.get("name") or asset_id or component_id).strip()
+                or component_id,
                 "attach_to": attach_to or None,
                 "hand": hand or None,
                 "attach_to_secondary": item.get("attach_to_secondary"),
@@ -1100,8 +2518,83 @@ def build_ai_render_frame_control(output_path: Path) -> None:
     image.close()
 
 
+def _prepare_identity_lineart(
+    source_path: Path,
+    output_path: Path,
+    mode: str = "lineart_standard",
+) -> dict[str, object]:
+    """Create the selected line/edge companion for an identity reference.
+
+    The detector lives in the CUDA-capable pipeline environment, so the HTTP
+    server does not need to import ControlNet annotators into its own runtime.
+    Results are cached by the exact identity image hash and detector mode
+    because each deterministic detector produces a different input guide.
+    """
+    mode = normalize_identity_guide_mode(mode)
+    source_hash = sha256_file(source_path)
+    cache_path = GEMINI_IDENTITY_LINEART_CACHE / f"{source_hash}_{mode}.png"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if cache_path.is_file():
+        shutil.copy2(cache_path, output_path)
+        return {
+            "mode": mode,
+            "detector": (
+                "controlnet_aux.LineartDetector"
+                if mode == "lineart_standard"
+                else "controlnet_aux.CannyDetector"
+            ),
+            "cache_hit": True,
+            "source_sha256": source_hash,
+            "path": str(output_path),
+        }
+
+    completed = subprocess.run(
+        [
+            pipeline_python_executable(),
+            str(BASE / "identity_lineart.py"),
+            str(source_path),
+            str(output_path),
+            "--mode",
+            mode,
+            "--device",
+            os.environ.get("SPRITE_LAB_IDENTITY_LINEART_DEVICE", "auto"),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(BASE),
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"pré-processamento {mode} falhou:\n"
+            f"{completed.stdout}\n{completed.stderr}"
+        )
+    try:
+        lines = completed.stdout.splitlines()
+        json_start = next(
+            index for index, line in enumerate(lines) if line.strip().startswith("{")
+        )
+        report = json.loads("\n".join(lines[json_start:]))
+    except (StopIteration, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            f"pré-processamento {mode} não produziu relatório JSON"
+        ) from error
+    if not output_path.is_file():
+        raise RuntimeError(f"pré-processamento {mode} não produziu a imagem")
+    GEMINI_IDENTITY_LINEART_CACHE.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(output_path, cache_path)
+    return {
+        **(report if isinstance(report, dict) else {}),
+        "mode": mode,
+        "cache_hit": False,
+        "source_sha256": source_hash,
+        "path": str(output_path),
+    }
+
+
 def run_gemini_job(job: dict) -> None:
     started_at = utc_now()
+    layer_progress: dict[str, dict[str, object]] | None = None
     update_gemini_job(
         job["id"],
         {
@@ -1115,6 +2608,9 @@ def run_gemini_job(job: dict) -> None:
         provider_name = image_generation_provider.normalize_provider(
             str(job["payload"].get("provider", "openai"))
         )
+        identity_lineart_mode = normalize_identity_guide_mode(
+            job["payload"].get("identity_lineart_mode")
+        )
         output = GEMINI_WORK / job["id"] / "gemini_output.png"
         reference_channels = normalize_gemini_channels(
             job["payload"].get(
@@ -1125,6 +2621,18 @@ def run_gemini_job(job: dict) -> None:
         reference_id = str(job["payload"].get("reference_id", "")).strip()
         if reference_id:
             shutil.copy2(gemini_reference_path(reference_id), input_paths[0])
+        identity_lineart_path = GEMINI_WORK / job["id"] / "identity_lineart.png"
+        update_pipeline_progress(
+            GEMINI_JOBS_PATH,
+            job["id"],
+            stage="preprocessing_identity_lineart",
+            percent=8,
+            eta_seconds=120,
+        )
+        identity_lineart_report = _prepare_identity_lineart(
+            input_paths[0], identity_lineart_path, mode=identity_lineart_mode
+        )
+        input_paths.append(identity_lineart_path)
         frame_control_path = None
         if "frame_control" in reference_channels:
             frame_control_path = GEMINI_WORK / job["id"] / "frame_control.png"
@@ -1140,6 +2648,7 @@ def run_gemini_job(job: dict) -> None:
         input_paths.extend(reference_paths[channel] for channel in reference_channels)
         reference_hashes = {
             "identity": sha256_file(input_paths[0]),
+            "identity_lineart": sha256_file(identity_lineart_path),
             **{
                 channel: sha256_file(path)
                 for channel, path in reference_paths.items()
@@ -1149,25 +2658,157 @@ def run_gemini_job(job: dict) -> None:
             with_ai_render_source_contract(job["payload"].get("render_spec"), source),
             name=str(job["payload"].get("render_name") or "").strip(),
         )
+        output_size = [
+            int(render_spec["output"]["width"]),
+            int(render_spec["output"]["height"]),
+        ]
         reference_manifest = ai_render_spec.build_reference_manifest(
             reference_channels,
             identity_name=str(job["payload"].get("reference_name") or "identity reference"),
+            include_identity_lineart=True,
+            identity_lineart_mode=identity_lineart_mode,
         )
-        expected_roles = ["identity", *reference_channels]
+        expected_roles = ["identity", "identity_lineart", *reference_channels]
         actual_roles = [str(item.get("type")) for item in reference_manifest]
         if actual_roles != expected_roles or len(input_paths) != len(reference_manifest):
             raise RuntimeError(
                 "preflight de referências falhou: manifest e arquivos físicos não correspondem"
             )
-        prompt = ai_render_spec.compile_provider_prompt(
-            render_spec,
-            reference_manifest,
-            str(
-                job["payload"].get(
-                    "additional_instructions", job["payload"].get("prompt") or ""
+        additional_instructions = str(
+            job["payload"].get(
+                "additional_instructions", job["payload"].get("prompt") or ""
+            )
+        ).strip()
+        generic_layered_mode = (
+            render_spec.get("generation_mode")
+            == ai_render_spec.GENERATION_MODE_CHARACTER_COMPONENT_HOLDOUT
+        )
+        layered_mode = render_spec.get("generation_mode") in {
+            ai_render_spec.GENERATION_MODE_CHARACTER_WEAPON_HOLDOUT,
+            ai_render_spec.GENERATION_MODE_CHARACTER_COMPONENT_HOLDOUT,
+        }
+        selected_component_id = str(
+            (render_spec.get("layer_contract") or {}).get("weapon_component_id")
+            or "weapon"
+        )
+        selected_component_kind = "weapon"
+        if generic_layered_mode:
+            component_ids = render_spec["layer_contract"]["component_ids"]
+            if len(component_ids) != 1:
+                raise RuntimeError(
+                    "a execução AI modular atual exige exatamente um componente por job"
                 )
-            ).strip(),
-            provider=provider_name,
+            selected_component_id = str(component_ids[0])
+            selected_layer = next(
+                layer
+                for layer in render_spec["layer_contract"]["layers"]
+                if layer["id"] == selected_component_id
+            )
+            selected_component_kind = str(selected_layer.get("kind") or "equipment")
+        if layered_mode:
+            # Keep the historical top-level progress fields while exposing a
+            # durable per-layer view for the UI/history.  This is deliberately
+            # updated at each worker checkpoint, so a refresh cannot lose the
+            # character approval boundary before the weapon pass starts.
+            layer_progress = {
+                "character": {
+                    "status": "queued",
+                    "stage": "queued",
+                    "percent": 0,
+                },
+                "weapon": {
+                    "status": "queued",
+                    "stage": "queued",
+                    "percent": 0,
+                },
+                "composition": {
+                    "status": "queued",
+                    "stage": "queued",
+                    "percent": 0,
+                },
+            }
+
+        def update_layer_state(layer: str, state: dict[str, object]) -> None:
+            """Persist one worker checkpoint without flattening other layers."""
+            if layer_progress is None:
+                return
+            stage = str(state.get("stage") or "processing")
+            try:
+                percent = max(0, min(100, int(state.get("percent", 0))))
+            except (TypeError, ValueError):
+                percent = 0
+            if stage.endswith("_failed") or stage.endswith("_blocked"):
+                status = "error"
+            elif stage.endswith("_complete"):
+                status = "done"
+            else:
+                status = "running"
+            layer_progress[layer] = {
+                "status": status,
+                "stage": stage,
+                "percent": percent,
+                **({"resumed": bool(state["resumed"])} if "resumed" in state else {}),
+            }
+            update_gemini_job(
+                job["id"],
+                {
+                    "status": "running" if status == "running" else stage,
+                    "progress": {
+                        "stage": stage,
+                        "percent": percent,
+                        "eta_seconds": 0 if status in {"done", "error"} else 300,
+                        "layers": copy.deepcopy(layer_progress),
+                    },
+                },
+            )
+
+        def update_layered_pipeline(stage: str, percent: int, eta: int | None) -> None:
+            """Persist composition progress alongside completed layer passes."""
+            update_gemini_job(job["id"], {"status": "building_holdout"})
+            if layer_progress is None:
+                update_pipeline_progress(
+                    GEMINI_JOBS_PATH,
+                    job["id"],
+                    stage=f"layered_{stage}",
+                    percent=min(99, int(percent)),
+                    eta_seconds=eta,
+                )
+                return
+            layer_progress["composition"] = {
+                "status": "running",
+                "stage": stage,
+                "percent": max(0, min(100, int(percent))),
+            }
+            update_pipeline_progress(
+                GEMINI_JOBS_PATH,
+                job["id"],
+                stage=f"layered_{stage}",
+                percent=min(99, int(percent)),
+                eta_seconds=eta,
+                layers=copy.deepcopy(layer_progress),
+            )
+
+        prompt = (
+            ai_render_spec.compile_modular_layer_prompt(
+                render_spec,
+                reference_manifest,
+                layer_id=render_spec["layer_contract"]["base_id"],
+                additional_instructions=additional_instructions,
+            )
+            if generic_layered_mode
+            else ai_render_spec.compile_layer_prompt(
+                render_spec,
+                reference_manifest,
+                layer="character",
+                additional_instructions=additional_instructions,
+            )
+            if layered_mode
+            else ai_render_spec.compile_provider_prompt(
+                render_spec,
+                reference_manifest,
+                additional_instructions,
+                provider=provider_name,
+            )
         )
         input_manifest = [
             {
@@ -1184,8 +2825,21 @@ def run_gemini_job(job: dict) -> None:
             "compiled_prompt": prompt,
             "prompt_contract_schema": ai_render_spec.PROMPT_SCHEMA,
             "reference_manifest": reference_manifest,
+            "output_size": output_size,
+            "identity_lineart": identity_lineart_report,
         }
         job["payload"] = runtime_payload
+        outputs = {
+            "image": f"{job['id']}/gemini_output.png",
+            "validation": f"{job['id']}/gemini_validation.png",
+            "reference": f"{job['id']}/reference.png",
+            "identity_lineart": f"{job['id']}/identity_lineart.png",
+            "frame_control": (
+                f"{job['id']}/frame_control.png"
+                if frame_control_path is not None
+                else None
+            ),
+        }
         update_gemini_job(
             job["id"],
             {
@@ -1198,6 +2852,269 @@ def run_gemini_job(job: dict) -> None:
                 },
             },
         )
+        if provider_name == "google":
+            provider = image_generation_provider.GoogleImageProvider(
+                api_key=gemini_api_key() or None
+            )
+        elif provider_name == "openai":
+            provider = image_generation_provider.OpenAIImageProvider(
+                api_key=openai_api_key() or None
+            )
+        elif provider_name == "qwen":
+            provider = image_generation_provider.QwenImageProvider(
+                api_key=qwen_api_key() or None
+            )
+        else:
+            provider = image_generation_provider.create_provider(provider_name)
+        if layered_mode:
+            character_directory = GEMINI_WORK / job["id"]
+            character_report = character_layer_worker.run_character_layer(
+                job_id=job["id"],
+                render_spec=render_spec,
+                reference_manifest=reference_manifest,
+                input_images=input_paths,
+                output_dir=character_directory,
+                model=str(job["payload"]["model"]),
+                provider=provider,
+                additional_instructions=additional_instructions,
+                update_state=lambda state: update_layer_state("character", state),
+            )
+
+            # The detachable-component pass is deliberately a separate request and
+            # checkpoint. The approved character is copied into the manifest
+            # as a context reference only; it is never used as the weapon
+            # output or as a replacement for the weapon visual reference.
+            weapon_reference_id = str(job["payload"].get("weapon_reference_id") or "").strip()
+            if not weapon_reference_id:
+                raise RuntimeError("modo holdout exige referência visual do componente")
+            weapon_reference = weapon_reference_path(weapon_reference_id)
+            weapon_reference_local = character_directory / "weapon_reference.png"
+            shutil.copy2(weapon_reference, weapon_reference_local)
+            guide_channel = "beauty" if "beauty" in reference_paths else next(iter(reference_paths))
+            weapon_guide = reference_paths[guide_channel]
+            weapon_manifest = [
+                {
+                    "index": 1,
+                    "type": (
+                        "component_reference"
+                        if generic_layered_mode
+                        else "weapon_reference"
+                    ),
+                    "name": str(
+                        get_weapon_reference(weapon_reference_id).get("name")
+                        or f"{selected_component_kind} reference"
+                    ),
+                },
+                {
+                    "index": 2,
+                    "type": "character_full",
+                    "name": "character_full.png",
+                },
+                {
+                    "index": 3,
+                    "type": (
+                        "component_guide" if generic_layered_mode else "weapon_guide"
+                    ),
+                    "name": f"{guide_channel} structural guide for {selected_component_id}",
+                },
+            ]
+            weapon_inputs = [
+                weapon_reference_local,
+                character_directory / "character_full.png",
+                weapon_guide,
+            ]
+            weapon_input_manifest = [
+                {
+                    "index": item["index"],
+                    "type": item["type"],
+                    "name": item.get("name"),
+                    "path": str(path),
+                    "sha256": sha256_file(path),
+                }
+                for item, path in zip(weapon_manifest, weapon_inputs)
+            ]
+            weapon_prompt = (
+                ai_render_spec.compile_modular_layer_prompt(
+                    render_spec,
+                    weapon_manifest,
+                    layer_id=selected_component_id,
+                    additional_instructions=additional_instructions,
+                )
+                if generic_layered_mode
+                else ai_render_spec.compile_layer_prompt(
+                    render_spec,
+                    weapon_manifest,
+                    layer="weapon",
+                    additional_instructions=additional_instructions,
+                )
+            )
+            weapon_runtime_payload = {
+                **runtime_payload,
+                "weapon_prompt": weapon_prompt,
+                "weapon_reference_manifest": weapon_manifest,
+                "weapon_input_manifest": weapon_input_manifest,
+                "weapon_reference": {
+                    "id": weapon_reference_id,
+                    "sha256": sha256_file(weapon_reference_local),
+                    "path": f"{job['id']}/weapon_reference.png",
+                },
+            }
+            update_gemini_job(
+                job["id"],
+                {
+                    "payload": weapon_runtime_payload,
+                    "preflight": {
+                        "status": "passed",
+                        "prompt_contract_schema": ai_render_spec.PROMPT_SCHEMA,
+                        "reference_manifest": reference_manifest,
+                        "input_manifest": input_manifest,
+                        "weapon_reference_manifest": weapon_manifest,
+                        "weapon_input_manifest": weapon_input_manifest,
+                    },
+                },
+            )
+            weapon_report = weapon_layer_worker.run_weapon_layer(
+                job_id=job["id"],
+                render_spec=render_spec,
+                reference_manifest=weapon_manifest,
+                input_images=weapon_inputs,
+                output_dir=character_directory,
+                model=str(job["payload"]["model"]),
+                provider=provider,
+                additional_instructions=additional_instructions,
+                update_state=lambda state: update_layer_state("weapon", state),
+                layer_id=selected_component_id,
+            )
+            layered_integration = None
+            if job["payload"].get("publish_layered_bundle") is True:
+                postprocess_model = str(
+                    job["payload"].get(
+                        "postprocess_model_profile", "anime_x4plus_6b"
+                    )
+                ).strip()
+                layered_source = {
+                    "job_id": str(job["id"]),
+                    "render_id": str(
+                        job["payload"].get("render_id")
+                        or job["payload"].get("render_name")
+                        or job["id"]
+                    ),
+                    "provider": provider_name,
+                    "model": str(job["payload"].get("model") or "").strip(),
+                    "source_id": str(job["payload"].get("source_id") or "").strip(),
+                }
+                layered_integration = run_layered_postprocess_compose_publish(
+                    str(job["id"]),
+                    {
+                        "character": {
+                            "generated_sheet": character_directory / "character_full.png",
+                            "structural_dir": source,
+                        },
+                        "weapon": {
+                            "generated_sheet": character_directory / "weapon_full.png",
+                            "structural_dir": source,
+                            "front_mask_dir": job["payload"].get(
+                                "component_visibility_dir"
+                                if generic_layered_mode
+                                else "weapon_front_mask_dir",
+                                source
+                                / (
+                                    "component_visible"
+                                    if generic_layered_mode
+                                    else "weapon_front_mask"
+                                ),
+                            ),
+                        },
+                    },
+                    source=layered_source,
+                    profile_id=postprocess_model,
+                    rows=8,
+                    phases=8,
+                    source_cell=256,
+                    postprocess_output=POSTPROCESS_WORK / str(job["id"]) / "layered",
+                    dilation=normalize_holdout_dilation(
+                        job["payload"].get("holdout_dilation")
+                    ),
+                    tolerance=normalize_holdout_tolerance(
+                        job["payload"].get("holdout_tolerance")
+                    ),
+                    component_id=selected_component_id,
+                    component_kind=selected_component_kind,
+                    process_kwargs={
+                        "fps": float(job["payload"].get("fps", 10.0)),
+                        "foot_anchor": (128, 220),
+                        "realesrgan_repo": BASE / "work" / "Real-ESRGAN",
+                        "python_executable": pipeline_python_executable(),
+                        "lineart_mode": str(
+                            job["payload"].get("lineart_mode", "blender")
+                        ),
+                        "progress_callback": update_layered_pipeline,
+                    },
+                    config=render_spec,
+                )
+            final_report = {"character": character_report, "weapon": weapon_report}
+            final_outputs = {
+                # Keep the historical consumer contract terminal and
+                # previewable while exposing both canonical layers.
+                "image": f"{job['id']}/weapon_full.png",
+                "validation": f"{job['id']}/weapon_validation.png",
+                "character": f"{job['id']}/character_full.png",
+                "character_validation": f"{job['id']}/character_validation.png",
+                "character_request": f"{job['id']}/character.request.json",
+                "character_response": f"{job['id']}/character_response.json",
+                "weapon": f"{job['id']}/weapon_full.png",
+                "weapon_validation": f"{job['id']}/weapon_validation.png",
+                "weapon_request": f"{job['id']}/weapon.request.json",
+                "weapon_response": f"{job['id']}/weapon_response.json",
+                "weapon_reference": f"{job['id']}/weapon_reference.png",
+            }
+            if layered_integration is not None:
+                final_report["layered"] = {
+                    "holdout_stage": layered_integration["holdout_stage"],
+                    "postprocess": layered_integration["postprocess"],
+                    "composition": layered_integration["composition"],
+                    "publication": layered_integration["publication"],
+                }
+                final_outputs["layered_bundle"] = layered_integration["publication"]
+            final_progress = {
+                "stage": "completed",
+                "percent": 100,
+                "eta_seconds": 0,
+            }
+            if layer_progress is not None:
+                # A successful terminal checkpoint is explicit for every
+                # pass, including composition when publication was requested.
+                layer_progress["character"] = {
+                    **layer_progress["character"],
+                    "status": "done",
+                    "stage": "character_complete",
+                    "percent": 100,
+                }
+                layer_progress["weapon"] = {
+                    **layer_progress["weapon"],
+                    "status": "done",
+                    "stage": "weapon_complete",
+                    "percent": 100,
+                }
+                layer_progress["composition"] = {
+                    **layer_progress["composition"],
+                    "status": "done",
+                    "stage": "completed",
+                    "percent": 100,
+                }
+                final_progress["layers"] = copy.deepcopy(layer_progress)
+            update_gemini_job(
+                job["id"],
+                {
+                    "status": "done",
+                    "validated": True,
+                    "finished_at": utc_now(),
+                    "report": final_report,
+                    "outputs": final_outputs,
+                    "progress": final_progress,
+                },
+            )
+            return
         request = image_generation_provider.GenerationRequest(
             job_id=job["id"],
             prompt=prompt,
@@ -1206,8 +3123,9 @@ def run_gemini_job(job: dict) -> None:
             model=str(job["payload"]["model"]),
             metadata={
                 "source_id": job["payload"]["source_id"],
-                "channels": ["identity", *reference_channels],
-                "output_size": [2048, 2048],
+                "channels": ["identity", "identity_lineart", *reference_channels],
+                "output_size": output_size,
+                "identity_lineart": identity_lineart_report,
                 "qwen_seed": job["payload"].get("qwen_seed"),
                 "gemini_temperature": job["payload"].get("gemini_temperature", 1.0),
                 "gemini_top_k": job["payload"].get("gemini_top_k", 64),
@@ -1226,20 +3144,6 @@ def run_gemini_job(job: dict) -> None:
             percent=15,
             eta_seconds=300,
         )
-        if provider_name == "google":
-            provider = image_generation_provider.GoogleImageProvider(
-                api_key=gemini_api_key() or None
-            )
-        elif provider_name == "openai":
-            provider = image_generation_provider.OpenAIImageProvider(
-                api_key=openai_api_key() or None
-            )
-        elif provider_name == "qwen":
-            provider = image_generation_provider.QwenImageProvider(
-                api_key=qwen_api_key() or None
-            )
-        else:
-            provider = image_generation_provider.create_provider(provider_name)
         result = provider.generate(request)
         if result.output_path is None or not result.output_path.is_file():
             raise RuntimeError(f"{provider_name} não retornou um arquivo de imagem")
@@ -1253,9 +3157,9 @@ def run_gemini_job(job: dict) -> None:
             eta_seconds=5,
         )
         with Image.open(result.output_path) as image:
-            if image.size != (2048, 2048):
+            if image.size != tuple(output_size):
                 raise RuntimeError(
-                    f"{provider_name} retornou {image.size}; esperado (2048, 2048)"
+                    f"{provider_name} retornou {image.size}; esperado {tuple(output_size)}"
                 )
         # Keep this as a separate persisted artifact for visual inspection.
         # `gemini_output.png` remains the only canonical pipeline input.
@@ -1263,6 +3167,7 @@ def run_gemini_job(job: dict) -> None:
         validation_report = build_ai_render_validation_overlay(
             result.output_path,
             validation_output,
+            cell_size=output_size[0] // ai_render_spec.GRID_COLUMNS,
         )
         validation_report.update(
             {
@@ -1272,6 +3177,19 @@ def run_gemini_job(job: dict) -> None:
                 "validated": validation_report["violation_count"] == 0,
             }
         )
+        if provider_name == "chatgpt-local":
+            provider_original = output.with_name("chatgpt_original.png")
+            provider_resized = output.with_name("chatgpt_1024.png")
+            provider_upscaled = output.with_name("chatgpt_swinir_2048.png")
+            bridge_receipt = output.with_name("chatgpt_bridge.json")
+            if provider_original.is_file():
+                outputs["provider_original"] = f"{job['id']}/chatgpt_original.png"
+            if provider_resized.is_file():
+                outputs["provider_resized"] = f"{job['id']}/chatgpt_1024.png"
+            if provider_upscaled.is_file():
+                outputs["provider_upscaled"] = f"{job['id']}/chatgpt_swinir_2048.png"
+            if bridge_receipt.is_file():
+                outputs["bridge_receipt"] = f"{job['id']}/chatgpt_bridge.json"
         finished_at = utc_now()
         response_metadata = result.response_metadata or {}
         audit_metadata = {
@@ -1287,6 +3205,7 @@ def run_gemini_job(job: dict) -> None:
             ),
             "prompt_contract_schema": ai_render_spec.PROMPT_SCHEMA,
             "reference_hashes": reference_hashes,
+            "identity_lineart": job["payload"].get("identity_lineart"),
         }
         update_gemini_job(
             job["id"],
@@ -1298,45 +3217,120 @@ def run_gemini_job(job: dict) -> None:
                 "report": {
                     "provider": result.provider,
                     "model": result.model,
-                    "output_size": [2048, 2048],
+                    "output_size": output_size,
+                    "identity_lineart": job["payload"].get("identity_lineart"),
                     "response_metadata": result.response_metadata,
                     "validation": validation_report,
                 },
-                "outputs": {
-                    "image": f"{job['id']}/gemini_output.png",
-                    "validation": f"{job['id']}/gemini_validation.png",
-                    "reference": f"{job['id']}/reference.png",
-                    "frame_control": (
-                        f"{job['id']}/frame_control.png"
-                        if frame_control_path is not None
-                        else None
-                    ),
-                },
+                "outputs": outputs,
                 "progress": {"stage": "completed", "percent": 100, "eta_seconds": 0},
             },
         )
     except Exception as exc:  # noqa: BLE001 - job errors are returned to the UI.
+        error_patch = {
+            "status": "error",
+            "validated": False,
+            "finished_at": (finished_at := utc_now()),
+            "metadata": {
+                "duration_seconds": elapsed_seconds(started_at, finished_at),
+                "request_id": None,
+                "usage": None,
+                "cost": None,
+                "effective_seed": job.get("payload", {}).get("qwen_seed"),
+                "render_spec_schema": job.get("payload", {})
+                .get("render_spec", {})
+                .get("version", ai_render_spec.SCHEMA),
+                "prompt_contract_schema": ai_render_spec.PROMPT_SCHEMA,
+                "reference_hashes": None,
+            },
+            "error": str(exc),
+        }
+        if layer_progress is not None:
+            for layer in layer_progress.values():
+                if layer.get("status") == "running":
+                    layer["status"] = "error"
+            active_stage = next(
+                (
+                    str(layer.get("stage") or "failed")
+                    for layer in layer_progress.values()
+                    if layer.get("status") == "error"
+                ),
+                "failed",
+            )
+            error_patch["progress"] = {
+                "stage": active_stage,
+                "percent": 0,
+                "eta_seconds": 0,
+                "layers": copy.deepcopy(layer_progress),
+            }
         update_gemini_job(
             job["id"],
-            {
-                "status": "error",
-                "validated": False,
-                "finished_at": (finished_at := utc_now()),
-                "metadata": {
-                    "duration_seconds": elapsed_seconds(started_at, finished_at),
-                    "request_id": None,
-                    "usage": None,
-                    "cost": None,
-                    "effective_seed": job.get("payload", {}).get("qwen_seed"),
-                    "render_spec_schema": job.get("payload", {})
-                    .get("render_spec", {})
-                    .get("version", ai_render_spec.SCHEMA),
-                    "prompt_contract_schema": ai_render_spec.PROMPT_SCHEMA,
-                    "reference_hashes": None,
-                },
-                "error": str(exc),
-            },
+            error_patch,
         )
+
+
+def _prepare_gemini_postprocess_sheet(
+    generated_sheet: Path,
+    output: Path,
+    *,
+    rows: int = 8,
+    phases: int = 8,
+    target_cell: int = 256,
+) -> tuple[Path, dict[str, object]]:
+    """Normalize a 1K AI Render sheet to the postprocess 2K working grid.
+
+    AI Render can intentionally produce 1024×1024 (128px cells) to reduce
+    generation cost. The established postprocess contract starts at 256px per
+    cell and finishes at 512px, so each cell is enlarged independently before
+    the mask and neural upscale passes. Resizing cells independently prevents
+    pixels from bleeding across animation boundaries.
+    """
+    from PIL import Image
+
+    output.mkdir(parents=True, exist_ok=True)
+    with Image.open(generated_sheet) as opened:
+        source_size = opened.size
+        if source_size == (target_cell * phases, target_cell * rows):
+            return generated_sheet, {
+                "applied": False,
+                "source_size": list(source_size),
+                "working_size": list(source_size),
+                "method": "none",
+            }
+        expected_source = (128 * phases, 128 * rows)
+        if source_size != expected_source:
+            raise ValueError(
+                "o pós-processamento aceita AI Render em 1024×1024 ou 2048×2048; "
+                f"recebido {source_size}"
+            )
+        source_cell = source_size[0] // phases
+        source = opened.convert("RGBA")
+    working_size = (target_cell * phases, target_cell * rows)
+    working = Image.new("RGBA", working_size, (0, 0, 0, 0))
+    for row in range(rows):
+        for column in range(phases):
+            box = (
+                column * source_cell,
+                row * source_cell,
+                (column + 1) * source_cell,
+                (row + 1) * source_cell,
+            )
+            cell = source.crop(box)
+            enlarged = cell.resize((target_cell, target_cell), Image.Resampling.LANCZOS)
+            working.alpha_composite(enlarged, (column * target_cell, row * target_cell))
+            cell.close()
+            enlarged.close()
+    target = output / "postprocess_input_2048.png"
+    working.save(target, format="PNG")
+    source.close()
+    working.close()
+    return target, {
+        "applied": True,
+        "source_size": list(source_size),
+        "working_size": list(working_size),
+        "method": "per_cell_lanczos_2x",
+        "path": str(target),
+    }
 
 
 def run_postprocess_job(job: dict) -> None:
@@ -1350,6 +3344,7 @@ def run_postprocess_job(job: dict) -> None:
     )
     try:
         model_profile = str(job.get("payload", {}).get("model_profile", "anime_x4plus_6b"))
+        lineart_mode = str(job.get("payload", {}).get("lineart_mode", "blender"))
         huggingface_realesrgan.profile(model_profile)
         gemini_job = get_gemini_job(str(job["payload"]["gemini_job_id"]))
         if gemini_job is None or gemini_job.get("status") != "done":
@@ -1363,6 +3358,11 @@ def run_postprocess_job(job: dict) -> None:
             f"{gemini_job['id']}/gemini_output.png",
         )
         output = _safe_work_child(POSTPROCESS_WORK, job["id"])
+        output.mkdir(parents=True, exist_ok=True)
+        postprocess_sheet, input_normalization = _prepare_gemini_postprocess_sheet(
+            generated_sheet,
+            output,
+        )
         update_pipeline_progress(
             POSTPROCESS_JOBS_PATH,
             job["id"],
@@ -1371,7 +3371,7 @@ def run_postprocess_job(job: dict) -> None:
             eta_seconds=1800,
         )
         report = gemini_sprite_postprocess.process(
-            generated_sheet,
+            postprocess_sheet,
             structural_dir,
             output,
             rows=8,
@@ -1382,6 +3382,7 @@ def run_postprocess_job(job: dict) -> None:
             realesrgan_repo=BASE / "work" / "Real-ESRGAN",
             python_executable=pipeline_python_executable(),
             model_profile=model_profile,
+            lineart_mode=lineart_mode,
             progress_callback=lambda stage, percent, eta: update_pipeline_progress(
                 POSTPROCESS_JOBS_PATH,
                 job["id"],
@@ -1390,6 +3391,10 @@ def run_postprocess_job(job: dict) -> None:
                 eta_seconds=eta,
             ),
         )
+        report["generated_sheet"] = str(generated_sheet.resolve())
+        report["postprocess_input_sheet"] = str(postprocess_sheet.resolve())
+        report["input_normalization"] = input_normalization
+        lineart_export = report.get("lineart_export") or {}
         variant_outputs = {
             name: {
                 "spritesheet": f"{job['id']}/variants/{name}/spritesheet.png",
@@ -1397,6 +3402,13 @@ def run_postprocess_job(job: dict) -> None:
             }
             for name in ("original", "frame_adjustment", "color_cohesion_256", "color_cohesion_128")
         }
+        lineart_outputs = None
+        if lineart_export.get("enabled"):
+            lineart_outputs = {
+                "mode": lineart_export.get("mode", lineart_mode),
+                "spritesheet": f"{job['id']}/lineart/spritesheet.png",
+                "gif": f"{job['id']}/lineart/animation_all_directions_1-2-5-4-3-8-7-6.gif",
+            }
         update_postprocess_job(
             job["id"],
             {
@@ -1405,6 +3417,7 @@ def run_postprocess_job(job: dict) -> None:
                 "report": report,
                 "outputs": {
                     "variants": variant_outputs,
+                    "lineart": lineart_outputs,
                     "asset_manifest": f"{job['id']}/asset_manifest.json",
                     "metadata": f"{job['id']}/render_metadata.json",
                 },
@@ -1461,6 +3474,8 @@ def _json(handler: BaseHTTPRequestHandler, data, status: int = 200) -> None:
 
 def _body(handler: BaseHTTPRequestHandler) -> dict:
     length = int(handler.headers.get("Content-Length", 0) or 0)
+    if length > MAX_BODY_BYTES:
+        raise BodyTooLargeError(f"corpo acima do limite de {MAX_BODY_BYTES // (1024 * 1024)} MB")
     raw = handler.rfile.read(length) if length else b"{}"
     try:
         value = json.loads(raw.decode("utf-8"))
@@ -1474,13 +3489,17 @@ def _file(handler: BaseHTTPRequestHandler, path: Path) -> None:
         _json(handler, {"error": "not found"}, 404)
         return
     mime = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
-    data = path.read_bytes()
+    size = path.stat().st_size
     handler.send_response(200)
     handler.send_header("Content-Type", mime)
-    handler.send_header("Content-Length", str(len(data)))
+    handler.send_header("Content-Length", str(size))
     handler.send_header("Cache-Control", "no-store")
     handler.end_headers()
-    handler.wfile.write(data)
+    # Stream in chunks: the previous read_bytes() held whole GLBs (~11MB),
+    # atlases and GIFs in RAM per request.
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            handler.wfile.write(chunk)
 
 
 def _download(handler: BaseHTTPRequestHandler, data: bytes, filename: str, content_type: str) -> None:
@@ -1493,10 +3512,60 @@ def _download(handler: BaseHTTPRequestHandler, data: bytes, filename: str, conte
     handler.wfile.write(data)
 
 
+def _download_path(handler: BaseHTTPRequestHandler, path: Path, filename: str, content_type: str) -> None:
+    """Stream a file as an attachment without loading it into RAM."""
+    size = path.stat().st_size
+    handler.send_response(200)
+    handler.send_header("Content-Type", content_type)
+    handler.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+    handler.send_header("Content-Length", str(size))
+    handler.send_header("Cache-Control", "no-store")
+    handler.end_headers()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            handler.wfile.write(chunk)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "SpriteLabSemantic/1.0"
 
+    def handle_one_request(self):  # noqa: N802
+        """Attach a request ID and structured timing to every request.
+
+        This wraps ``do_GET``/``do_POST`` without touching their bodies: the
+        ID is propagated via ``X-Request-Id`` (see ``end_headers``) and every
+        response is logged as one JSON line (see ``log_message``).
+        """
+        self._request_id = obs.new_request_id()
+        self._request_started = time.monotonic()
+        try:
+            super().handle_one_request()
+        finally:
+            duration_ms = round((time.monotonic() - self._request_started) * 1000, 2)
+            obs.log_event(
+                "http_access",
+                method=self.command,
+                path=self.path,
+                status=getattr(self, "_logged_status", 0),
+                duration_ms=duration_ms,
+                request_id=self._request_id,
+            )
+
+    def send_response(self, code, message=None):  # noqa: N802
+        self._logged_status = code
+        super().send_response(code, message)
+
+    def end_headers(self):  # noqa: N802
+        request_id = getattr(self, "_request_id", None)
+        if request_id and not getattr(self, "_request_id_sent", False):
+            self.send_header("X-Request-Id", request_id)
+            self._request_id_sent = True
+        super().end_headers()
+
     def log_message(self, fmt, *args):
+        # Access telemetry is emitted once per request in handle_one_request
+        # (event ``http_access`` with duration). Keep stdout clean: it is
+        # reserved for the boot banner; structured logs go to stderr.
         return
 
     def do_GET(self):  # noqa: N802
@@ -1504,6 +3573,9 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path
         query = parse_qs(parsed.query)
         try:
+            if path == "/api/health":
+                _json(self, obs.health_snapshot({"cache": _model_cache_stats()}))
+                return
             if path == "/api/state":
                 manifest = ensure_relationship_catalog()
                 _json(
@@ -1517,6 +3589,9 @@ class Handler(BaseHTTPRequestHandler):
                         },
                     },
                 )
+                return
+            if path == "/api/catalog/uploads":
+                _json(self, {"uploads": list_catalog_uploads()})
                 return
             if path == "/api/catalog":
                 assets = catalog_assets(
@@ -1575,6 +3650,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/gemini/references":
                 _json(self, {"references": list_gemini_references()})
                 return
+            if path == "/api/weapon/references":
+                _json(self, {"references": read_weapon_references()})
+                return
             if path == "/api/config/gemini":
                 _json(self, {"config": gemini_config_status()})
                 return
@@ -1596,6 +3674,60 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/postprocess-jobs":
                 _json(self, {"jobs": read_postprocess_jobs()})
                 return
+            if path == "/api/layered-bundles":
+                _json(self, {"bundles": list_published_layered_bundles()})
+                return
+            if path.startswith("/api/layered-bundles/") and "/download/" in path:
+                raw = path.removeprefix("/api/layered-bundles/")
+                raw_job_id, raw_artifact = raw.split("/download/", 1)
+                job_id = unquote(raw_job_id).strip("/")
+                artifact = unquote(raw_artifact).strip("/")
+                try:
+                    resolved = _resolve_layered_download(job_id, artifact)
+                except ValueError:
+                    _json(self, {"error": "invalid layered download path"}, 400)
+                    return
+                if resolved is None:
+                    _json(self, {"error": "layered artifact not found"}, 404)
+                    return
+                target, filename = resolved
+                content_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+                _download_path(self, target, filename, content_type)
+                return
+            if path.startswith("/api/layered-bundles/"):
+                raw_job_id = path.removeprefix("/api/layered-bundles/").strip("/")
+                if raw_job_id.endswith("/manifest"):
+                    raw_job_id = raw_job_id.removesuffix("/manifest").strip("/")
+                job_id = unquote(raw_job_id)
+                try:
+                    manifest = _read_published_layered_manifest(job_id)
+                except ValueError as exc:
+                    _json(self, {"error": str(exc)}, 400)
+                    return
+                if manifest is None:
+                    _json(self, {"error": "layered bundle not found"}, 404)
+                    return
+                try:
+                    registry = _read_published_layered_registry(job_id)
+                except ValueError as exc:
+                    _json(self, {"error": str(exc)}, 400)
+                    return
+                _json(self, _published_layered_descriptor(job_id, manifest, registry))
+                return
+            if path == "/api/env-atlas/jobs":
+                _json(self, {"jobs": read_env_atlas_jobs()})
+                return
+            if path == "/api/maintenance/jobs":
+                _json(self, {"jobs": jq.list_jobs()})
+                return
+            if path.startswith("/api/maintenance/jobs/"):
+                job = jq.get_job(unquote(path.removeprefix("/api/maintenance/jobs/")))
+                _json(self, job or {"error": "not found"}, 200 if job else 404)
+                return
+            if path.startswith("/api/env-atlas/jobs/"):
+                job = get_env_atlas_job(unquote(path.removeprefix("/api/env-atlas/jobs/")))
+                _json(self, job or {"error": "not found"}, 200 if job else 404)
+                return
             if path == "/api/render-profiles":
                 _json(self, {"render_profiles": render_profile.list_profiles()})
                 return
@@ -1607,8 +3739,14 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path.startswith("/api/sprite-jobs/") and path.endswith("/download"):
                 job_id = unquote(path.removeprefix("/api/sprite-jobs/").removesuffix("/download").strip("/"))
-                data, filename = build_sprite_download(job_id)
-                _download(self, data, filename, "application/zip")
+                archive_path, filename = build_sprite_download_file(job_id)
+                try:
+                    _download_path(self, archive_path, filename, "application/zip")
+                finally:
+                    try:
+                        archive_path.unlink()
+                    except OSError:
+                        pass
                 return
             if path == "/api/bug-reports":
                 _json(self, {"reports": read_bug_reports()})
@@ -1653,7 +3791,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path in {
                 "/", "/index.html", "/catalog", "/composition", "/sprites",
-                "/gemini", "/postprocess", "/env-atlas",
+                "/gemini", "/postprocess", "/results", "/results/", "/env-atlas",
             }:
                 _file(self, WEB / "index.html")
                 return
@@ -1672,6 +3810,19 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 _file(self, target)
                 return
+            if path.startswith("/postprocess-benchmark/"):
+                # Read-only, explicitly scoped publication of local POC
+                # artifacts. Do not expose the wider work directory.
+                relative = Path(unquote(path.removeprefix("/postprocess-benchmark/")))
+                target = (POSTPROCESS_BENCHMARK_WORK / relative).resolve()
+                if not target.is_relative_to(POSTPROCESS_BENCHMARK_WORK.resolve()):
+                    _json(self, {"error": "invalid benchmark path"}, 400)
+                    return
+                if not target.is_file():
+                    _json(self, {"error": "benchmark artifact not found"}, 404)
+                    return
+                _file(self, target)
+                return
             if path.startswith("/gemini-outputs/"):
                 relative = Path(unquote(path.removeprefix("/gemini-outputs/")))
                 target = (GEMINI_WORK / relative).resolve()
@@ -1684,6 +3835,10 @@ class Handler(BaseHTTPRequestHandler):
                 reference_id = unquote(path.removeprefix("/gemini-reference-outputs/")).strip("/")
                 _file(self, gemini_reference_path(reference_id))
                 return
+            if path.startswith("/weapon-reference-outputs/"):
+                reference_id = unquote(path.removeprefix("/weapon-reference-outputs/")).strip("/")
+                _file(self, weapon_reference_path(reference_id))
+                return
             if path.startswith("/postprocess-outputs/"):
                 relative = Path(unquote(path.removeprefix("/postprocess-outputs/")))
                 target = (POSTPROCESS_WORK / relative).resolve()
@@ -1692,6 +3847,20 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 _file(self, target)
                 return
+            for prefix in ("/layered-outputs/", "/published-layered/"):
+                if path.startswith(prefix):
+                    try:
+                        target = _resolve_published_layered_artifact(
+                            unquote(path.removeprefix(prefix))
+                        )
+                    except ValueError:
+                        _json(self, {"error": "invalid layered output path"}, 400)
+                        return
+                    if target is None or not target.is_file():
+                        _json(self, {"error": "layered artifact not found"}, 404)
+                        return
+                    _file(self, target)
+                    return
             if path.startswith("/env-atlas/"):
                 relative = Path(unquote(path.removeprefix("/env-atlas/")))
                 env_atlas_dir = BASE / "env_atlas"
@@ -1736,11 +3905,59 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):  # noqa: N802
         path = urlparse(self.path).path
-        body = _body(self)
+        if path == "/api/catalog/upload":
+            filename = parse_qs(urlparse(self.path).query).get("filename", [""])[0]
+            try:
+                result = save_catalog_upload(self, filename)
+            except UploadTooLargeError as exc:
+                _json(self, {"error": str(exc)}, 413)
+                return
+            except (OSError, ValueError) as exc:
+                _json(self, {"error": str(exc)}, 400)
+                return
+            _json(self, result, 201)
+            return
+        if path == "/api/events":
+            client_ip = self.client_address[0] if self.client_address else "unknown"
+            if not obs.check_events_rate_limit(client_ip):
+                obs.log_event("events_rate_limited", client_ip=client_ip)
+                self.send_response(429)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Retry-After", "60")
+                self.end_headers()
+                self.wfile.write(b'{"error": "muitas requisicoes, tente em um minuto"}')
+                return
+            try:
+                total = int(self.headers.get("Content-Length", 0) or 0)
+            except (TypeError, ValueError):
+                total = 0
+            if total <= 0 or total > obs.MAX_INGEST_BODY_BYTES:
+                _json(self, {"error": "corpo deve ter entre 1 byte e 64 KB"}, 413)
+                return
+            try:
+                name, props = obs.validate_frontend_event(_body(self))
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                _json(self, {"error": str(exc)}, 400)
+                return
+            entry = obs.ingest_frontend_event(
+                name, props, request_id=getattr(self, "_request_id", None)
+            )
+            _json(self, {"ok": True, "event": entry["event"], "ts": entry["ts"]}, 202)
+            return
+        try:
+            body = _body(self)
+        except BodyTooLargeError as exc:
+            _json(self, {"error": str(exc)}, 413)
+            return
         try:
             if path == "/api/reindex":
-                manifest = rel.build_relationship_catalog()
-                _json(self, {"ok": True, "asset_count": manifest["asset_count"], "animation_count": manifest["animation_count"]})
+                if _wants_sync(body):
+                    manifest = rel.build_relationship_catalog()
+                    _json(self, {"ok": True, "asset_count": manifest["asset_count"], "animation_count": manifest["animation_count"]})
+                    return
+                job = jq.submit("reindex", {}, _maintenance_reindex_worker)
+                obs.log_event("maintenance_enqueued", kind="reindex", job_id=job["id"])
+                _json(self, job, 202)
                 return
             if path == "/api/annotate":
                 asset_id = str(body.get("asset_id", ""))
@@ -1762,38 +3979,59 @@ class Handler(BaseHTTPRequestHandler):
                 _json(self, {"annotation": annotation})
                 return
             if path == "/api/relationships":
-                relationship = rel.add_relationship(body)
-                try:
-                    export = composition_export.export_relationship(relationship)
-                except (OSError, ValueError, RuntimeError, KeyError) as exc:
+                if not isinstance(body, dict):
+                    _json(self, {"error": "payload inválido"}, 400)
+                    return
+                if _wants_sync(body):
+                    relationship = rel.add_relationship(body)
+                    try:
+                        export = composition_export.export_relationship(relationship)
+                    except (OSError, ValueError, RuntimeError, KeyError) as exc:
+                        _json(
+                            self,
+                            {
+                                "error": f"Composição salva, mas a exportação GLB falhou: {exc}",
+                                "relationship": relationship,
+                            },
+                            500,
+                        )
+                        return
+                    manifest = rel.build_relationship_catalog()
                     _json(
                         self,
                         {
-                            "error": f"Composição salva, mas a exportação GLB falhou: {exc}",
-                            "relationship": relationship,
+                            "relationship": {**relationship, "export": export},
+                            "export": export,
+                            "catalog_generated_at": manifest["generated_at"],
                         },
-                        500,
+                        201,
                     )
                     return
-                manifest = rel.build_relationship_catalog()
-                _json(
-                    self,
-                    {
-                        "relationship": {**relationship, "export": export},
-                        "export": export,
-                        "catalog_generated_at": manifest["generated_at"],
-                    },
-                    201,
+                job = jq.submit(
+                    "relationship_save",
+                    {"semantic_name": body.get("semantic_name")},
+                    lambda: _relationships_save_worker(body),
                 )
+                obs.log_event("maintenance_enqueued", kind="relationship_save", job_id=job["id"])
+                _json(self, job, 202)
                 return
             if path == "/api/relationships/delete":
-                relationship_id = str(body.get("relationship_id", ""))
+                relationship_id = str(body.get("relationship_id", "")) if isinstance(body, dict) else ""
                 if not relationship_id:
                     _json(self, {"error": "relationship_id é obrigatório"}, 400)
                     return
-                relationship = rel.delete_relationship(relationship_id)
-                manifest = rel.build_relationship_catalog()
-                _json(self, {"relationship": relationship, "catalog_generated_at": manifest["generated_at"]})
+                if _wants_sync(body):
+                    relationship = rel.delete_relationship(relationship_id)
+                    manifest = rel.build_relationship_catalog()
+                    _json(self, {"relationship": relationship, "catalog_generated_at": manifest["generated_at"]})
+                    return
+                job = jq.submit(
+                    "relationship_delete",
+                    {"relationship_id": relationship_id},
+                    lambda: _relationships_delete_worker(relationship_id),
+                )
+                obs.log_event("maintenance_enqueued", kind="relationship_delete", job_id=job["id"])
+                _json(self, job, 202)
                 return
             if path == "/api/sprite-render":
                 payload = body.get("payload", body)
@@ -1837,7 +4075,7 @@ class Handler(BaseHTTPRequestHandler):
                     jobs = read_sprite_jobs()
                     jobs.append(job)
                     write_json_atomic(SPRITE_JOBS_PATH, jobs)
-                threading.Thread(target=run_sprite_job, args=(job,), daemon=True).start()
+                jq.run_in_background(run_sprite_job, job)
                 _json(self, job, 202)
                 return
             if path in {"/api/tile-render", "/api/prop-render", "/api/vfx-render"}:
@@ -1880,11 +4118,7 @@ class Handler(BaseHTTPRequestHandler):
                     jobs = read_sprite_jobs()
                     jobs.append(job)
                     write_json_atomic(SPRITE_JOBS_PATH, jobs)
-                threading.Thread(
-                    target=run_asset_job,
-                    args=(job, tile_render_mod),
-                    daemon=True,
-                ).start()
+                jq.run_in_background(run_asset_job, job, tile_render_mod)
                 _json(self, job, 202)
                 return
             if path == "/api/env-atlas":
@@ -1893,16 +4127,21 @@ class Handler(BaseHTTPRequestHandler):
                     _json(self, {"error": "payload inválido"}, 400)
                     return
                 blender_path = payload.get("blender_path", "/usr/bin/blender")
-                directions = payload.get("directions", 8)
                 render_profile_id = payload.get("render_profile", "env_atlas_v1")
-                selected_assets = payload.get("selected_assets", None)
-
-                import subprocess
-                import time
+                try:
+                    selection = build_env_atlas_selection(payload)
+                except ValueError as exc:
+                    _json(self, {"error": str(exc)}, 400)
+                    return
 
                 env_atlas_dir = BASE / "env_atlas"
                 output_dir = env_atlas_dir / "output"
                 output_dir.mkdir(parents=True, exist_ok=True)
+                selection_path = output_dir / "selection.json"
+                selection_path.write_text(
+                    json.dumps(selection, indent=2, ensure_ascii=False) + "\n",
+                    encoding="utf-8",
+                )
 
                 render_script = BASE / "render_env_atlas.py"
                 cmd = [
@@ -1910,7 +4149,28 @@ class Handler(BaseHTTPRequestHandler):
                     str(render_script),
                     "--blender", blender_path,
                     "--output", str(output_dir),
+                    "--assets", str(selection_path),
                 ]
+
+                wants_async = not _wants_sync(payload)
+                if wants_async:
+                    job = _create_env_atlas_job(
+                        {
+                            "blender_path": blender_path,
+                            "render_profile": render_profile_id,
+                            "selected_assets": selection["assets"],
+                        }
+                    )
+                    jq.run_in_background(
+                        _run_env_atlas_job,
+                        job["id"],
+                        cmd,
+                        output_dir,
+                        cwd=str(BASE),
+                    )
+                    obs.log_event("env_atlas_enqueued", job_id=job["id"])
+                    _json(self, job, 202)
+                    return
 
                 try:
                     result = subprocess.run(
@@ -1935,8 +4195,10 @@ class Handler(BaseHTTPRequestHandler):
                         "cells": 64,
                         "size": "2048×2048",
                     }, 200)
+                    obs.log_event("env_atlas_finished", status="done", mode="sync")
                 except subprocess.TimeoutExpired:
                     _json(self, {"error": "Timeout na renderização"}, 500)
+                    obs.log_event("env_atlas_finished", status="error", mode="sync", error="timeout")
                 except Exception as exc:
                     _json(self, {"error": str(exc)}, 500)
                 return
@@ -1949,10 +4211,26 @@ class Handler(BaseHTTPRequestHandler):
                 reference = save_gemini_reference(data_url, name)
                 _json(self, {"reference": reference}, 201)
                 return
+            if path == "/api/weapon/references":
+                data_url = str(body.get("reference_data", ""))
+                name = str(body.get("name", "referência da arma"))
+                if len(name) > 240:
+                    _json(self, {"error": "nome da referência é muito longo"}, 400)
+                    return
+                try:
+                    reference = save_weapon_reference(data_url, name)
+                except ValueError as error:
+                    _json(self, {"error": str(error)}, 400)
+                    return
+                _json(self, {"reference": reference}, 201)
+                return
             if path == "/api/ai-render-spec/compile":
                 try:
                     channels = normalize_gemini_channels(
                         body.get("reference_channels", body.get("blender_channels"))
+                    )
+                    identity_lineart_mode = normalize_identity_guide_mode(
+                        body.get("identity_lineart_mode")
                     )
                 except ValueError as error:
                     _json(self, {"error": str(error)}, 400)
@@ -1964,10 +4242,14 @@ class Handler(BaseHTTPRequestHandler):
                     if source is not None
                     else body.get("render_spec")
                 )
-                render_spec = ai_render_spec.normalize_render_spec(
-                    render_spec_input,
-                    name=str(body.get("render_name", "")).strip(),
-                )
+                try:
+                    render_spec = ai_render_spec.normalize_render_spec(
+                        render_spec_input,
+                        name=str(body.get("render_name", "")).strip(),
+                    )
+                except ValueError as error:
+                    _json(self, {"error": str(error)}, 400)
+                    return
                 additional_instructions = str(
                     body.get("additional_instructions", body.get("prompt", ""))
                 ).strip()
@@ -1988,6 +4270,8 @@ class Handler(BaseHTTPRequestHandler):
                 reference_manifest = ai_render_spec.build_reference_manifest(
                     channels,
                     identity_name=str(body.get("reference_name") or "identity reference"),
+                    include_identity_lineart=True,
+                    identity_lineart_mode=identity_lineart_mode,
                 )
                 try:
                     compiled_prompt = ai_render_spec.compile_provider_prompt(
@@ -2020,6 +4304,9 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     provider = image_generation_provider.normalize_provider(
                         str(body.get("provider", "openai"))
+                    )
+                    identity_lineart_mode = normalize_identity_guide_mode(
+                        body.get("identity_lineart_mode")
                     )
                 except ValueError as error:
                     _json(self, {"error": str(error)}, 400)
@@ -2057,14 +4344,14 @@ class Handler(BaseHTTPRequestHandler):
                 except ValueError as error:
                     _json(self, {"error": str(error)}, 400)
                     return
-                if provider == "qwen" and len(reference_channels) > 2:
+                if provider == "qwen" and len(reference_channels) > 1:
                     _json(
                         self,
                         {
                             "error": (
                                 "O Qwen aceita até três imagens por chamada: "
-                                "a referência de identidade e no máximo duas "
-                                "referências estruturais selecionadas."
+                                "a referência de identidade, o guia derivado e "
+                                "no máximo uma referência estrutural selecionada."
                             )
                         },
                         400,
@@ -2118,15 +4405,51 @@ class Handler(BaseHTTPRequestHandler):
                 elif not reference_data:
                     _json(self, {"error": "selecione ou envie uma referência"}, 400)
                     return
-                render_spec = ai_render_spec.normalize_render_spec(
-                    with_ai_render_source_contract(
-                        body.get("render_spec"), structural_source
-                    ),
-                    name=render_name,
-                )
+                render_spec_input = body.get("render_spec")
+                if provider == "chatgpt-local":
+                    render_spec_input = copy.deepcopy(render_spec_input) if isinstance(render_spec_input, dict) else {}
+                    render_output = render_spec_input.setdefault("output", {})
+                    if not isinstance(render_output, dict):
+                        render_output = {}
+                        render_spec_input["output"] = render_output
+                    if not str(render_output.get("background") or "").strip():
+                        render_output["background"] = "#00FF00"
+                try:
+                    render_spec = ai_render_spec.normalize_render_spec(
+                        with_ai_render_source_contract(
+                            render_spec_input, structural_source
+                        ),
+                        name=render_name,
+                    )
+                except ValueError as error:
+                    _json(self, {"error": str(error)}, 400)
+                    return
+                try:
+                    weapon_reference_id = resolve_weapon_reference_for_render(
+                        render_spec, body.get("weapon_reference_id")
+                    )
+                except ValueError as error:
+                    _json(self, {"error": str(error)}, 400)
+                    return
+                try:
+                    holdout_dilation = normalize_holdout_dilation(
+                        body.get("holdout_dilation")
+                    )
+                    holdout_tolerance = normalize_holdout_tolerance(
+                        body.get("holdout_tolerance")
+                    )
+                except ValueError as error:
+                    _json(self, {"error": str(error)}, 400)
+                    return
+                output_size = [
+                    int(render_spec["output"]["width"]),
+                    int(render_spec["output"]["height"]),
+                ]
                 reference_manifest = ai_render_spec.build_reference_manifest(
                     reference_channels,
                     identity_name=reference_name,
+                    include_identity_lineart=True,
+                    identity_lineart_mode=identity_lineart_mode,
                 )
                 try:
                     compiled_prompt = ai_render_spec.compile_provider_prompt(
@@ -2162,13 +4485,16 @@ class Handler(BaseHTTPRequestHandler):
                         "compiled_prompt": compiled_prompt,
                         "prompt_contract_schema": ai_render_spec.PROMPT_SCHEMA,
                         "render_spec": render_spec,
+                        "output_size": output_size,
                         "direction_rows": copy.deepcopy(render_spec.get("rows", [])),
                         "reference_manifest": reference_manifest,
                         "provider": provider,
                         "model": model,
                         "reference_name": reference_name,
                         "reference_id": reference_id or None,
+                        "weapon_reference_id": weapon_reference_id or None,
                         "reference_channels": reference_channels,
+                        "identity_lineart_mode": identity_lineart_mode,
                         # Keep the legacy field for older clients and saved jobs.
                         "blender_channels": [
                             channel
@@ -2180,6 +4506,9 @@ class Handler(BaseHTTPRequestHandler):
                         "gemini_temperature": gemini_temperature,
                         "gemini_top_k": gemini_top_k,
                         "reference": reference_report,
+                        "publish_layered_bundle": body.get("publish_layered_bundle") is True,
+                        "holdout_dilation": holdout_dilation,
+                        "holdout_tolerance": holdout_tolerance,
                     },
                 }
                 with JOB_LOCK:
@@ -2194,7 +4523,7 @@ class Handler(BaseHTTPRequestHandler):
                         return
                     jobs.append(job)
                     write_json_atomic(GEMINI_JOBS_PATH, jobs)
-                threading.Thread(target=run_gemini_job, args=(job,), daemon=True).start()
+                jq.run_in_background(run_gemini_job, job)
                 _json(self, job, 202)
                 return
             if path == "/api/config/gemini":
@@ -2263,6 +4592,10 @@ class Handler(BaseHTTPRequestHandler):
                 except ValueError as error:
                     _json(self, {"error": str(error)}, 400)
                     return
+                lineart_mode = str(body.get("lineart_mode", "blender")).strip() or "blender"
+                if lineart_mode not in {"blender", "lineart_standard", "lineart_coarse", "lineart_anime", "none"}:
+                    _json(self, {"error": "modo de lineart inválido"}, 400)
+                    return
                 fps = max(1.0, min(60.0, float(body.get("fps", 10.0))))
                 batch_id = f"post_batch_{uuid.uuid4().hex[:16]}" if len(source_jobs) > 1 else None
                 created_jobs = []
@@ -2279,6 +4612,7 @@ class Handler(BaseHTTPRequestHandler):
                         ).strip(),
                         "fps": fps,
                         "model_profile": model_profile,
+                        "lineart_mode": lineart_mode,
                     }
                     if batch_id:
                         payload.update(
@@ -2301,22 +4635,14 @@ class Handler(BaseHTTPRequestHandler):
                     jobs.extend(created_jobs)
                     write_json_atomic(POSTPROCESS_JOBS_PATH, jobs)
                 if batch_id:
-                    threading.Thread(
-                        target=run_postprocess_batch,
-                        args=(created_jobs,),
-                        daemon=True,
-                    ).start()
+                    jq.run_in_background(run_postprocess_batch, created_jobs)
                     _json(
                         self,
                         {"batch_id": batch_id, "jobs": created_jobs, "count": len(created_jobs)},
                         202,
                     )
                 else:
-                    threading.Thread(
-                        target=run_postprocess_job,
-                        args=(created_jobs[0],),
-                        daemon=True,
-                    ).start()
+                    jq.run_in_background(run_postprocess_job, created_jobs[0])
                     _json(self, created_jobs[0], 202)
                 return
             if path == "/api/bug-reports":
@@ -2337,6 +4663,19 @@ def main() -> int:
     ensure_relationship_catalog()
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"Sprite Lab semantic catalog em http://{args.host}:{args.port}/", flush=True)
+    try:
+        import signal
+
+        def _handle_sigterm(signum, frame):  # noqa: ARG001
+            # dev_server.py sends SIGTERM on reload: stop accepting new
+            # connections; bounded background jobs drain (up to their own
+            # timeouts) before the process exits. dev_server SIGKILLs after
+            # SPRITE_LAB_DRAIN_TIMEOUT if anything wedges.
+            raise SystemExit(0)
+
+        signal.signal(signal.SIGTERM, _handle_sigterm)
+    except (AttributeError, OSError, ValueError):
+        pass
     try:
         server.serve_forever()
     except KeyboardInterrupt:

@@ -6,7 +6,9 @@
 /generation/artifacts/
 /generation/**/__pycache__/
 /generation/sprite-lab/state/*.json
+/generation/sprite-lab/state/*.jsonl
 /generation/sprite-lab/state/*_jobs.json
+/third_party/
 /d2r-casc/build/
 /d2r-casc/CascLib/listfile/listfile.txt
 /d2r-casc/CascLib/listfile/listfile-archive.zip

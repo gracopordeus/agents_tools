@@ -58,17 +58,38 @@ def asset_kind(record: dict[str, Any]) -> str:
     category = str(record.get("category", "")).casefold()
     if category == "weapon" or category.startswith("weapon"):
         return "weapon"
+    if category == "prop" or category.startswith("prop"):
+        return "prop"
     mannequin_name = " ".join(
         (str(record.get("name", "")), str(record.get("relative_path", "")))
     ).casefold()
     source_id = str(record.get("source_id", "")).casefold()
     filename = Path(str(record.get("relative_path", ""))).name.casefold()
+    # UAL1 and UAL2 base files ship the mannequin mesh together with every
+    # action, so they are usable as mesh principal even though the source
+    # is registered as an animation pack.
+    is_ual_mannequin = filename in {
+        "ual1_standard.fbx",
+        "ual1_standard_rm.fbx",
+        "ual2_standard.fbx",
+        "ual2_standard_rm.fbx",
+    }
+    is_ual_base_source = source_id in {
+        "quaternius_universal_animation_library_standard",
+        "quaternius_universal_animation_library_2_standard",
+    } and filename in {
+        "ual1_standard.fbx",
+        "ual1_standard_rm.fbx",
+        "ual2_standard.fbx",
+        "ual2_standard_rm.fbx",
+    }
+    # Legacy narrow check kept for compatibility with existing tests.
     is_ual2_mannequin = (
         source_id == "quaternius_universal_animation_library_2_standard"
         and filename in {"ual2_standard.fbx", "ual2_standard_rm.fbx"}
     )
     if category in {"animation", "animation_reference"} and (
-        "mannequin" in mannequin_name or is_ual2_mannequin
+        "mannequin" in mannequin_name or is_ual2_mannequin or is_ual_mannequin or is_ual_base_source
     ):
         return "character"
     if category in {"character", "character_base"}:
@@ -146,15 +167,64 @@ def build_relationship_catalog(
     catalog_root = Path(assets_data.get("catalog_root", assets_path.parent.parent)).expanduser()
     if not catalog_root.is_absolute():
         catalog_root = (assets_path.parent.parent / catalog_root).resolve()
+    # Meshes escondidos: o probe do Blender registra mesh_count por asset
+    # em animations.json ("assets"). Um FBX de animação que contém
+    # geometria E armature (ex.: UAL1_Standard.fbx, mesh_count=1) deve
+    # aparecer como mesh principal, não só como ação. Promove
+    # animation(+mesh+armature) a character; weapon com mesh (ex.: espada
+    # Um WProp do Mixamo é um personagem com arma anexada e malha estática
+    # sem armature (ex.: decals Sidewalk) nunca vira character (o render exige armature:
+    # blender_sprite_render.py "mesh principal sem armature").
+    probe_geometry: dict[str, tuple[int, int]] = {}
+    for probe in animations_data.get("assets", []):
+        if not isinstance(probe, dict) or not probe.get("asset_id"):
+            continue
+        try:
+            mesh_count = int(probe.get("mesh_count", 0) or 0)
+            armature_count = int(probe.get("armature_count", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        probe_geometry[str(probe.get("asset_id"))] = (mesh_count, armature_count)
 
     assets: list[dict[str, Any]] = []
     for source in assets_data.get("assets", []):
         if not isinstance(source, dict):
             continue
+        kind = asset_kind(source)
+        category = str(source.get("category", "")).casefold()
+        mesh_count, armature_count = probe_geometry.get(str(source.get("id")), (0, 0))
+        if (
+            kind == "animation"
+            and category in {"animation", "animation_reference"}
+            and mesh_count > 0
+            and armature_count > 0
+        ):
+            kind = "character"
+        searchable_name = " ".join(
+            (str(source.get("name", "")), str(source.get("relative_path", "")))
+        ).casefold()
+        if (
+            kind == "weapon"
+            and ("wprop" in searchable_name or "weapon_prop" in searchable_name)
+            and mesh_count > 0
+            and armature_count > 0
+        ):
+            # Preserve compatibility with catalogs generated before the
+            # source classifier knew that Mixamo WProp files include the
+            # render mesh and armature.
+            kind = "character"
+        annotation = annotations.get(str(source.get("id")), _annotation_defaults(source))
+        if (
+            kind == "character"
+            and isinstance(annotation, dict)
+            and annotation.get("review_status") == "unreviewed"
+            and annotation.get("kind") != "character"
+        ):
+            annotation = {**annotation, "kind": "character"}
         record = {
             "id": source.get("id"),
             "name": source.get("name"),
-            "kind": asset_kind(source),
+            "kind": kind,
             "category": source.get("category"),
             "format": source.get("format"),
             "source_id": source.get("source_id"),
@@ -165,7 +235,7 @@ def build_relationship_catalog(
             "source_root": source.get("source_root"),
             "sha256": source.get("sha256"),
             "tags": source.get("tags", []),
-            "annotation": annotations.get(str(source.get("id")), _annotation_defaults(source)),
+            "annotation": annotation,
         }
         assets.append(record)
 

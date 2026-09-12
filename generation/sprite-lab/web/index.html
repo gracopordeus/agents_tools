@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Sprite Lab · Catálogo semântico</title>
-  <link rel="stylesheet" href="/web/style.css">
+  <link rel="stylesheet" href="/web/style.css?v=2">
 </head>
 <body>
   <header class="topbar">
@@ -52,6 +52,7 @@
       <nav class="sidebar-nav" aria-label="Etapas generativas">
         <button class="page-tab sidebar-tab" data-page="gemini-page" type="button" title="AI Render"><span class="sidebar-icon">✧</span><span class="sidebar-label">AI Render</span></button>
         <button class="page-tab sidebar-tab" data-page="postprocess-page" type="button" title="Pós-processamento"><span class="sidebar-icon">◈</span><span class="sidebar-label">Pós-processamento</span></button>
+        <button class="page-tab sidebar-tab" data-page="results-page" type="button" title="Resultados"><span class="sidebar-icon">▤</span><span class="sidebar-label">Resultados</span></button>
       </nav>
       <div class="sidebar-note"><span class="status-dot"></span><span class="sidebar-label">Local · offline</span></div>
       <div class="sidebar-spacer"></div>
@@ -74,10 +75,22 @@
             <option value="">Tipos</option>
             <option value="character">Personagens</option>
             <option value="weapon">Armas</option>
+            <option value="prop">Props</option>
             <option value="model">Modelos</option>
             <option value="texture">Texturas</option>
           </select>
         </div>
+        <section class="upload-card" aria-label="Enviar pacote ZIP para o catálogo">
+          <h2>Enviar pacote ZIP</h2>
+          <p class="hint">O ZIP cai na pasta de entrada do catálogo e é indexado sozinho em segundos.</p>
+          <div class="upload-row">
+            <input id="catalog-upload-file" type="file" accept=".zip,application/zip">
+            <button id="btn-upload-zip" class="primary" type="button">Enviar ZIP</button>
+          </div>
+          <progress id="catalog-upload-progress" max="100" value="0" hidden></progress>
+          <output id="catalog-upload-status" class="upload-status"></output>
+          <ul id="catalog-upload-list" class="upload-list"></ul>
+        </section>
         <div id="asset-list" class="asset-list"></div>
       </section>
     </div>
@@ -210,12 +223,13 @@
             <div class="field"><label for="sprite-representation">Representação</label><select id="sprite-representation"><option value="directional_sprite_atlas">directional_sprite_atlas</option><option value="sprite_atlas">sprite_atlas</option><option value="tile_atlas">tile_atlas</option><option value="frame_sequence">frame_sequence</option></select></div>
             <div class="field"><label for="sprite-capabilities">Capacidades</label><input id="sprite-capabilities" type="text" value="animated, agent" placeholder="animated, interactable"><small>Separe por vírgulas; collision/navigation ficam no manifesto.</small></div>
             <div class="field full"><label for="sprite-composition">Composição</label><select id="sprite-composition"><option value="">Selecione uma composição</option></select></div>
+            <div class="field full"><label for="sprite-layer-component">Camada modular</label><select id="sprite-layer-component"><option value="">Nenhuma · render combinado</option></select><small>Opcional. Gera personagem isolado e o componente com Holdout nativo para uso posterior no AI Render.</small></div>
             <div class="field full sprite-internal-field"><label for="sprite-render-profile">Enquadramento travado</label><select id="sprite-render-profile"><option value="">Selecione um manifesto</option></select></div>
             <div class="field full"><label for="sprite-output-mode">Saída</label><select id="sprite-output-mode"><option value="runtime" selected>Runtime · 8 direções / 8 fases</option><option value="ai_base">Base IA · 5 direções / 9 fases</option></select></div>
             <div class="field sprite-internal-field"><label for="sprite-profile">Perfil</label><select id="sprite-profile"><option value="8x8">8×8 · 8 direções / 8 fases</option><option value="8x12">8×12 · 8 direções / 12 fases</option><option value="8x16">8×16 · 8 direções / 16 fases</option><option value="5x9">5×9 · Base IA</option></select></div>
             <div class="field sprite-internal-field"><label for="sprite-resolution">Resolução da célula</label><select id="sprite-resolution"><option value="128">128 × 128</option><option value="256" selected>256 × 256</option><option value="512">512 × 512</option><option value="672">672 × 672</option><option value="1024">1024 × 1024</option></select></div>
             <div class="field sprite-internal-field"><label for="sprite-fps">FPS</label><input id="sprite-fps" type="number" min="1" max="60" value="10"></div>
-            <div class="field sprite-internal-field"><label for="sprite-elevation">Elevação da câmera</label><input id="sprite-elevation" type="number" step="0.001" value="35.264"></div>
+            <div class="field sprite-internal-field"><label for="sprite-elevation">Elevação da câmera</label><input id="sprite-elevation" type="number" step="0.001" value="30.0"></div>
             <div class="field sprite-internal-field"><label for="sprite-azimuth">Azimute da câmera</label><input id="sprite-azimuth" type="number" step="0.001" value="45"></div>
             <div class="field full"><label for="sprite-camera-preset">Câmera</label><select id="sprite-camera-preset"><option value="isometric" selected>Isométrico</option><option value="platform">Plataforma</option><option value="frontal">Frontal</option><option value="three_quarter">3/4</option><option value="diagonal">Diagonal 45°</option><option value="top_down">Top-down</option></select></div>
             <div class="field full sprite-scale-option"><label for="sprite-scale-mode">Scale</label><select id="sprite-scale-mode"><option value="dynamic">Dinâmico</option><option value="default" selected>Padrão</option></select></div>
@@ -282,20 +296,31 @@
     <div class="page-workspace pipeline-workspace">
       <div class="page-header">
         <div><span class="eyebrow">PIPELINE</span><h1>AI Render</h1><p>Transforme renders estruturais em spritesheets prontas para produção.</p></div>
-        <div class="page-header-actions"><span class="status-chip neutral">64 células · 2048×2048</span><button type="button" class="history-toggle" data-history-toggle aria-controls="gemini-history" aria-expanded="true">Ocultar execuções</button></div>
+        <div class="page-header-actions"><span class="status-chip neutral">64 células · <span id="gemini-output-size-status">2048×2048</span></span><button type="button" class="history-toggle" data-history-toggle aria-controls="gemini-history" aria-expanded="true">Ocultar execuções</button></div>
       </div>
       <div class="mobile-workspace-tabs" role="tablist" aria-label="Áreas do AI Render"><button type="button" role="tab" data-mobile-tab="setup" aria-selected="true">Configuração</button><button type="button" role="tab" data-mobile-tab="preview" aria-selected="false">Preview</button><button type="button" role="tab" data-mobile-tab="runs" aria-selected="false">Execuções</button></div>
       <aside class="panel pipeline-form-panel">
         <div class="panel-head"><div><span class="pane-title">Inspetor de geração</span><span class="pane-subtitle">Configuração do render</span></div></div>
         <form id="ai-render-form" class="pipeline-form">
           <div class="form-grid ai-render-provider-controls">
-            <div class="field"><label for="gemini-provider">Provider</label><select id="gemini-provider"><option value="google" selected>Gemini · Google API</option><option value="openai">GPT Image 2 · OpenAI API</option><option value="qwen">Qwen Image · Qwen Cloud API</option></select><small>Gemini é o provider padrão. Configure a chave correspondente em Configurações.</small></div>
-            <div class="field"><label for="gemini-model">Modelo</label><input id="gemini-model" value="gemini-3.1-flash-image" spellcheck="false"><small>Gemini: gemini-3.1-flash-image · OpenAI: gpt-image-2 · Qwen: qwen-image-3.0-pro ou qwen-image-3.0</small></div>
+            <div class="field"><label for="gemini-provider">Provider</label><select id="gemini-provider"><option value="google" selected>Gemini · Google API</option><option value="openai">GPT Image 2 · OpenAI API</option><option value="qwen">Qwen Image · Qwen Cloud API</option><option value="chatgpt-local">ChatGPT local · POC (tarefa local)</option></select><small>ChatGPT local cria a tarefa com GPT-6 Astra e raciocínio Ultra. Imagens quadradas são ajustadas à resolução escolhida; o original é preservado. A geração de imagem continua sendo a ferramenta integrada da sessão.</small></div>
+            <div class="field"><label for="gemini-model">Modelo</label><input id="gemini-model" value="gemini-3.1-flash-image" spellcheck="false"><small>Gemini: gemini-3.1-flash-image · OpenAI: gpt-image-2 · Qwen: qwen-image-3.0-pro ou qwen-image-3.0 · ChatGPT local: gpt-6-astra (Ultra)</small></div>
+            <div class="field"><label for="gemini-output-size">Resolução do output</label><select id="gemini-output-size"><option value="2048" selected>2048×2048 (2K)</option><option value="1024">1024×1024 (1K)</option></select><small>A grade continua 8×8. Em 1024×1024, cada célula terá 128×128 px; em 2048×2048, 256×256 px. No pós-processamento, o 1K é normalizado por célula antes do upscale final para 512×512.</small></div>
             <div id="gemini-temperature-field" class="field"><label for="gemini-temperature">Criatividade / temperatura (Gemini)</label><input id="gemini-temperature" type="number" min="0" max="1" step="0.1" value="1"><small>0 = mais estável · 1 = mais exploratório. Padrão do modelo: 1.</small></div>
             <div id="gemini-top-k-field" class="field"><label for="gemini-top-k">TopK (Gemini)</label><input id="gemini-top-k" type="number" min="1" max="1000" step="1" value="64"><small>Limita a seleção aos tokens mais prováveis. Padrão oficial do modelo: 64.</small></div>
             <div id="qwen-seed-field" class="field" hidden><label for="qwen-seed">Seed (Qwen, opcional)</label><input id="qwen-seed" type="number" min="0" step="1" placeholder="Aleatório"><small>Use o mesmo valor para reproduzir uma variação; deixe vazio para seed aleatória.</small></div>
           </div>
           <div class="field"><label for="gemini-render-name">Nome do AI Render *</label><input id="gemini-render-name" type="text" maxlength="160" required placeholder="Ex.: viking_idle_qwen_01" autocomplete="off"><small>Identifica esta spritesheet no histórico e não pode repetir um nome já usado.</small></div>
+          <div class="field"><label for="gemini-generation-mode">Modo de geração</label><select id="gemini-generation-mode"><option value="single_sheet" selected>Spritesheet única</option><option value="character_component_holdout">Camadas modulares · personagem + equipamento</option><option value="character_weapon_holdout">Legado · personagem + arma</option></select><small id="gemini-generation-mode-help">Gera uma única spritesheet, preservando o fluxo atual.</small></div>
+          <section id="gemini-holdout-controls" class="holdout-controls" hidden aria-labelledby="gemini-holdout-title">
+            <div class="holdout-controls-head"><div><span class="pane-title" id="gemini-holdout-title">Modo Holdout modular</span><span class="pane-subtitle">Passes coordenados e base imutável</span></div><span class="status-chip neutral">v2</span></div>
+            <p id="gemini-holdout-notice" class="holdout-notice">O personagem e o equipamento serão gerados separadamente; o Blender resolve a visibilidade e a composição final preserva o personagem completo.</p>
+            <div class="form-grid">
+              <div class="field full"><label for="gemini-weapon-component">Componente destacável</label><select id="gemini-weapon-component"><option value="">Selecione roupa, arma ou equipamento</option></select><small id="gemini-weapon-component-help">Selecione o componente estrutural usado no segundo passe.</small></div>
+              <div class="field"><label for="gemini-holdout-dilation">Dilatação da máscara (px)</label><input id="gemini-holdout-dilation" type="number" min="0" max="32" step="1" value="0"><small>0 mantém a máscara estrutural; valores maiores ampliam o holdout por célula.</small></div>
+              <div class="field"><label for="gemini-holdout-tolerance">Tolerância de alpha</label><input id="gemini-holdout-tolerance" type="number" min="0" max="32" step="1" value="4"><small>Diferença máxima de canal aceita no gate de bordas antialiased (0–32).</small></div>
+            </div>
+          </section>
           <details class="ai-render-spec-panel" open>
             <summary>Contrato do asset e da composição</summary>
             <p class="section-help">Esses campos formam o RenderSpec. O contrato fixo de consistência é compilado pela aplicação e não pode ser removido pelo prompt adicional.</p>
@@ -308,7 +333,7 @@
               <div class="field full"><label for="gemini-style-description">Descrição do estilo</label><textarea id="gemini-style-description" rows="2" placeholder="Para personagens, a aparência vem exclusivamente da imagem conceito."></textarea></div>
               <div class="field"><label for="gemini-camera-projection">Projeção</label><select id="gemini-camera-projection"><option value="orthographic">orthographic</option><option value="perspective">perspective</option></select></div>
               <div class="field"><label for="gemini-camera-preset">Preset de câmera</label><input id="gemini-camera-preset" type="text" value="isometric" spellcheck="false"></div>
-              <div class="field"><label for="gemini-camera-elevation">Elevação (graus)</label><input id="gemini-camera-elevation" type="number" step="0.001" value="35.264"></div>
+              <div class="field"><label for="gemini-camera-elevation">Elevação (graus)</label><input id="gemini-camera-elevation" type="number" step="0.001" value="30.0"></div>
               <div class="field"><label for="gemini-camera-azimuth">Azimute (graus)</label><input id="gemini-camera-azimuth" type="number" step="0.001" value="45"></div>
               <div class="field"><label for="gemini-framing-anchor">Âncora</label><select id="gemini-framing-anchor"><option value="bottom_center">bottom_center</option><option value="center">center</option><option value="bottom_left">bottom_left</option><option value="bottom_right">bottom_right</option></select></div>
               <div class="field"><label for="gemini-scale-policy">Política de escala</label><select id="gemini-scale-policy"><option value="normalize_per_row">normalize_per_row</option><option value="world_scale">world_scale</option><option value="fixed_pixel_scale">fixed_pixel_scale</option><option value="custom">custom</option></select></div>
@@ -320,13 +345,19 @@
           </details>
           <div class="field"><label for="gemini-source">Render estrutural</label><select id="gemini-source"><option value="">Carregando beauty, bones e lineart…</option></select><small>Escolha abaixo quais referências exportadas pelo Blender serão enviadas junto com a referência de identidade.</small></div>
           <div id="gemini-source-preview" class="pipeline-upload-preview structural-preview" hidden><button id="gemini-source-preview-trigger" class="sprite-media-trigger" type="button" data-media-open><img id="gemini-source-image" alt="Pré-visualização do render estrutural"></button><span id="gemini-source-preview-label">Clique para ampliar</span></div>
-          <div class="field"><div class="field-head"><span>Referências estruturais</span><span id="gemini-channel-count" class="muted"></span></div><div id="gemini-channel-options" class="checklist pipeline-reference-checklist"><label class="reference-card" title="Volume, profundidade e oclusão"><input type="checkbox" value="beauty" checked><strong>Beauty</strong><small>Volume e profundidade</small></label><label class="reference-card" title="Pose, articulação e movimento"><input type="checkbox" value="bones" checked><strong>Bones</strong><small>Pose e movimento</small></label><label class="reference-card" title="Silhueta, geometria e contorno"><input type="checkbox" value="lineart" checked><strong>Lineart</strong><small>Silhueta e geometria</small></label><label class="reference-card" title="Grade 8×8, limites dos boxes e contenção espacial"><input type="checkbox" value="frame_control"><strong>Frame Control</strong><small>Limites das células</small></label></div><small id="gemini-channel-help">Selecione as referências que serão enviadas junto com a referência de identidade. Frame Control está desabilitado por padrão e, quando usado, delimita os boxes de 256×256 sem aparecer no output.</small></div>
+          <div class="field"><div class="field-head"><span>Referências estruturais</span><span id="gemini-channel-count" class="muted"></span></div><div id="gemini-channel-options" class="checklist pipeline-reference-checklist"><label class="reference-card" title="Volume, profundidade e oclusão"><input type="checkbox" value="beauty" checked><strong>Beauty</strong><small>Volume e profundidade</small></label><label class="reference-card" title="Pose, articulação e movimento"><input type="checkbox" value="bones"><strong>Bones</strong><small>Pose e movimento</small></label><label class="reference-card" title="Silhueta, geometria e contorno"><input type="checkbox" value="lineart"><strong>Lineart</strong><small>Silhueta e geometria</small></label><label class="reference-card" title="Grade 8×8, limites dos boxes e contenção espacial"><input type="checkbox" value="frame_control"><strong>Frame Control</strong><small>Limites das células</small></label></div><small id="gemini-channel-help">A referência de identidade recebe automaticamente um segundo guia derivado pelo preprocessamento escolhido abaixo. Selecione as referências estruturais enviadas depois dele. Beauty é a referência estrutural padrão; os demais canais são opcionais. Frame Control está desabilitado por padrão e, quando usado, delimita os boxes de 256×256 sem aparecer no output.</small></div>
           <section class="identity-reference-card" aria-labelledby="identity-reference-title">
             <div class="field-head"><div><span id="identity-reference-title" class="pane-title">Referência de identidade</span><span class="pane-subtitle">Design, materiais, cores e identidade visual</span></div></div>
             <div class="field"><label for="gemini-reference-cache">Referência salva</label><select id="gemini-reference-cache"><option value="">Selecione uma referência salva</option></select><small>As imagens ficam salvas localmente para reutilização.</small></div>
-            <div class="field"><label for="gemini-reference">Enviar nova imagem</label><input id="gemini-reference" type="file" accept="image/png,image/jpeg,image/webp"><small id="gemini-reference-name">Nenhuma imagem selecionada.</small></div>
+          <div class="field"><label for="gemini-reference">Enviar nova imagem</label><input id="gemini-reference" type="file" accept="image/png,image/jpeg,image/webp"><small id="gemini-reference-name">Nenhuma imagem selecionada.</small><small>A aplicação gera automaticamente um segundo guia da referência para reforçar contorno e silhueta; a imagem original continua sendo a autoridade de identidade.</small></div>
+            <div class="field"><label for="gemini-identity-lineart-mode">Preprocessamento do concept</label><select id="gemini-identity-lineart-mode"><option value="canny_edges" selected>Canny edges · teste atual</option><option value="lineart_standard">Lineart standard</option></select><small>Substitui apenas o segundo input enviado à IA. O concept original continua sendo o primeiro input e a autoridade visual. Canny usa os thresholds 100/200 do benchmark.</small></div>
             <div class="actions"><button id="gemini-cache-reference" type="button">Salvar no cache</button></div>
             <div id="gemini-reference-preview" class="pipeline-upload-preview" hidden><img id="gemini-reference-image" alt="Pré-visualização da referência"></div>
+          </section>
+          <section id="gemini-weapon-reference-card" class="identity-reference-card" aria-labelledby="weapon-reference-title" hidden>
+            <div class="field-head"><div><span id="weapon-reference-title" class="pane-title">Referência visual do equipamento</span><span class="pane-subtitle">Obrigatória nos modos Holdout</span></div></div>
+            <div class="field"><label for="weapon-reference-cache">Referência salva</label><select id="weapon-reference-cache"><option value="">Nenhuma referência salva</option></select></div>
+            <div class="field"><label for="weapon-reference">Enviar nova imagem</label><input id="weapon-reference" type="file" accept="image/png,image/jpeg,image/webp"><small id="weapon-reference-name">Nenhuma imagem selecionada. Cache separado da identidade do personagem.</small></div>
           </section>
           <div class="field gemini-prompt-field"><div class="field-head"><label for="gemini-prompt">Instruções adicionais</label><span><button id="gemini-prompt-expand" type="button">Expandir editor</button><button id="gemini-prompt-save" type="button" hidden>Salvar instruções</button></span></div><textarea id="gemini-prompt" class="code-editor" rows="5" placeholder="Ajustes excepcionais; pose, ação e componentes são herdados automaticamente."></textarea><small>Pose, câmera, direções, foot anchor e equipamentos vêm do render estrutural. Ctrl/Cmd+Enter executa.</small></div>
           <details class="ai-render-debug"><summary>Avançado / debug</summary><div class="field compiled-prompt-field"><div class="field-head"><label for="gemini-compiled-prompt">Prompt compilado</label><span class="muted">somente leitura · fonte usada para debug</span></div><textarea id="gemini-compiled-prompt" class="code-editor compiled-prompt" rows="8" readonly placeholder="O prompt compilado aparecerá aqui."></textarea></div></details>
@@ -343,6 +374,18 @@
       <aside id="gemini-history" class="panel pipeline-history"><div class="panel-head"><div><span class="pane-title">Execuções</span><span class="pane-subtitle">Outputs para aprovação e pós-processamento</span></div></div><div id="gemini-job-list" class="pipeline-job-list" aria-live="polite"></div></aside>
     </div>
   </section>
+  <section id="results-page" class="page" hidden>
+    <div class="page-workspace results-workspace">
+      <div class="page-header">
+        <div><span class="eyebrow">PUBLICAÇÃO</span><h1>Resultados</h1><p>Artefatos publicados dos bundles holdout, com preview e download seguros.</p></div>
+        <div class="page-header-actions"><button id="refresh-results" type="button">Atualizar resultados</button></div>
+      </div>
+      <div class="results-layout">
+        <aside class="panel results-history"><div class="panel-head"><div><span class="pane-title">Bundles publicados</span><span class="pane-subtitle">Somente jobs promovidos</span></div></div><div id="results-job-list" class="pipeline-job-list" aria-live="polite"></div></aside>
+        <section class="panel results-detail-panel"><div id="results-empty" class="empty"><div class="empty-icon">▤</div><h2>Selecione um bundle</h2><p>Jobs single-sheet não possuem artefatos layered publicados.</p></div><div id="results-detail" hidden></div></section>
+      </div>
+    </div>
+  </section>
   <section id="postprocess-page" class="page" hidden>
     <div class="page-workspace pipeline-workspace postprocess-workspace">
       <div class="page-header">
@@ -355,10 +398,11 @@
         <div class="pipeline-form">
           <div class="field"><span class="field-label">Nome IA Render</span><div id="postprocess-gemini-job" class="postprocess-source-checklist" role="group" aria-describedby="postprocess-gemini-job-help"><span class="muted">Nenhum output concluído</span></div><small id="postprocess-gemini-job-help">Marque uma ou mais spritesheets concluídas. Todas usarão os mesmos parâmetros abaixo.</small></div>
           <div id="postprocess-gemini-preview" class="postprocess-gemini-preview" hidden><img id="postprocess-gemini-image" alt="Output de IA selecionado"><span id="postprocess-gemini-preview-label"></span></div>
-          <div class="pipeline-steps"><strong>Pipeline</strong><span>Alinhamento estrutural</span><span>Anime 6B → máscara binária + nearest</span><span>Pré-limpeza antes do upscale final</span><span>Modelo selecionado → 2× em CPU</span><span>4 variantes finais</span></div>
+          <div class="pipeline-steps"><strong>Pipeline</strong><span>Alinhamento estrutural</span><span>Anime 6B + BiRefNet → máscara binária</span><span>Pré-limpeza antes do upscale final</span><span>Modelo selecionado → 2× em GPU quando disponível</span><span>4 variantes finais</span></div>
           <div class="variant-list"><div><span class="variant-dot original"></span><span>Original (padrão)</span></div><div><span class="variant-dot frame"></span><span>Ajuste de frame</span></div><div><span class="variant-dot palette"></span><span>Coesão de cores · 256</span></div><div><span class="variant-dot palette-low"></span><span>Coesão de cores · 128</span></div></div>
           <div class="field"><label for="postprocess-fps">FPS</label><input id="postprocess-fps" type="number" min="1" max="60" value="10"></div>
-          <div class="field"><label for="postprocess-model-profile">Upscale final</label><select id="postprocess-model-profile"><option value="anime_x4plus_6b" selected>Anime 6B · neural</option><option value="bicubic">Bicubic 2× · conservador</option></select><small>O passe da máscara usa o Anime 6B. Escolha entre reconstrução neural e Bicubic, que prioriza fidelidade à imagem original sem reconstrução generativa.</small></div>
+          <div class="field"><label for="postprocess-model-profile">Upscale final</label><select id="postprocess-model-profile"><option value="anime_x4plus_6b" selected>Anime 6B · neural</option><option value="swinir_light_x2">POC · SwinIR Lightweight 2×</option><option value="swinir_m_classical_df2k_x2">POC · SwinIR-M ClassicalSR DF2K 2×</option><option value="realcugan_x2">POC · Real-CUGAN 2× sem denoise</option><option value="realcugan_conservative_x2">POC · Real-CUGAN 2× conservador</option><option value="bicubic">Bicubic 2× · conservador</option></select><small>Inferência neural usa CUDA automaticamente quando disponível, em FP32. O passe de máscara permanece Anime 6B + BiRefNet; as alternativas reutilizam a mesma máscara aprovada. Bicubic e a limpeza de bordas usam CPU.</small></div>
+          <div class="field"><label for="postprocess-lineart-mode">Lineart para exportação</label><select id="postprocess-lineart-mode"><option value="lineart_standard" selected>Lineart padrão · inferido por frame</option><option value="lineart_coarse">Lineart coarse · inferido por frame</option><option value="lineart_anime">Lineart Anime · inferido por frame</option><option value="blender">Lineart estrutural · Blender</option><option value="none">Desligado</option></select><small>Quando ativo, o spritesheet de cores permanece sem lineart e é criado um atlas separado, branco e transparente, para composição no jogo. Lineart padrão, coarse e Anime usam os detectores do ControlNet em cada frame 512×512 dentro do alpha aprovado. Coarse produz traços mais densos. Blender reutiliza o lineart estrutural exportado por pose.</small></div>
           <div class="actions"><button id="run-postprocess" class="primary" type="button">Executar pós-processamento</button></div>
         </div>
       </aside>
@@ -393,7 +437,7 @@
       }
     }
   </script>
-  <script src="/web/app.js"></script>
-  <script type="module" src="/web/viewer.js"></script>
+  <script src="/web/app.js?v=3"></script>
+  <script type="module" src="/web/viewer.js?v=9"></script>
 </body>
 </html>

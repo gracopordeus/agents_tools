@@ -3,9 +3,15 @@ import unittest
 import numpy as np
 from PIL import Image
 
-from concept_palette_normalize import apply_chroma_shift
+try:
+    from concept_palette_normalize import apply_chroma_shift
+    HAS_CV2 = True
+except ImportError:
+    apply_chroma_shift = None  # type: ignore[assignment]
+    HAS_CV2 = False
 
 
+@unittest.skipUnless(HAS_CV2, "requires cv2")
 class ConceptPaletteNormalizeTest(unittest.TestCase):
     def test_shift_preserves_binary_alpha_and_changes_only_foreground(self) -> None:
         rgba = np.zeros((8, 8, 4), dtype=np.uint8)

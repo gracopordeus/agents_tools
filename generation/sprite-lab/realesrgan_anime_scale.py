@@ -3,9 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 import time
-import types
 from pathlib import Path
 
 import cv2
@@ -15,65 +13,24 @@ from PIL import Image
 
 import huggingface_realesrgan
 from waifu2x_cunet_scale import alpha_bleed
+from postprocess_runtime import (
+    add_runtime_arguments,
+    resolve_device,
+    validate_parallelism,
+)
 
 
-def _load_realesrgan(profile_id: str, tile_size: int, tile_pad: int):
-    """Load a selected Hub checkpoint with the local torchvision compatibility shim."""
-    import torchvision.transforms.functional as functional
-
-    compat = types.ModuleType("torchvision.transforms.functional_tensor")
-    compat.rgb_to_grayscale = functional.rgb_to_grayscale
-    sys.modules["torchvision.transforms.functional_tensor"] = compat
-    from basicsr.archs.rrdbnet_arch import RRDBNet  # noqa: PLC0415
-    from realesrgan import RealESRGANer  # noqa: PLC0415
-    selected = huggingface_realesrgan.profile(profile_id)
-    if selected["architecture"] == "traditional":
+def _load_realesrgan(profile_id: str, tile_size: int, tile_pad: int, device="auto", precision="fp32"):
+    """Keep the historical entry point while supporting multiple architectures."""
+    if huggingface_realesrgan.profile(profile_id)["architecture"] == "traditional":
         return None
-    model_path = huggingface_realesrgan.download_weight(profile_id)
-    if selected["architecture"] == "rrdb":
-        model = RRDBNet(
-            num_in_ch=3,
-            num_out_ch=3,
-            num_feat=64,
-            num_block=int(selected["num_block"]),
-            num_grow_ch=32,
-            scale=int(selected["network_scale"]),
-        )
-    else:
-        from realesrgan.archs.srvgg_arch import SRVGGNetCompact  # noqa: PLC0415
-        from safetensors.torch import load_file  # noqa: PLC0415
-
-        model = SRVGGNetCompact(
-            num_in_ch=3,
-            num_out_ch=3,
-            num_feat=64,
-            num_conv=int(selected["num_conv"]),
-            upscale=int(selected["network_scale"]),
-            act_type="prelu",
-        )
-        state = load_file(str(model_path), device="cpu")
-        state = state.get("params", state)
-        converted_dir = huggingface_realesrgan.HF_CACHE_DIR / "converted"
-        converted_dir.mkdir(parents=True, exist_ok=True)
-        converted_path = converted_dir / f"{profile_id}.pth"
-        if not converted_path.is_file():
-            torch.save({"params": state}, converted_path)
-        model_path = converted_path
-    return RealESRGANer(
-        scale=int(selected["network_scale"]),
-        model_path=str(model_path),
-        model=model,
-        tile=tile_size,
-        tile_pad=tile_pad,
-        pre_pad=0,
-        half=False,
-        device=torch.device("cpu"),
-        gpu_id=None,
-    )
+    from upscale_backend import Upscaler
+    return Upscaler(profile_id, tile_size, tile_pad, device, precision)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    add_runtime_arguments(parser)
     parser.add_argument("source", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--realesrgan-repo", type=Path, required=True)
@@ -102,11 +59,15 @@ def main() -> None:
         raise FileNotFoundError(args.source)
     if args.bleed_radius < 0 or args.tile_size < 32 or args.tile_pad < 0:
         raise ValueError("parâmetros de tile/bleeding inválidos")
+    validate_parallelism(args.batch_size, args.cpu_workers)
     args.output.mkdir(parents=True, exist_ok=True)
     bleed_output = args.output / "alpha_bleed"
     bleed_output.mkdir(parents=True, exist_ok=True)
     selected_profile = huggingface_realesrgan.profile(args.model_profile)
-    upsampler = _load_realesrgan(args.model_profile, args.tile_size, args.tile_pad)
+    device = "cpu" if selected_profile["architecture"] == "traditional" else resolve_device(args.device)
+    upsampler = _load_realesrgan(args.model_profile, args.tile_size, args.tile_pad, device, args.precision)
+    if device == "cuda":
+        torch.cuda.reset_peak_memory_stats()
 
     import sprite_render  # noqa: PLC0415
 
@@ -117,46 +78,73 @@ def main() -> None:
     ]
     started = time.monotonic()
     source_size: tuple[int, int] | None = None
-    for source in inputs:
-        if not source.is_file():
-            raise FileNotFoundError(source)
-        with Image.open(source) as opened:
-            original = opened.convert("RGBA")
-        if source_size is None:
-            source_size = original.size
-        if original.size != source_size:
-            raise ValueError("todas as células precisam ter a mesma dimensão")
-        original_alpha = original.getchannel("A")
-        prepared = alpha_bleed(original, args.bleed_radius)
-        prepared.save(bleed_output / source.name, format="PNG")
-        rgb = np.asarray(prepared.convert("RGB"), dtype=np.uint8)
-        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-        if selected_profile["architecture"] == "traditional":
-            output_bgr = cv2.resize(
-                bgr,
-                (original.width * args.scale, original.height * args.scale),
-                interpolation=cv2.INTER_CUBIC,
-            )
-        else:
-            output_bgr, _ = upsampler.enhance(bgr, outscale=float(args.scale))
-        output_rgb = cv2.cvtColor(output_bgr, cv2.COLOR_BGR2RGB)
-        result = Image.fromarray(output_rgb, mode="RGB").convert("RGBA")
-        expected_size = (original.width * args.scale, original.height * args.scale)
-        if result.size != expected_size:
-            raise RuntimeError(
-                f"Real-ESRGAN produziu {result.size}, esperado {expected_size}"
-            )
-        filter_mode = (
-            Image.Resampling.NEAREST
-            if args.alpha_filter == "nearest"
-            else Image.Resampling.LANCZOS
-        )
-        result.putalpha(original_alpha.resize(expected_size, filter_mode))
-        result.save(args.output / source.name, format="PNG")
-        original.close()
-        original_alpha.close()
-        prepared.close()
-        result.close()
+    effective_batch_size = 1 if upsampler is None else args.batch_size
+    for batch_start in range(0, len(inputs), effective_batch_size):
+        batch_sources = inputs[batch_start:batch_start + effective_batch_size]
+        originals: list[Image.Image] = []
+        original_alphas: list[Image.Image] = []
+        prepared_images: list[Image.Image] = []
+        bgr_images: list[np.ndarray] = []
+        try:
+            for source in batch_sources:
+                if not source.is_file():
+                    raise FileNotFoundError(source)
+                with Image.open(source) as opened:
+                    original = opened.convert("RGBA")
+                if source_size is None:
+                    source_size = original.size
+                if original.size != source_size:
+                    raise ValueError("todas as células precisam ter a mesma dimensão")
+                original_alpha = original.getchannel("A")
+                prepared = alpha_bleed(original, args.bleed_radius)
+                prepared.save(bleed_output / source.name, format="PNG")
+                rgb = np.asarray(prepared.convert("RGB"), dtype=np.uint8)
+                originals.append(original)
+                original_alphas.append(original_alpha)
+                prepared_images.append(prepared)
+                bgr_images.append(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+
+            if selected_profile["architecture"] == "traditional":
+                output_bgr_images = [
+                    cv2.resize(
+                        bgr,
+                        (original.width * args.scale, original.height * args.scale),
+                        interpolation=cv2.INTER_CUBIC,
+                    )
+                    for bgr, original in zip(bgr_images, originals)
+                ]
+            else:
+                output_bgr_batch, _ = upsampler.enhance_batch(
+                    bgr_images,
+                    outscale=float(args.scale),
+                )
+                output_bgr_images = list(output_bgr_batch)
+
+            for source, original, original_alpha, output_bgr in zip(
+                batch_sources, originals, original_alphas, output_bgr_images
+            ):
+                output_rgb = cv2.cvtColor(output_bgr, cv2.COLOR_BGR2RGB)
+                result = Image.fromarray(output_rgb, mode="RGB").convert("RGBA")
+                expected_size = (original.width * args.scale, original.height * args.scale)
+                if result.size != expected_size:
+                    raise RuntimeError(
+                        f"Real-ESRGAN produziu {result.size}, esperado {expected_size}"
+                    )
+                filter_mode = (
+                    Image.Resampling.NEAREST
+                    if args.alpha_filter == "nearest"
+                    else Image.Resampling.LANCZOS
+                )
+                result.putalpha(original_alpha.resize(expected_size, filter_mode))
+                result.save(args.output / source.name, format="PNG")
+                result.close()
+        finally:
+            for original_alpha in original_alphas:
+                original_alpha.close()
+            for original in originals:
+                original.close()
+            for prepared in prepared_images:
+                prepared.close()
 
     assert source_size is not None
     output_size = source_size[0] * args.scale
@@ -182,18 +170,23 @@ def main() -> None:
         "alpha_bleed_radius": args.bleed_radius,
         "alpha_filter": args.alpha_filter,
         "mask": "source_alpha_resized",
-        "rgb_resize_filter": "opencv_inter_cubic" if selected_profile["architecture"] == "traditional" else "realesrgan_internal_lanczos4",
+        "rgb_resize_filter": "opencv_inter_cubic" if selected_profile["architecture"] == "traditional" else (
+            "opencv_lanczos4" if selected_profile["network_scale"] != args.scale else "native_model_scale"),
         "realesrgan": {
-            "implementation": "xinntao/Real-ESRGAN",
+            "implementation": "spandrel" if upsampler else "opencv",
             "model_profile": args.model_profile,
-            "model": selected_profile.get("repo_id", "opencv.INTER_CUBIC"),
-            "network_scale": 4,
+            "model": selected_profile.get("repo_id", selected_profile.get("url", "opencv.INTER_CUBIC")),
+            "network_scale": selected_profile["network_scale"],
             "output_scale": args.scale,
-            "device": "cpu",
-            "precision": "fp32",
+            "device": device,
+            "precision": args.precision if upsampler else "uint8",
+            "weight_sha256": upsampler.sha256 if upsampler else None,
+            "peak_vram_bytes": torch.cuda.max_memory_allocated() if device == "cuda" else 0,
             "tile_size": args.tile_size,
             "tile_pad": args.tile_pad,
+            "tiling": "full_frame_global_context" if selected_profile["architecture"] == "realcugan" else "padded_tiles",
             "images": len(inputs),
+            "batch_size": effective_batch_size,
             "elapsed_seconds": round(time.monotonic() - started, 3),
         },
         "cells": [path.name for path in inputs],

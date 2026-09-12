@@ -75,22 +75,52 @@ def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def classify_action(name: str) -> dict[str, Any]:
+def _is_generic_clip_name(name: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", "_", name.casefold()).strip("_")
+    return normalized in {
+        "action",
+        "animation",
+        "layer0",
+        "layer_0",
+        "take",
+        "take_01",
+        "take_001",
+    } or normalized.startswith("layer_")
+
+
+def classify_action(name: str, fallback_name: str | None = None) -> dict[str, Any]:
     """Map common action names to controlled semantic labels.
 
     This is deliberately conservative: unknown names remain ``unknown`` and
     are still fully available to the user.  The classifier is metadata, not a
     replacement for the original Action name.
     """
-    clip_name = name.split("|")[-1]
+    clip_name = name.split("|")[-1].strip()
+    if fallback_name and _is_generic_clip_name(clip_name):
+        fallback_clip_name = str(fallback_name).strip()
+        if fallback_clip_name:
+            clip_name = fallback_clip_name
     lowered = re.sub(r"[^a-z0-9]+", "_", clip_name.casefold())
     rules: list[tuple[str, tuple[str, ...], float]] = [
         ("tpose", ("tpose", "bindpose", "restpose"), 0.99),
         ("death", ("death", "die", "dead", "dying", "fall"), 0.96),
-        ("hit", ("hit", "hurt", "damage", "stagger", "flinch"), 0.92),
+        ("hit", ("hit", "hurt", "damage", "stagger", "flinch", "impact"), 0.92),
         ("dodge", ("dodge", "roll", "evade", "dash"), 0.92),
         ("block", ("block", "guard", "parry", "shield"), 0.90),
-        ("cast", ("cast", "spell", "magic", "charge", "summon"), 0.86),
+        ("equip", ("draw", "sheath", "unsheathe", "equip"), 0.86),
+        # UAL ships a few utility actions outside its locomotion/combat
+        # naming convention. Keep these semantic instead of exposing them as
+        # an unusable catch-all ``unknown`` in the web UI.
+        ("aim", ("aim", "target"), 0.86),
+        ("reload", ("reload", "reloading"), 0.86),
+        ("swim", ("swim", "swimming"), 0.86),
+        ("sit", ("sit", "sitting"), 0.86),
+        ("dance", ("dance", "dancing"), 0.80),
+        ("drive", ("drive", "driving"), 0.80),
+        ("cast", ("cast", "spell", "magic", "charge", "summon", "power"), 0.86),
+        ("crouch", ("crouch",), 0.86),
+        ("turn", ("turn",), 0.84),
+        ("strafe", ("strafe",), 0.84),
         (
             "attack",
             (
@@ -100,7 +130,6 @@ def classify_action(name: str) -> dict[str, Any]:
                 "swing",
                 "combo",
                 "melee",
-                "sword",
                 "scratch",
                 "chop",
                 "throw",
@@ -109,6 +138,7 @@ def classify_action(name: str) -> dict[str, Any]:
                 "thrust",
                 "punch",
                 "kick",
+                "spin",
             ),
             0.94,
         ),
@@ -116,7 +146,12 @@ def classify_action(name: str) -> dict[str, Any]:
         ("run", ("run", "jog", "sprint"), 0.94),
         ("walk", ("walk", "locomotion", "move", "slide"), 0.84),
         ("idle", ("idle", "stand", "breath", "rest"), 0.88),
-        ("interact", ("consume", "chest", "farm", "harvest", "plant", "water", "yes"), 0.70),
+        ("interact", ("consume", "chest", "farm", "harvest", "plant", "water", "pickup", "pick_up", "fix", "push", "interact", "taunt"), 0.70),
+        # Some UAL actions are named only after the weapon (for example
+        # ``Sword_Regular_A_Rec``). Keep that compatibility fallback after
+        # explicit movement/action verbs, otherwise ``great sword idle``
+        # would incorrectly become an attack.
+        ("attack", ("sword", "greatsword", "axe", "mace", "spear", "bow"), 0.80),
     ]
     category = "unknown"
     confidence = 0.0
@@ -144,6 +179,28 @@ def classify_action(name: str) -> dict[str, Any]:
     }
 
 
+def _asset_animation_name(asset: dict[str, Any]) -> str:
+    name = str(asset.get("name", "")).strip()
+    if name:
+        return Path(name).stem
+    relative_path = str(asset.get("relative_path", "")).strip()
+    return Path(relative_path).stem or "unknown"
+
+
+def _is_render_mesh_bind_action(probe: dict[str, Any], action: dict[str, Any]) -> bool:
+    try:
+        mesh_count = int(probe.get("mesh_count", 0) or 0)
+        frame_count = int(action.get("frame_count", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    action_name = str(action.get("name", action.get("action_name", "")))
+    return (
+        mesh_count > 0
+        and _is_generic_clip_name(action_name.split("|")[-1].strip())
+        and frame_count <= 2
+    )
+
+
 def _animation_candidate(asset: dict[str, Any], all_fbx: bool) -> bool:
     if str(asset.get("format", "")).casefold() != "fbx":
         return False
@@ -152,7 +209,31 @@ def _animation_candidate(asset: dict[str, Any], all_fbx: bool) -> bool:
     category = str(asset.get("category", "")).casefold()
     kind = str(asset.get("kind", "")).casefold()
     tags = {str(tag).casefold() for tag in asset.get("tags", [])}
-    return category in {"animation", "animation_reference"} or kind == "animation" or "animation" in tags
+    searchable_name = " ".join(
+        (str(asset.get("name", "")), str(asset.get("relative_path", "")))
+    ).casefold()
+    # Mixamo's ``WProp`` export is a renderable character with an attached
+    # weapon prop. Probe it alongside motion-only FBXs so geometry metadata
+    # is available to the relationship catalog.
+    is_embedded_character_mesh = "wprop" in searchable_name or "weapon_prop" in searchable_name
+    return (
+        category in {"animation", "animation_reference"}
+        or kind == "animation"
+        or "animation" in tags
+        or is_embedded_character_mesh
+    )
+
+
+def _mixamo_probe_signals(record: dict[str, Any]) -> list[str]:
+    """Return structural signals that identify a Mixamo FBX export."""
+    signals: set[str] = set()
+    action_name = str(record.get("action_name", "")).casefold()
+    if "mixamo.com" in action_name:
+        signals.add("action_namespace:mixamo.com")
+    bones = record.get("animated_bones", [])
+    if any("mixamorig" in str(bone).casefold() for bone in bones):
+        signals.add("bone_namespace:mixamorig")
+    return sorted(signals)
 
 
 def _asset_source_path(asset: dict[str, Any], catalog_root: Path, cache_root: Path) -> Path:
@@ -228,7 +309,10 @@ def _make_animation_record(
     probe: dict[str, Any],
     action: dict[str, Any],
 ) -> dict[str, Any]:
-    classification = classify_action(str(action.get("name", "unknown")))
+    classification = classify_action(
+        str(action.get("name", "unknown")),
+        fallback_name=_asset_animation_name(asset),
+    )
     rig_fingerprint = probe.get("rig_fingerprint")
     animation_id = _stable_animation_id(asset, action, rig_fingerprint)
     loop_recommended = (
@@ -268,11 +352,44 @@ def _make_animation_record(
     return record
 
 
+def _reclassify_animation_record(
+    asset: dict[str, Any],
+    record: dict[str, Any],
+) -> dict[str, Any]:
+    """Refresh semantic fields without re-importing an unchanged FBX.
+
+    This matters when a source pack used Blender's generic ``Layer0`` action:
+    the cached probe remains valid, while the human-readable asset filename
+    is now used to classify and label that action.
+    """
+    classification = classify_action(
+        str(record.get("action_name", "unknown")),
+        fallback_name=_asset_animation_name(asset),
+    )
+    refreshed = dict(record)
+    refreshed.update(
+        {
+            "clip_name": classification["clip_name"],
+            "category": classification["category"],
+            "semantic_tags": classification["semantic_tags"],
+            "classification_confidence": classification["classification_confidence"],
+            "loop_name_hint": classification["loop_name_hint"],
+            "loop_recommended": (
+                classification["category"] in {"idle", "walk", "run"}
+                and not classification["explicit_no_loop"]
+            ),
+            "probe_version": PROBE_VERSION,
+        }
+    )
+    return refreshed
+
+
 def _make_asset_probe(asset: dict[str, Any], raw: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     actions = [
         _make_animation_record(asset, raw, action)
         for action in raw.get("actions", [])
         if isinstance(action, dict)
+        and not _is_render_mesh_bind_action(raw, action)
     ]
     asset_record = {
         "asset_id": asset.get("id"),
@@ -377,6 +494,22 @@ def index_animation_catalog(
         if asset_ids and str(asset.get("id")) not in asset_ids:
             continue
         candidates.append(asset)
+    # A Mixamo pack usually contains animation-only FBXs plus one render mesh
+    # (for example ``Exo Gray.fbx``). Once a pack has at least one animation
+    # seed, inspect every FBX from that same source so the internal action
+    # namespace can identify the pack and the mesh is retained as part of its
+    # probe metadata. This also covers renamed files such as ``Layer0.fbx``.
+    seed_source_ids = {str(asset.get("source_id")) for asset in candidates}
+    if seed_source_ids and not all_fbx:
+        candidates_by_id = {str(asset.get("id")): asset for asset in candidates}
+        for asset in catalog.get("assets", []):
+            if (
+                isinstance(asset, dict)
+                and str(asset.get("source_id")) in seed_source_ids
+                and str(asset.get("format", "")).casefold() == "fbx"
+            ):
+                candidates_by_id[str(asset.get("id"))] = asset
+        candidates = list(candidates_by_id.values())
     candidates.sort(key=lambda item: str(item.get("id", "")).casefold())
 
     existing = _existing_by_asset(output_path)
@@ -499,6 +632,12 @@ def index_animation_catalog(
         if asset_id in probe_results:
             raw = probe_results[asset_id]
             for action in raw.get("actions", []):
+                # A Mixamo character export may carry a two-frame Layer0
+                # bind/reference pose alongside the render mesh. It is useful
+                # for the character asset probe, but must not appear as a
+                # playable animation in the frontend.
+                if _is_render_mesh_bind_action(raw, action):
+                    continue
                 record = _make_animation_record(asset, raw, action)
                 animations_by_id[record["id"]] = record
         else:
@@ -506,7 +645,13 @@ def index_animation_catalog(
                 old = existing.get(asset_id, {})
                 for action_id in old.get("action_ids", []):
                     if action_id in previous_animations:
-                        animations_by_id[action_id] = previous_animations[action_id]
+                        previous = previous_animations[action_id]
+                        if _is_render_mesh_bind_action(asset_records[asset_id], previous):
+                            continue
+                        animations_by_id[action_id] = _reclassify_animation_record(
+                            asset,
+                            previous,
+                        )
 
     animations = sorted(animations_by_id.values(), key=lambda item: str(item["id"]))
     summary["animations"] = len(animations)
@@ -514,6 +659,28 @@ def index_animation_catalog(
         item["action_ids"] = [
             animation["id"] for animation in animations if animation.get("asset_id") == item.get("asset_id")
         ]
+
+    source_profiles: dict[str, dict[str, Any]] = {}
+    for animation in animations:
+        signals = _mixamo_probe_signals(animation)
+        if not signals:
+            continue
+        source_id = str(animation.get("source_id") or "")
+        if not source_id:
+            continue
+        profile = source_profiles.setdefault(
+            source_id,
+            {"source_id": source_id, "detected_format": "mixamo", "signals": set()},
+        )
+        profile["signals"].update(signals)
+    normalized_source_profiles = [
+        {
+            **profile,
+            "signals": sorted(profile["signals"]),
+        }
+        for profile in source_profiles.values()
+    ]
+    normalized_source_profiles.sort(key=lambda item: item["source_id"].casefold())
 
     manifest = {
         "schema": ANIMATION_SCHEMA,
@@ -524,6 +691,7 @@ def index_animation_catalog(
         "catalog_root": str(catalog_root),
         "asset_count": len(asset_records),
         "animation_count": len(animations),
+        "source_profiles": normalized_source_profiles,
         "assets": sorted(asset_records.values(), key=lambda item: str(item["asset_id"])),
         "animations": animations,
     }

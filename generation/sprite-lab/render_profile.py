@@ -18,7 +18,7 @@ CAMERA_PRESETS: dict[str, dict[str, Any]] = {
     # running the Blender calibration job; they are absolute world spans,
     # never percentages of the isometric camera.
     "isometric": {
-        "label": "Isométrico", "elevation": 35.264, "azimuth": 45.0,
+        "label": "Isométrico", "elevation": 30.0, "azimuth": 45.0,
         "ortho_scale": 2.57705670238966,
         "profile_id": "hero_reference_v1",
     },
@@ -124,8 +124,11 @@ def normalize_manifest(value: Any) -> dict[str, Any]:
         raise ValueError("vertical_margin_px deve ficar dentro da célula")
     directions = int(value.get("directions", 8))
     phases = int(value.get("phases", 8))
-    if directions not in {5, 8}:
-        raise ValueError("directions deve ser 5 ou 8 no contrato atual")
+    # Tiles/static props render a single direction; characters use 5 or 8.
+    # tile_reference_v1.json ships directions=1 and list_profiles() must not
+    # crash on it (it broke GET /api/render-profiles entirely).
+    if directions not in {1, 5, 8}:
+        raise ValueError("directions deve ser 1, 5 ou 8 no contrato atual")
     if not 1 <= phases <= 32:
         raise ValueError("phases deve ficar entre 1 e 32")
     camera_preset = str(value.get("camera_preset") or "").strip().casefold() or None
@@ -145,7 +148,7 @@ def normalize_manifest(value: Any) -> dict[str, Any]:
         "vertical_margin_px": vertical_margin_px,
         "foot_anchor": foot_anchor,
         "camera_elevation": _finite_number(
-            value.get("camera_elevation", 35.264), "camera_elevation"
+            value.get("camera_elevation", 30.0), "camera_elevation"
         ),
         "camera_azimuth": _finite_number(
             value.get("camera_azimuth", 45.0), "camera_azimuth"

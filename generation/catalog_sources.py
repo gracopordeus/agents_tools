@@ -27,6 +27,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 import unicodedata
 import zipfile
@@ -273,6 +274,42 @@ def _iter_source_items(
     return direct, archives
 
 
+def _word_hit(lowered: str, keyword: str) -> bool:
+    """Match a keyword on word boundaries with common English suffixes.
+
+    Substring matching misfires on static meshes: ``walk`` in ``sidewalk``,
+    ``turn`` in ``arrowturnleft``, ``guard`` in ``wall_guard``. The lookarounds
+    treat only a-z as word characters (so ``_``, spaces, parens, camelCase
+    transitions after lowercasing all act as boundaries) and tolerate
+    ``ing``/``ed``/``s`` inflections (``blocking`` -> ``block``).
+    """
+    return re.search(
+        rf"(?<![a-z]){re.escape(keyword)}(?:ing|ed|s|es)?(?![a-z])",
+        lowered,
+    ) is not None
+
+
+def _is_generic_animation_filename(name: str) -> bool:
+    """Recognize the generic names produced by Mixamo FBX exports.
+
+    A Mixamo download can be renamed to ``Layer0.fbx`` or ``Take 001.fbx``
+    before it reaches the inbox.  Those names carry no action verb, but they
+    are still useful seeds for the animation probe, which can inspect the
+    internal ``mixamo.com`` action namespace.
+    """
+    stem = Path(name).stem.casefold()
+    normalized = re.sub(r"[^a-z0-9]+", "_", stem).strip("_")
+    return normalized in {
+        "action",
+        "animation",
+        "layer0",
+        "layer_0",
+        "take",
+        "take_01",
+        "take_001",
+    } or normalized.startswith("layer_")
+
+
 def _category(source: dict[str, Any], name: str, extension: str) -> str:
     by_extension = source.get("category_by_extension", {})
     if isinstance(by_extension, dict) and extension in by_extension:
@@ -283,22 +320,111 @@ def _category(source: dict[str, Any], name: str, extension: str) -> str:
     if extension == "fbx":
         if any(token in lowered for token in ("character", "outfit", "body", "mannequin")):
             return "character"
+        # Mixamo's ``WProp`` export is a character mesh with an attached
+        # weapon prop (for example ``Maria WProp``), not an animation-only
+        # file. Keep the renderable principal visible to Sprite Lab; files
+        # named only after a sword/weapon remain weapon components below.
+        if "wprop" in lowered or "weapon_prop" in lowered:
+            return "character"
+        # Token set aligned with animation_catalog.classify_action plus
+        # locomotion verbs seen in packs like the Great Sword Pack
+        # (crouch, draw, turn, strafe, slide, slash, kick, ...). Animation
+        # wins over weapon so action files like "great sword walk.fbx"
+        # are indexed as animation even though they mention a weapon.
+        # NOTE: callers must pass the ZIP member name (not the archive
+        # name) so per-file classification works for auto-discovered
+        # archives; see _record_base. Matching is word-based (see
+        # _word_hit) so "sidewalk" does not trigger "walk".
+        # NOTE: "guard" deliberately excluded: it matches architectural
+        # pieces like "Trim_Wall_Guard" more often than block animations
+        # ("blocking" already covers the Great Sword guards via block+ing).
+        if _is_generic_animation_filename(name):
+            return "animation"
         if any(
-            token in lowered
+            _word_hit(lowered, token)
             for token in (
                 "animation",
                 "animations",
                 "locomotion",
                 "motion",
                 "attack",
+                "slash",
+                "strike",
+                "swing",
+                "combo",
+                "melee",
+                "stab",
+                "thrust",
+                "punch",
+                "shoot",
+                "throw",
+                "chop",
                 "idle",
+                "stand",
+                "breath",
+                "rest",
                 "walk",
                 "run",
+                "jog",
+                "sprint",
+                "move",
+                "slide",
+                "strafe",
+                "turn",
+                "jump",
+                "leap",
+                "crouch",
+                "block",
+                "parry",
+                "dodge",
+                "roll",
+                "evade",
+                "dash",
+                "hit",
+                "hurt",
+                "damage",
+                "stagger",
+                "flinch",
+                "death",
+                "die",
+                "dead",
+                "dying",
+                "cast",
+                "spell",
+                "magic",
+                "charge",
+                "summon",
+                "power",
+                "impact",
+                "kick",
+                "spin",
+                "draw",
             )
         ):
             return "animation"
-        if any(token in lowered for token in ("sword", "shield", "weapon", "axe", "bow")):
+        stem_lowered = Path(name).stem.casefold()
+        weapon_name = any(
+            _word_hit(stem_lowered, token)
+            for token in (
+                "sword",
+                "shield",
+                "weapon",
+                "axe",
+                "bow",
+                "dagger",
+                "hammer",
+                "mace",
+                "spear",
+                "staff",
+            )
+        )
+        if weapon_name:
             return "weapon"
+        if any(
+            _word_hit(stem_lowered, token)
+            for token in ("prop", "item", "static_prop", "static_item")
+        ):
+            return "prop"
         # An FBX is a container format, not evidence that the file contains
         # animation.  The deep animation probe can later promote an asset when
         # an explicit ``--all-fbx`` scan is requested.
@@ -316,14 +442,24 @@ def _kind(category: str, name: str = "") -> str:
     if category in {"animation", "animation_reference"}:
         normalized_name = name.casefold()
         filename = Path(name).name.casefold()
-        is_ual2_mannequin = filename in {"ual2_standard.fbx", "ual2_standard_rm.fbx"}
-        if "mannequin" in normalized_name or is_ual2_mannequin:
+        # UAL1 and UAL2 base files ship the mannequin mesh together with
+        # every action, so they are usable as mesh principal even though
+        # the source is registered as an animation pack.
+        is_ual_mannequin = filename in {
+            "ual1_standard.fbx",
+            "ual1_standard_rm.fbx",
+            "ual2_standard.fbx",
+            "ual2_standard_rm.fbx",
+        }
+        if "mannequin" in normalized_name or is_ual_mannequin:
             return "character"
         return "animation"
     if category in {"character", "character_base"}:
         return "character"
     if category.startswith("weapon"):
         return "weapon"
+    if category.startswith("prop"):
+        return "prop"
     if category.startswith("composite"):
         return "composite"
     if category.startswith("reference"):
@@ -348,7 +484,12 @@ def _record_base(
     member: str | None = None,
 ) -> dict[str, Any]:
     source_id = str(source["id"])
-    category = _category(source, reference, extension)
+    # For ZIP members classify by the member filename, not the archive
+    # name: otherwise every file in "Great Sword Pack.zip" inherits
+    # category weapon from the word "sword" in the zip name, even when
+    # the member is an animation like "great sword walk.fbx".
+    classification_name = member or reference
+    category = _category(source, classification_name, extension)
     source_reference = f"{_relative_path(archive, catalog_root)}!{member}" if archive and member else reference
     tags = {str(tag) for tag in _as_list(source.get("tags"))}
     tags.update({f"category:{category}", f"format:{extension}"})
@@ -779,6 +920,42 @@ def _notify_catalog_finished(
             return
 
 
+def rebuild_relationship_catalog() -> dict[str, Any] | None:
+    """Rebuild relationships.json from assets/animations manifests.
+
+    Returns the manifest on success, None on error. Import errors are
+    raised: relationship_catalog lives in sprite-lab/ and is a hard
+    requirement of the pipeline, not an optional probe.
+    """
+    sprite_lab = Path(__file__).resolve().parent / "sprite-lab"
+    sys.path.insert(0, str(sprite_lab))
+    try:
+        import relationship_catalog as rel
+
+        manifest = rel.build_relationship_catalog()
+        print(
+            json.dumps(
+                {
+                    "relationships": manifest.get("relationship_count", 0),
+                    "assets": manifest.get("asset_count", 0),
+                    "animations": manifest.get("animation_count", 0),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        return manifest
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"RELATIONSHIP_INDEX_ERROR {exc}", flush=True)
+        return None
+    finally:
+        try:
+            sys.path.remove(str(sprite_lab))
+        except ValueError:
+            pass
+
+
 def _watch_snapshot(root: Path) -> dict[str, tuple[int, int]]:
     """Return a cheap snapshot that ignores generated catalog manifests."""
     if not root.is_dir():
@@ -814,6 +991,7 @@ def watch_catalog(
     probe_animations: bool,
     animation_all_fbx: bool,
     blender: str | None,
+    rebuild_relationships: bool = True,
 ) -> int:
     """Watch source files and re-index after a stable debounce window."""
     _, catalog_root = load_registry(registry_path)
@@ -850,6 +1028,8 @@ def watch_catalog(
                 )
             except (OSError, ValueError, json.JSONDecodeError, RuntimeError) as exc:
                 print(f"ANIMATION_INDEX_ERROR {exc}", flush=True)
+        if rebuild_relationships:
+            rebuild_relationship_catalog()
         if notify:
             _notify_catalog_finished(report, animation_report)
         while True:
@@ -888,6 +1068,8 @@ def watch_catalog(
                         )
                     except (OSError, ValueError, json.JSONDecodeError, RuntimeError) as exc:
                         print(f"ANIMATION_INDEX_ERROR {exc}", flush=True)
+                if rebuild_relationships:
+                    rebuild_relationship_catalog()
                 if notify:
                     _notify_catalog_finished(report, animation_report)
             except (OSError, ValueError, json.JSONDecodeError) as exc:
@@ -994,6 +1176,7 @@ def parse_args() -> argparse.Namespace:
     index.add_argument("--dry-run", action="store_true", help="não grava manifests")
     index.add_argument("--no-notify", action="store_true")
     index.add_argument("--no-animation-probe", action="store_true")
+    index.add_argument("--no-relationships", action="store_true")
     index.add_argument("--animation-all-fbx", action="store_true")
     index.add_argument("--blender", default=None)
     index.add_argument("--animation-output", type=Path, default=None)
@@ -1011,6 +1194,7 @@ def parse_args() -> argparse.Namespace:
     watch.add_argument("--no-hash", action="store_true")
     watch.add_argument("--no-notify", action="store_true")
     watch.add_argument("--no-animation-probe", action="store_true")
+    watch.add_argument("--no-relationships", action="store_true")
     watch.add_argument("--animation-all-fbx", action="store_true")
     watch.add_argument("--blender", default=None)
     watch.add_argument("--animation-output", type=Path, default=None)
@@ -1077,6 +1261,8 @@ def main() -> int:
             except (OSError, ValueError, json.JSONDecodeError, RuntimeError) as exc:
                 print(f"ANIMATION_INDEX_ERROR {exc}")
                 animation_error = True
+        if not args.dry_run and not args.no_relationships:
+            rebuild_relationship_catalog()
         if not args.dry_run and not args.no_notify:
             _notify_catalog_finished(report, animation_report if not animation_error else None)
         return 0 if (report["summary"]["assets"] and not animation_error) or args.dry_run else 1
@@ -1097,6 +1283,7 @@ def main() -> int:
                 not args.no_animation_probe,
                 args.animation_all_fbx,
                 args.blender,
+                not args.no_relationships,
             )
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             print(f"ERROR {exc}")
