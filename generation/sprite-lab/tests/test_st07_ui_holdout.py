@@ -20,8 +20,10 @@ class St07HoldoutUiTests(unittest.TestCase):
         html = (SPRITE_LAB / "web" / "index.html").read_text(encoding="utf-8")
         self.assertIn('id="gemini-generation-mode"', html)
         self.assertIn('value="single_sheet" selected', html)
+        self.assertIn('value="character_component_holdout"', html)
         self.assertIn('value="character_weapon_holdout"', html)
         self.assertIn('id="gemini-holdout-controls"', html)
+        self.assertIn('id="sprite-layer-component"', html)
         self.assertIn('id="gemini-weapon-component"', html)
         self.assertIn('id="gemini-weapon-reference-card"', html)
         self.assertIn('id="gemini-holdout-dilation"', html)
@@ -38,10 +40,14 @@ class St07HoldoutUiTests(unittest.TestCase):
         self.assertIn('spec.generation_mode = selectedAiGenerationMode();', source)
         self.assertIn('weapon_component_id: selectedWeaponComponentId()', source)
         self.assertIn('generation_order: ["character", "weapon"]', source)
-        self.assertIn('publish_layered_bundle: generationMode === "character_weapon_holdout"', source)
+        self.assertIn('const layeredMode = generationMode !== "single_sheet";', source)
+        self.assertIn('publish_layered_bundle: layeredMode', source)
+        self.assertIn('component_ids: [componentId]', source)
         self.assertIn('holdout_dilation: selectedHoldoutDilation()', source)
         self.assertIn('holdout_tolerance: selectedHoldoutTolerance()', source)
         self.assertIn('renderWeaponComponents();', source)
+        self.assertIn('payload.component_holdout_pass = true;', source)
+        self.assertIn('payload.component_holdout_id = selectedComponent.id;', source)
         self.assertIn('updateHoldoutControls();', source)
 
     def test_source_fixture_exposes_stable_weapon_component_ids(self) -> None:
@@ -106,6 +112,29 @@ class St07HoldoutUiTests(unittest.TestCase):
         self.assertEqual(
             layered["layer_contract"]["weapon_component_id"], "weapon-1"
         )
+        modular = ai_render_spec.normalize_render_spec(
+            {
+                "generation_mode": "character_component_holdout",
+                "source_contract": source_contract,
+                "layer_contract": {
+                    "base_id": "character_full",
+                    "component_ids": ["weapon-1"],
+                    "generation_order": ["character_full", "weapon-1"],
+                    "composition_order": ["character_full", "weapon-1"],
+                    "layers": [
+                        {"id": "character_full", "role": "base", "z": 0},
+                        {
+                            "id": "weapon-1",
+                            "role": "component",
+                            "kind": "weapon",
+                            "z": 1,
+                        },
+                    ],
+                    "preview": None,
+                },
+            }
+        )
+        self.assertEqual(modular["layer_contract"]["component_ids"], ["weapon-1"])
 
     def test_holdout_parameters_have_bounded_server_defaults(self) -> None:
         self.assertEqual(server.normalize_holdout_dilation(None), 0)

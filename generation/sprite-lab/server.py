@@ -47,6 +47,7 @@ import composition_export
 import gemini_sprite_postprocess
 import layered_bundle
 import layered_compositor
+import holdout_validation
 import huggingface_realesrgan
 import image_generation_provider
 import character_layer_worker
@@ -529,12 +530,12 @@ def weapon_reference_path(reference_id: str) -> Path:
 
 
 def require_weapon_reference(render_spec: dict, reference_id: str | None) -> None:
-    if (
-        render_spec.get("generation_mode")
-        == ai_render_spec.GENERATION_MODE_CHARACTER_WEAPON_HOLDOUT
-        and not str(reference_id or "").strip()
-    ):
-        raise ValueError("modo holdout exige uma referência visual da arma")
+    mode = render_spec.get("generation_mode")
+    if not str(reference_id or "").strip():
+        if mode == ai_render_spec.GENERATION_MODE_CHARACTER_WEAPON_HOLDOUT:
+            raise ValueError("modo holdout exige uma referência visual da arma")
+        if mode == ai_render_spec.GENERATION_MODE_CHARACTER_COMPONENT_HOLDOUT:
+            raise ValueError("modo holdout exige uma referência visual do componente")
 
 
 def resolve_weapon_reference_for_render(
@@ -818,6 +819,18 @@ def _layered_bundle_destination(job_id: str) -> Path:
 
 def _layered_bundle_urls(job_id: str, manifest: dict) -> dict[str, str]:
     base = f"/layered-outputs/{quote(job_id, safe='')}"
+    if manifest.get("schema") == layered_bundle.LAYERED_BUNDLE_SCHEMA_V2:
+        component = manifest["layers"][1]
+        return {
+            "character_full": (
+                f"{base}/{quote(manifest['layers'][0]['file'], safe='/')}"
+            ),
+            "component_visible": f"{base}/{quote(component['file'], safe='/')}",
+            "component_visibility_mask": (
+                f"{base}/{quote(component['occlusion']['visible_mask'], safe='/')}"
+            ),
+            "preview": f"{base}/{quote(manifest['preview'], safe='/')}",
+        }
     return {
         "weapon": f"{base}/{quote(manifest['layers'][0]['file'], safe='/')}",
         "character_holdout": f"{base}/{quote(manifest['layers'][1]['file'], safe='/')}",
@@ -1113,12 +1126,14 @@ def _mark_layered_holdout_complete(
 ) -> dict:
     composition_outputs = composition.get("outputs")
     holdout_report = {
+        "schema": composition.get("schema"),
         "grid": composition.get("grid"),
         "cell_size": composition.get("cell_size"),
         "dilation": composition.get("dilation", 0),
         "outputs": sorted(composition_outputs)
         if isinstance(composition_outputs, Mapping)
         else [],
+        "validation": copy.deepcopy(composition.get("validation")),
     }
     report["holdout_stage"] = "after_final_resolution"
     report["holdout_applied"] = True
@@ -1179,6 +1194,9 @@ def run_layered_postprocess_compose_publish(
     source_cell: int = 256,
     output_cell: int | None = None,
     dilation: int = 0,
+    tolerance: int = 1,
+    component_id: str = "equipment",
+    component_kind: str = "equipment",
     postprocess_output: Path | None = None,
     process_fn=None,
     composer_fn=None,
@@ -1250,8 +1268,12 @@ def run_layered_postprocess_compose_publish(
     if not weapon_sheet.is_absolute():
         weapon_sheet = process_output / weapon_sheet
     mask_paths = _front_mask_paths_for_layer(specs["weapon"], rows=rows, phases=phases)
-    composer = layered_compositor.compose_layered_spritesheets if composer_fn is None else composer_fn
-    publisher = publish_layered_job if publish_fn is None else publish_fn
+    composer = (
+        layered_compositor.compose_layered_spritesheets_v2
+        if composer_fn is None
+        else composer_fn
+    )
+    publisher = publish_layered_job_v2 if publish_fn is None else publish_fn
     with tempfile.TemporaryDirectory(prefix=f".layered-compose-{job_id}-") as temporary:
         compose_root = Path(temporary) / "composition"
         character_cells = _extract_layered_sheet_cells(
@@ -1287,13 +1309,13 @@ def run_layered_postprocess_compose_publish(
         if not isinstance(composition, Mapping):
             raise ValueError("compositor layered não retornou relatório")
         output_paths = {}
-        for key in layered_bundle.PUBLISHED_ARTIFACTS:
-            report_key = {
-                "character_holdout": "character_holdout_spritesheet",
-                "weapon": "weapon_spritesheet",
-                "holdout_source": "holdout_cut_mask",
-                "preview": "composite_preview",
-            }[key]
+        output_contract = {
+            "character_full": "character_full_spritesheet",
+            "component_visible": "component_visible_spritesheet",
+            "component_visibility_mask": "component_visibility_mask",
+            "preview": "composite_preview",
+        }
+        for key, report_key in output_contract.items():
             value = composition.get(report_key)
             if value is None and isinstance(composition.get("outputs"), Mapping):
                 value = composition["outputs"].get(report_key)
@@ -1311,8 +1333,34 @@ def run_layered_postprocess_compose_publish(
                 raise ValueError(
                     f"{report_key} deve permanecer na árvore do compositor"
                 ) from None
+        validation = holdout_validation.validate_layered_composition(
+            character_source=character_sheet,
+            character_full=compose_root / output_paths["character_full"],
+            component_source=weapon_sheet,
+            visibility_mask=compose_root / output_paths["component_visibility_mask"],
+            component_visible=compose_root / output_paths["component_visible"],
+            preview=compose_root / output_paths["preview"],
+            grid=(rows, phases),
+            tolerance=tolerance,
+            output_path=process_output / "layered_composition_validation.json",
+        )
+        composition = {**dict(composition), "validation": validation}
         processed = _mark_layered_holdout_complete(
             process_output, processed, composition
+        )
+        character_report = reports.get("character", {})
+        foot_anchor = (
+            character_report.get("foot_anchor")
+            if isinstance(character_report, Mapping)
+            else None
+        )
+        runtime = layered_bundle.default_layered_runtime(
+            list(final_cell_size),
+            rows=rows,
+            columns=phases,
+            fps=float(dict(process_kwargs or {}).get("fps", 10.0)),
+            action_id=str(audit_source.get("render_id") or "default"),
+            foot_anchor=foot_anchor,
         )
         publication = publisher(
             str(job_id),
@@ -1321,6 +1369,11 @@ def run_layered_postprocess_compose_publish(
             provenance=provenance,
             config=config,
             require_auditable_source=True,
+            runtime=runtime,
+            rows=rows,
+            columns=phases,
+            component_id=component_id,
+            component_kind=component_kind,
             **output_paths,
         )
     return {
@@ -1389,6 +1442,73 @@ def publish_layered_job(
     }
 
 
+def publish_layered_job_v2(
+    job_id: str,
+    source_root: Path,
+    *,
+    character_full: Path | str,
+    component_visible: Path | str,
+    component_visibility_mask: Path | str,
+    preview: Path | str,
+    runtime: Mapping[str, object],
+    rows: int = 8,
+    columns: int = 8,
+    source: dict | None = None,
+    provenance: dict | list[dict] | None = None,
+    config=None,
+    require_auditable_source: bool = False,
+    character_id: str = "character",
+    component_id: str = "equipment",
+    component_kind: str = "equipment",
+) -> dict:
+    """Publish the immutable-base modular contract used by the v2 pipeline."""
+    if require_auditable_source:
+        source = layered_bundle.validate_auditable_source(source)
+    destination = _layered_bundle_destination(job_id)
+    manifest = layered_bundle.publish_layered_bundle_v2(
+        source_root,
+        destination,
+        base={"id": character_id, "file": character_full, "z": 0},
+        components=[
+            {
+                "id": component_id,
+                "kind": component_kind,
+                "file": component_visible,
+                "visible_mask": component_visibility_mask,
+                "occluders": [character_id],
+                "z": 1,
+            }
+        ],
+        preview=preview,
+        source=source or {},
+        runtime=runtime,
+        rows=rows,
+        columns=columns,
+        provenance=provenance,
+        config=config,
+        hash_file=sha256_file,
+    )
+    registry_path = destination / layered_bundle.ARTIFACT_HASH_REGISTRY_FILENAME
+    registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    layered_bundle.validate_artifact_hash_registry(
+        registry,
+        {"published": destination},
+        scopes={"published"},
+        hash_file=sha256_file,
+    )
+    return {
+        "job_id": str(job_id),
+        "manifest": manifest,
+        "artifact_hashes": registry,
+        "manifest_url": f"/api/layered-bundles/{quote(str(job_id), safe='')}",
+        "artifact_hashes_url": (
+            f"/layered-outputs/{quote(str(job_id), safe='')}/"
+            f"{layered_bundle.ARTIFACT_HASH_REGISTRY_FILENAME}"
+        ),
+        "outputs": _layered_bundle_urls(str(job_id), manifest),
+    }
+
+
 # Explicit name for callers that prefer the bundle-oriented API vocabulary.
 publish_layered_bundle_for_job = publish_layered_job
 
@@ -1451,6 +1571,49 @@ def _published_layered_artifacts(job_id: str, manifest: dict) -> list[dict[str, 
     layers = manifest.get("layers") or []
     if len(layers) < 2:
         raise ValueError("manifest layered sem as duas camadas canônicas")
+    if manifest.get("schema") == layered_bundle.LAYERED_BUNDLE_SCHEMA_V2:
+        component = layers[1]
+        names = {
+            "character_full": str(layers[0]["file"]),
+            "component_visible": str(component["file"]),
+            "component_visibility_mask": str(
+                component["occlusion"]["visible_mask"]
+            ),
+            "preview": str(manifest["preview"]),
+            "manifest": "layered_sprite_bundle.json",
+            "hashes": layered_bundle.ARTIFACT_HASH_REGISTRY_FILENAME,
+        }
+        labels = {
+            "character_full": "Personagem completo",
+            "component_visible": "Equipamento visível",
+            "component_visibility_mask": "Máscara de visibilidade",
+            "preview": "Composição final",
+            "manifest": "Manifesto do bundle",
+            "hashes": "Registro de hashes",
+        }
+        kinds = {
+            key: "image"
+            for key in (
+                "character_full",
+                "component_visible",
+                "component_visibility_mask",
+                "preview",
+            )
+        }
+        kinds.update({"manifest": "json", "hashes": "json"})
+        return [
+            {
+                "key": key,
+                "label": labels[key],
+                "kind": kinds[key],
+                "filename": filename,
+                "url": f"/layered-outputs/{encoded_job}/{quote(filename, safe='/')}",
+                "download_url": (
+                    f"/api/layered-bundles/{encoded_job}/download/{key}"
+                ),
+            }
+            for key, filename in names.items()
+        ]
     names = {
         "weapon": str(layers[0].get("file") or "weapon_spritesheet.png"),
         "character_holdout": str(layers[1].get("file") or "character_holdout_spritesheet.png"),
@@ -1510,6 +1673,9 @@ def _resolve_layered_download(job_id: str, artifact: str) -> tuple[Path, str] | 
         "character_holdout": ("character_holdout_spritesheet.png", "png"),
         "weapon": ("weapon_spritesheet.png", "png"),
         "holdout_source": ("holdout_cut_mask.png", "png"),
+        "character_full": ("character_full_spritesheet.png", "png"),
+        "component_visible": ("component_visible_spritesheet.png", "png"),
+        "component_visibility_mask": ("component_visibility_mask.png", "png"),
         "preview": ("composite_preview.png", "png"),
         "manifest": ("layered_sprite_bundle.json", "json"),
         "hashes": (layered_bundle.ARTIFACT_HASH_REGISTRY_FILENAME, "json"),
@@ -1538,13 +1704,21 @@ def _resolve_published_layered_artifact(relative: str) -> Path | None:
         return None
     _read_published_layered_registry(job_id)
     allowed = {
-        manifest["layers"][0]["file"],
-        manifest["layers"][1]["file"],
-        manifest["layers"][1]["holdout_source"],
-        manifest["preview"],
-        "layered_sprite_bundle.json",
-        layered_bundle.ARTIFACT_HASH_REGISTRY_FILENAME,
+        layer["file"]
+        for layer in manifest["layers"]
     }
+    for layer in manifest["layers"]:
+        if isinstance(layer.get("occlusion"), dict):
+            allowed.add(layer["occlusion"]["visible_mask"])
+        if layer.get("holdout_source"):
+            allowed.add(layer["holdout_source"])
+    allowed.update(
+        {
+            manifest["preview"],
+            "layered_sprite_bundle.json",
+            layered_bundle.ARTIFACT_HASH_REGISTRY_FILENAME,
+        }
+    )
     if filename not in allowed:
         return None
     target = (destination / filename).resolve()
@@ -2505,10 +2679,32 @@ def run_gemini_job(job: dict) -> None:
                 "additional_instructions", job["payload"].get("prompt") or ""
             )
         ).strip()
-        layered_mode = (
+        generic_layered_mode = (
             render_spec.get("generation_mode")
-            == ai_render_spec.GENERATION_MODE_CHARACTER_WEAPON_HOLDOUT
+            == ai_render_spec.GENERATION_MODE_CHARACTER_COMPONENT_HOLDOUT
         )
+        layered_mode = render_spec.get("generation_mode") in {
+            ai_render_spec.GENERATION_MODE_CHARACTER_WEAPON_HOLDOUT,
+            ai_render_spec.GENERATION_MODE_CHARACTER_COMPONENT_HOLDOUT,
+        }
+        selected_component_id = str(
+            (render_spec.get("layer_contract") or {}).get("weapon_component_id")
+            or "weapon"
+        )
+        selected_component_kind = "weapon"
+        if generic_layered_mode:
+            component_ids = render_spec["layer_contract"]["component_ids"]
+            if len(component_ids) != 1:
+                raise RuntimeError(
+                    "a execução AI modular atual exige exatamente um componente por job"
+                )
+            selected_component_id = str(component_ids[0])
+            selected_layer = next(
+                layer
+                for layer in render_spec["layer_contract"]["layers"]
+                if layer["id"] == selected_component_id
+            )
+            selected_component_kind = str(selected_layer.get("kind") or "equipment")
         if layered_mode:
             # Keep the historical top-level progress fields while exposing a
             # durable per-layer view for the UI/history.  This is deliberately
@@ -2593,7 +2789,14 @@ def run_gemini_job(job: dict) -> None:
             )
 
         prompt = (
-            ai_render_spec.compile_layer_prompt(
+            ai_render_spec.compile_modular_layer_prompt(
+                render_spec,
+                reference_manifest,
+                layer_id=render_spec["layer_contract"]["base_id"],
+                additional_instructions=additional_instructions,
+            )
+            if generic_layered_mode
+            else ai_render_spec.compile_layer_prompt(
                 render_spec,
                 reference_manifest,
                 layer="character",
@@ -2677,13 +2880,13 @@ def run_gemini_job(job: dict) -> None:
                 update_state=lambda state: update_layer_state("character", state),
             )
 
-            # The weapon pass is deliberately a separate request and
+            # The detachable-component pass is deliberately a separate request and
             # checkpoint. The approved character is copied into the manifest
             # as a context reference only; it is never used as the weapon
             # output or as a replacement for the weapon visual reference.
             weapon_reference_id = str(job["payload"].get("weapon_reference_id") or "").strip()
             if not weapon_reference_id:
-                raise RuntimeError("modo holdout exige referência visual da arma")
+                raise RuntimeError("modo holdout exige referência visual do componente")
             weapon_reference = weapon_reference_path(weapon_reference_id)
             weapon_reference_local = character_directory / "weapon_reference.png"
             shutil.copy2(weapon_reference, weapon_reference_local)
@@ -2692,8 +2895,15 @@ def run_gemini_job(job: dict) -> None:
             weapon_manifest = [
                 {
                     "index": 1,
-                    "type": "weapon_reference",
-                    "name": str(get_weapon_reference(weapon_reference_id).get("name") or "weapon reference"),
+                    "type": (
+                        "component_reference"
+                        if generic_layered_mode
+                        else "weapon_reference"
+                    ),
+                    "name": str(
+                        get_weapon_reference(weapon_reference_id).get("name")
+                        or f"{selected_component_kind} reference"
+                    ),
                 },
                 {
                     "index": 2,
@@ -2702,8 +2912,10 @@ def run_gemini_job(job: dict) -> None:
                 },
                 {
                     "index": 3,
-                    "type": "weapon_guide",
-                    "name": f"{guide_channel} structural guide",
+                    "type": (
+                        "component_guide" if generic_layered_mode else "weapon_guide"
+                    ),
+                    "name": f"{guide_channel} structural guide for {selected_component_id}",
                 },
             ]
             weapon_inputs = [
@@ -2721,11 +2933,20 @@ def run_gemini_job(job: dict) -> None:
                 }
                 for item, path in zip(weapon_manifest, weapon_inputs)
             ]
-            weapon_prompt = ai_render_spec.compile_layer_prompt(
-                render_spec,
-                weapon_manifest,
-                layer="weapon",
-                additional_instructions=additional_instructions,
+            weapon_prompt = (
+                ai_render_spec.compile_modular_layer_prompt(
+                    render_spec,
+                    weapon_manifest,
+                    layer_id=selected_component_id,
+                    additional_instructions=additional_instructions,
+                )
+                if generic_layered_mode
+                else ai_render_spec.compile_layer_prompt(
+                    render_spec,
+                    weapon_manifest,
+                    layer="weapon",
+                    additional_instructions=additional_instructions,
+                )
             )
             weapon_runtime_payload = {
                 **runtime_payload,
@@ -2762,6 +2983,7 @@ def run_gemini_job(job: dict) -> None:
                 provider=provider,
                 additional_instructions=additional_instructions,
                 update_state=lambda state: update_layer_state("weapon", state),
+                layer_id=selected_component_id,
             )
             layered_integration = None
             if job["payload"].get("publish_layered_bundle") is True:
@@ -2792,7 +3014,15 @@ def run_gemini_job(job: dict) -> None:
                             "generated_sheet": character_directory / "weapon_full.png",
                             "structural_dir": source,
                             "front_mask_dir": job["payload"].get(
-                                "weapon_front_mask_dir", source / "weapon_front_mask"
+                                "component_visibility_dir"
+                                if generic_layered_mode
+                                else "weapon_front_mask_dir",
+                                source
+                                / (
+                                    "component_visible"
+                                    if generic_layered_mode
+                                    else "weapon_front_mask"
+                                ),
                             ),
                         },
                     },
@@ -2805,6 +3035,11 @@ def run_gemini_job(job: dict) -> None:
                     dilation=normalize_holdout_dilation(
                         job["payload"].get("holdout_dilation")
                     ),
+                    tolerance=normalize_holdout_tolerance(
+                        job["payload"].get("holdout_tolerance")
+                    ),
+                    component_id=selected_component_id,
+                    component_kind=selected_component_kind,
                     process_kwargs={
                         "fps": float(job["payload"].get("fps", 10.0)),
                         "foot_anchor": (128, 220),

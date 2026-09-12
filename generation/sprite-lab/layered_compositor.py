@@ -1,9 +1,14 @@
-"""Deterministic character holdout and local layered composition.
+"""Deterministic visibility masks and local layered composition.
 
 This module operates only on already-approved image layers.  It does not
-render a sprite or call a provider.  The structural front mask is the
-authority for *where* to cut and the weapon alpha is the authority for *how
-much* to cut at anti-aliased edges.
+render a sprite or call a provider.  The v2 API keeps the character immutable
+and applies the structural visibility mask to the detachable component.  The
+resulting component is then composited *over* the complete character using
+straight-alpha source-over semantics.
+
+The original character-holdout API remains available for v1 bundle readers.
+New code should use :func:`apply_component_visibility` and
+:func:`compose_layered_spritesheets_v2`.
 """
 from __future__ import annotations
 
@@ -21,6 +26,13 @@ OUTPUT_NAMES = {
     "character_holdout_spritesheet": "character_holdout_spritesheet.png",
     "weapon_spritesheet": "weapon_spritesheet.png",
     "holdout_cut_mask": "holdout_cut_mask.png",
+    "composite_preview": "composite_preview.png",
+}
+
+OUTPUT_NAMES_V2 = {
+    "character_full_spritesheet": "character_full_spritesheet.png",
+    "component_visible_spritesheet": "component_visible_spritesheet.png",
+    "component_visibility_mask": "component_visibility_mask.png",
     "composite_preview": "composite_preview.png",
 }
 
@@ -239,6 +251,144 @@ def clean_invisible_rgb(
     return output
 
 
+def _rgba_uint8(value: Any, name: str) -> np.ndarray:
+    """Return a copied straight-alpha RGBA array in uint8 representation."""
+    array = _as_array(value, name)
+    if array.ndim != 3 or array.shape[-1] != 4:
+        raise ValueError(f"{name} deve possuir quatro canais")
+    if not np.issubdtype(array.dtype, np.number) and array.dtype != np.bool_:
+        raise ValueError(f"{name} deve ser numérico")
+    if array.dtype == np.uint8:
+        return np.array(array, copy=True)
+    source_is_bool = array.dtype == np.bool_
+    source_is_float = np.issubdtype(array.dtype, np.floating)
+    values = np.asarray(array, dtype=np.float64)
+    values = np.nan_to_num(values, nan=0.0, posinf=255.0, neginf=0.0)
+    if source_is_bool or (
+        source_is_float and np.max(values, initial=0.0) <= 1.0
+    ):
+        values = values * 255.0
+    return np.clip(np.rint(values), 0.0, 255.0).astype(np.uint8)
+
+
+def calculate_component_visible_alpha(
+    component_alpha: Any,
+    visibility_mask: Any,
+    *,
+    grid: Sequence[int] = DEFAULT_GRID,
+    dilation: int = 0,
+) -> np.ndarray:
+    """Return ``component_alpha x visibility_mask`` as straight uint8 alpha.
+
+    Unlike the v1 holdout equation, this operation never changes character
+    alpha.  A fractional component edge remains fractional and source-over
+    composition over an opaque character therefore remains fully opaque.
+    """
+    component_channel = _channel_array(component_alpha, "component_alpha")
+    shape = tuple(int(part) for part in component_channel.shape)
+    _grid_shape(shape, grid)
+    dilation = _validate_dilation(dilation)
+    mask, _before, _after = _cell_limited_mask(
+        visibility_mask,
+        shape,
+        grid,
+        dilation,
+    )
+    result = np.clip(
+        np.rint(_unit_interval(component_channel, "component_alpha") * mask * 255.0),
+        0.0,
+        255.0,
+    )
+    return result.astype(np.uint8)
+
+
+def calculate_visibility_mask(
+    visibility_mask: Any,
+    *,
+    grid: Sequence[int] = DEFAULT_GRID,
+    dilation: int = 0,
+) -> np.ndarray:
+    """Return the cell-limited structural visibility mask as uint8."""
+    channel = _channel_array(visibility_mask, "visibility_mask", mask=True)
+    shape = tuple(int(part) for part in channel.shape)
+    _grid_shape(shape, grid)
+    dilation = _validate_dilation(dilation)
+    mask, _before, _after = _cell_limited_mask(
+        visibility_mask,
+        shape,
+        grid,
+        dilation,
+    )
+    return np.clip(np.rint(mask * 255.0), 0.0, 255.0).astype(np.uint8)
+
+
+def apply_component_visibility(
+    component_rgba: Any,
+    visibility_mask: Any,
+    *,
+    grid: Sequence[int] = DEFAULT_GRID,
+    dilation: int = 0,
+) -> tuple[Image.Image, dict[str, Any]]:
+    """Mask a detachable component while preserving straight-alpha edges."""
+    component = _rgba_uint8(component_rgba, "component_rgba")
+    shape = tuple(int(part) for part in component.shape[:2])
+    dilation = _validate_dilation(dilation)
+    mask, before, after = _cell_limited_mask(
+        visibility_mask,
+        shape,
+        grid,
+        dilation,
+    )
+    component_alpha = _unit_interval(component[..., 3], "component_alpha")
+    output = np.array(component, copy=True)
+    output[..., 3] = np.clip(
+        np.rint(component_alpha * mask * 255.0),
+        0.0,
+        255.0,
+    ).astype(np.uint8)
+    output, cleaned = clean_invisible_rgb(output, return_count=True)
+    report = {
+        "grid": [int(grid[0]), int(grid[1])],
+        "size": [shape[1], shape[0]],
+        "dilation": dilation,
+        "dilation_applied": bool(dilation),
+        "visible_pixel_count": before,
+        "dilated_visible_pixel_count": after,
+        "mask_limited_to_cells": True,
+        "transparent_rgb_cleaned": cleaned,
+        "character_preserved": True,
+        "component_masked": True,
+        "alpha_mode": "straight",
+    }
+    return Image.fromarray(output, mode="RGBA"), report
+
+
+def composite_component_over_character(
+    character_full_rgba: Any,
+    component_visible_rgba: Any,
+) -> Image.Image:
+    """Compose a visible component over an immutable full character.
+
+    Pillow's ``alpha_composite`` implements straight-alpha source-over.  In
+    particular, a component edge at alpha 128 over an opaque character yields
+    an opaque result rather than the alpha-191 fringe produced by v1's
+    double-attenuation arrangement.
+    """
+    character = _rgba_uint8(character_full_rgba, "character_full_rgba")
+    component = _rgba_uint8(component_visible_rgba, "component_visible_rgba")
+    if character.shape != component.shape:
+        raise ValueError(
+            "character_full_rgba e component_visible_rgba devem ter a mesma dimensão"
+        )
+    character_image = Image.fromarray(character, mode="RGBA")
+    component_image = Image.fromarray(component, mode="RGBA")
+    try:
+        return Image.alpha_composite(character_image, component_image)
+    finally:
+        character_image.close()
+        component_image.close()
+
+
 def apply_character_holdout(
     character_rgba: Any,
     weapon_rgba: Any,
@@ -365,7 +515,11 @@ def compose_layered_spritesheets(
         if not isinstance(cell, dict):
             raise ValueError("cada célula deve ser um objeto")
         row, column = cell.get("row"), cell.get("column")
-        if type(row) is not int or type(column) is not int or (row, column) not in expected:
+        if (
+            type(row) is not int
+            or type(column) is not int
+            or (row, column) not in expected
+        ):
             raise ValueError(f"célula fora da grade {rows}x{columns}: {(row, column)}")
         if (row, column) in indexed:
             raise ValueError(f"célula duplicada: {(row, column)}")
@@ -507,6 +661,225 @@ def compose_layered_spritesheets(
     }
 
 
+def compose_layered_spritesheets_v2(
+    cells: Sequence[dict[str, Any]] | dict[str, Any],
+    output_dir: Path | str,
+    *,
+    grid: Sequence[int] = DEFAULT_GRID,
+    character_field: str = "character_path",
+    component_field: str = "component_path",
+    visibility_mask_field: str = "visibility_mask_path",
+    dilation: int = 0,
+) -> dict[str, Any]:
+    """Build v2 atlases using ``component_visible OVER character_full``.
+
+    Each cell is addressed by explicit row/column metadata.  Weapon-oriented
+    v1 field names are accepted as input aliases so callers can migrate the
+    compositor before changing their renderer manifests.  Outputs, however,
+    use generic component terminology and never modify the character layer.
+    """
+    rows, columns = _composition_grid(grid)
+    dilation = _validate_dilation(dilation)
+    expected = {(row, column) for row in range(rows) for column in range(columns)}
+    raw_cells = cells.get("cells") if isinstance(cells, dict) else cells
+    if not isinstance(raw_cells, Sequence) or isinstance(raw_cells, (str, bytes)):
+        raise ValueError(
+            f"cells deve ser uma sequência de {rows * columns} células"
+        )
+
+    indexed: dict[tuple[int, int], dict[str, Any]] = {}
+    for cell in raw_cells:
+        if not isinstance(cell, dict):
+            raise ValueError("cada célula deve ser um objeto")
+        row, column = cell.get("row"), cell.get("column")
+        if type(row) is not int or type(column) is not int or (row, column) not in expected:
+            raise ValueError(f"célula fora da grade {rows}x{columns}: {(row, column)}")
+        if (row, column) in indexed:
+            raise ValueError(f"célula duplicada: {(row, column)}")
+        indexed[(row, column)] = cell
+    missing = expected - set(indexed)
+    if missing:
+        raise ValueError(f"célula ausente: {sorted(missing)[0]}")
+
+    prepared: list[
+        tuple[
+            int,
+            int,
+            Image.Image,
+            Image.Image,
+            Image.Image,
+            Image.Image,
+            dict[str, Any],
+        ]
+    ] = []
+    cell_size: tuple[int, int] | None = None
+    for (row, column), cell in sorted(indexed.items()):
+        character_path = _cell_path(
+            cell,
+            character_field,
+            (
+                "character_beauty_path",
+                "character_full_path",
+                "character",
+                "character_path",
+            ),
+            row,
+            column,
+        )
+        component_path = _cell_path(
+            cell,
+            component_field,
+            (
+                "component_beauty_path",
+                "weapon_beauty_path",
+                "weapon_path",
+                "component",
+                "weapon",
+            ),
+            row,
+            column,
+        )
+        mask_path = _cell_path(
+            cell,
+            visibility_mask_field,
+            (
+                "component_visibility_mask_path",
+                "weapon_front_mask_path",
+                "front_mask_path",
+                "visibility_mask",
+                "front_mask",
+            ),
+            row,
+            column,
+        )
+        character = _load_rgba_png(character_path, "character")
+        component = _load_rgba_png(component_path, "component")
+        mask = _load_mask_png(mask_path)
+        try:
+            if character.size != component.size or character.size != mask.size:
+                raise ValueError(
+                    f"dimensão incorreta na célula {(row, column)}: "
+                    f"character={character.size}, component={component.size}, "
+                    f"mask={mask.size}"
+                )
+            if cell_size is None:
+                cell_size = character.size
+            elif character.size != cell_size:
+                raise ValueError(
+                    f"dimensão incorreta na célula {(row, column)}: {character.size}; "
+                    f"esperado {cell_size}"
+                )
+
+            component_visible, cell_report = apply_component_visibility(
+                component,
+                mask,
+                grid=(1, 1),
+                dilation=dilation,
+            )
+            structural_mask = calculate_visibility_mask(
+                mask,
+                grid=(1, 1),
+                dilation=dilation,
+            )
+            mask_rgba = Image.fromarray(
+                np.dstack(
+                    (
+                        np.full((mask.height, mask.width), 255, dtype=np.uint8),
+                        np.full((mask.height, mask.width), 255, dtype=np.uint8),
+                        np.full((mask.height, mask.width), 255, dtype=np.uint8),
+                        structural_mask,
+                    )
+                ),
+                mode="RGBA",
+            )
+            preview = composite_component_over_character(character, component_visible)
+            character_full = character.copy()
+            cell_report = {
+                "row": row,
+                "column": column,
+                **cell_report,
+                "mask_size": [mask.width, mask.height],
+                "composition": "component_visible_over_character_full",
+            }
+            prepared.append(
+                (
+                    row,
+                    column,
+                    character_full,
+                    component_visible,
+                    mask_rgba,
+                    preview,
+                    cell_report,
+                )
+            )
+        except Exception:
+            character.close()
+            component.close()
+            mask.close()
+            raise
+        character.close()
+        component.close()
+        mask.close()
+
+    assert cell_size is not None
+    width, height = cell_size
+    sheet_size = (width * columns, height * rows)
+    character_sheet = Image.new("RGBA", sheet_size, (0, 0, 0, 0))
+    component_sheet = Image.new("RGBA", sheet_size, (0, 0, 0, 0))
+    mask_sheet = Image.new("RGBA", sheet_size, (0, 0, 0, 0))
+    preview_sheet = Image.new("RGBA", sheet_size, (0, 0, 0, 0))
+    for row, column, character, component, mask, preview, _report in prepared:
+        position = (column * width, row * height)
+        character_sheet.paste(character, position)
+        component_sheet.paste(component, position)
+        mask_sheet.paste(mask, position)
+        preview_sheet.paste(preview, position)
+        character.close()
+        component.close()
+        mask.close()
+        preview.close()
+
+    destination = Path(output_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    paths = {
+        name: destination / filename for name, filename in OUTPUT_NAMES_V2.items()
+    }
+    for name, image in (
+        ("character_full_spritesheet", character_sheet),
+        ("component_visible_spritesheet", component_sheet),
+        ("component_visibility_mask", mask_sheet),
+        ("composite_preview", preview_sheet),
+    ):
+        image.save(paths[name], format="PNG")
+        image.close()
+
+    output_metadata = {
+        name: {
+            "path": str(path),
+            "size": [sheet_size[0], sheet_size[1]],
+            "mode": "RGBA",
+            "sha256": _sha256(path),
+        }
+        for name, path in paths.items()
+    }
+    reports = [report for *_images, report in prepared]
+    return {
+        "schema": "sprite_lab.layered_composition/v2",
+        "composition_order": ["character_full", "component_visible"],
+        "composition": "component_visible_over_character_full",
+        "alpha_mode": "straight",
+        "character_immutable": True,
+        "grid": [rows, columns],
+        "cell_count": len(prepared),
+        "cell_size": [width, height],
+        "dilation": dilation,
+        "outputs": {name: str(path) for name, path in paths.items()},
+        "output_metadata": output_metadata,
+        "reports": reports,
+        **{name: str(path) for name, path in paths.items()},
+    }
+
+
 # Keep descriptive aliases available to callers that use the shorter API
 # vocabulary while retaining one implementation and one rounding policy.
 compute_holdout_alpha = calculate_holdout_alpha
@@ -517,13 +890,19 @@ compose_layered_outputs = compose_layered_spritesheets
 
 __all__ = [
     "DEFAULT_GRID",
+    "OUTPUT_NAMES_V2",
+    "apply_component_visibility",
     "apply_character_holdout",
     "apply_holdout",
     "calculate_holdout_alpha",
     "calculate_holdout_mask",
+    "calculate_component_visible_alpha",
+    "calculate_visibility_mask",
     "clean_invisible_rgb",
+    "composite_component_over_character",
     "compose_layered_outputs",
     "compose_layered_spritesheets",
+    "compose_layered_spritesheets_v2",
     "compose_spritesheets",
     "compute_holdout_alpha",
 ]

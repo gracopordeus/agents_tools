@@ -46,3 +46,34 @@ ao aplicativo e pode mudar. O uso depende dos limites e capacidades da sessão.
 
 Verificação: `python3 -m unittest discover -s sprite-lab/tests -p 'test_chatgpt_bridge.py'`
 a partir da raiz do projeto.
+
+## Camadas modulares / Holdout v2
+
+O modo recomendado no AI Render é `character_component_holdout`. Ele usa o
+mesmo provider selecionado (incluindo GPT Image/OpenAI e ChatGPT local), mas
+executa dois pedidos independentes: uma base completa e imutável e um
+componente destacável, como roupa, arma, escudo ou cabelo.
+
+O render estrutural deve habilitar `layered_outputs: true` ou declarar
+`component_holdout_pass: true` e `component_holdout_id`. O Blender grava cada
+célula de `component_visible/` com `Object.is_holdout` nos oclusores. A etapa
+final aplica a máscara ao alpha do componente e compõe
+`component_visible OVER character_full`; ela nunca recorta a base.
+
+Antes da publicação, o gate `sprite_lab.layered_composition_validation/v2`
+confere identidade byte a byte da base, alpha do componente, RGB visível,
+pixels transparentes, resultado Alpha Over, opacidade sobre a base e ausência
+de expansão do alpha. Uma falha interrompe o job antes da promoção atômica.
+
+O bundle `sprite_lab.layered_sprite_bundle/v2` contém:
+
+- `character_full_spritesheet.png`;
+- `component_visible_spritesheet.png`;
+- `component_visibility_mask.png`;
+- `composite_preview.png`;
+- runtime com ações, FPS, direções, frame, pivot e foot anchor;
+- manifesto e registro de hashes.
+
+O leitor e as APIs v1 permanecem disponíveis para bundles antigos. O contrato
+v2 já representa N componentes; a tela atual gera um componente por job para
+manter checkpoint, referência visual e retentativa independentes.

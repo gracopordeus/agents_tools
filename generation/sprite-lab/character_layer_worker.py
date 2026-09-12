@@ -22,12 +22,23 @@ def run_character_layer(
     additional_instructions: str = "",
 ) -> dict[str, Any]:
     """Run or resume the character layer through the real provider boundary."""
-    prompt = ai_render_spec.compile_layer_prompt(
-        render_spec,
-        reference_manifest,
-        layer="character",
-        additional_instructions=additional_instructions,
-    )
+    if (
+        render_spec.get("generation_mode")
+        == ai_render_spec.GENERATION_MODE_CHARACTER_COMPONENT_HOLDOUT
+    ):
+        prompt = ai_render_spec.compile_modular_layer_prompt(
+            render_spec,
+            reference_manifest,
+            layer_id=render_spec["layer_contract"]["base_id"],
+            additional_instructions=additional_instructions,
+        )
+    else:
+        prompt = ai_render_spec.compile_layer_prompt(
+            render_spec,
+            reference_manifest,
+            layer="character",
+            additional_instructions=additional_instructions,
+        )
     request = character_layer_request.build_character_layer_request(
         job_id=job_id,
         prompt=prompt,

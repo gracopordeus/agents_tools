@@ -766,6 +766,86 @@ class AiRenderSpecTests(unittest.TestCase):
         self.assertNotIn("Do not include this note.", prompt)
         self.assertIn("C2: Include this note.", prompt)
 
+    def _modular_spec(self) -> dict:
+        spec = ai_render_spec.default_render_spec(name="hero")
+        spec.update({
+            "generation_mode": "character_component_holdout",
+            "layer_contract": {
+                "base_id": "character_full",
+                "component_ids": ["coat", "sword"],
+                "generation_order": ["character_full", "coat", "sword"],
+                "composition_order": ["character_full", "coat", "sword"],
+                "layers": [
+                    {"id": "character_full", "z": 0},
+                    {"id": "coat", "kind": "clothing", "z": 10},
+                    {"id": "sword", "z": 20},
+                ],
+                "preview": "composite_preview.png",
+            },
+            "source_contract": {
+                "components": [
+                    {"id": "coat", "role": "clothing", "asset_id": "coat-red"},
+                    {"id": "sword", "role": "weapon", "attach_to": "hand_r"},
+                ]
+            },
+        })
+        return spec
+
+    def test_normalizes_generic_layer_contract_with_multiple_components(self) -> None:
+        normalized = ai_render_spec.normalize_render_spec(self._modular_spec())
+
+        self.assertEqual(normalized["generation_mode"], "character_component_holdout")
+        contract = normalized["layer_contract"]
+        self.assertEqual(contract["version"], 2)
+        self.assertEqual(contract["component_ids"], ["coat", "sword"])
+        self.assertEqual(
+            [(layer["id"], layer["role"], layer.get("kind"), layer["z"]) for layer in contract["layers"]],
+            [
+                ("character_full", "base", None, 0),
+                ("coat", "component", "clothing", 10),
+                ("sword", "component", "weapon", 20),
+            ],
+        )
+
+    def test_modular_component_prompt_keeps_full_component_for_later_holdout(self) -> None:
+        prompt = ai_render_spec.compile_modular_layer_prompt(
+            self._modular_spec(),
+            [{"index": 1, "type": "component_reference", "name": "red coat"}],
+            layer_id="coat",
+        )
+
+        self.assertIn("MODULAR COMPONENT LAYER CONTRACT", prompt)
+        self.assertIn("complete component", prompt)
+        self.assertIn("Do not cut it to the character silhouette", prompt)
+        self.assertIn("Blender holdout/depth pass", prompt)
+        self.assertIn('"id": "coat"', prompt)
+        self.assertIn('"asset_id": "coat-red"', prompt)
+        self.assertIn("exactly 8 rows by 8 columns", prompt)
+
+    def test_modular_base_prompt_is_immutable_and_excludes_components(self) -> None:
+        prompt = ai_render_spec.compile_modular_layer_prompt(
+            self._modular_spec(),
+            ai_render_spec.build_reference_manifest(["beauty", "bones"]),
+            layer_id="character_full",
+        )
+
+        self.assertIn("IMMUTABLE BASE LAYER CONTRACT", prompt)
+        self.assertIn("never pre-cut holes", prompt)
+        self.assertIn("coat, sword", prompt)
+
+    def test_modular_contract_rejects_hidden_or_reordered_components(self) -> None:
+        spec = self._modular_spec()
+        spec["source_contract"]["components"][0]["visible"] = False
+        with self.assertRaisesRegex(ValueError, "componentes visíveis.*coat"):
+            ai_render_spec.normalize_render_spec(spec)
+
+        reordered = self._modular_spec()
+        reordered["layer_contract"]["composition_order"] = [
+            "character_full", "sword", "coat"
+        ]
+        with self.assertRaisesRegex(ValueError, "composition_order"):
+            ai_render_spec.normalize_render_spec(reordered)
+
 
 if __name__ == "__main__":
     unittest.main()

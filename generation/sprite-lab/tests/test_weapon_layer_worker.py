@@ -33,6 +33,59 @@ class WeaponLayerWorkerTests(unittest.TestCase):
         })
         return spec
 
+    def _modular_spec(self):
+        spec = ai_render_spec.default_render_spec(name="hero")
+        spec.update({
+            "generation_mode": "character_component_holdout",
+            "output": {**spec["output"], "width": 1024, "height": 1024},
+            "source_contract": {
+                "components": [{"id": "coat_1", "role": "clothing", "visible": True}],
+            },
+            "layer_contract": {
+                "base_id": "character_full",
+                "component_ids": ["coat_1"],
+                "generation_order": ["character_full", "coat_1"],
+                "composition_order": ["character_full", "coat_1"],
+                "layers": [
+                    {"id": "character_full", "role": "base", "z": 0},
+                    {"id": "coat_1", "role": "component", "kind": "clothing", "z": 1},
+                ],
+            },
+        })
+        return spec
+
+    def test_modular_mode_compiles_a_clothing_component_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            character = root / "character_full.png"
+            Image.new("RGBA", (1024, 1024)).save(character)
+            (root / "character_response.json").write_text(
+                '{"status":"character_complete","sha256":"%s"}'
+                % character_layer_persistence._sha256(character)
+            )
+            component, guide = root / "coat.png", root / "guide.png"
+            Image.new("RGBA", (1024, 1024)).save(component)
+            Image.new("RGBA", (1024, 1024)).save(guide)
+            provider = DryRunProvider()
+            result = weapon_layer_worker.run_weapon_layer(
+                job_id="job",
+                render_spec=self._modular_spec(),
+                reference_manifest=[
+                    {"index": 1, "type": "component_reference"},
+                    {"index": 2, "type": "character_full"},
+                    {"index": 3, "type": "component_guide"},
+                ],
+                input_images=[component, character, guide],
+                output_dir=root,
+                model="model",
+                provider=provider,
+                update_state=lambda _state: None,
+                layer_id="coat_1",
+            )
+
+            self.assertIn("MODULAR COMPONENT LAYER CONTRACT", result["prompt"])
+            self.assertIn("coat_1", result["prompt"])
+
     def test_runs_weapon_after_character_checkpoint_and_emits_specific_states(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

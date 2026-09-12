@@ -151,6 +151,99 @@ class BlenderLayerVisibilityTests(unittest.TestCase):
             with visibility.weapon_only_visibility([character], "missing"):
                 pass
 
+    def test_generic_component_holdout_uses_native_flags_and_restores_state(self) -> None:
+        coat_root = FakeObject(
+            "sprite_component_coat_1",
+            conditioning_component_id="coat_1",
+            conditioning_component_role="clothing",
+        )
+        hat_root = FakeObject(
+            "sprite_component_hat_1",
+            conditioning_component_id="hat_1",
+            conditioning_component_role="clothing",
+        )
+        coat = FakeObject("CoatMesh", parent=coat_root)
+        coat.is_holdout = True
+        body = FakeObject("BodyMesh")
+        body.is_holdout = False
+        hat = FakeObject("HatMesh", parent=hat_root)
+        hat.is_holdout = False
+        originally_hidden = FakeObject("HiddenBody", hide_render=True)
+        originally_hidden.is_holdout = True
+
+        with visibility.component_holdout_visibility(
+            [body, coat, hat, originally_hidden],
+            "coat_1",
+            occluder_component_ids=[],
+        ) as selected:
+            self.assertEqual(selected, [coat])
+            self.assertFalse(coat.hide_render)
+            self.assertFalse(coat.is_holdout)
+            self.assertFalse(body.hide_render)
+            self.assertTrue(body.is_holdout)
+            self.assertTrue(hat.hide_render)
+            self.assertFalse(hat.is_holdout)
+            self.assertTrue(originally_hidden.hide_render)
+            self.assertFalse(originally_hidden.is_holdout)
+
+        self.assertTrue(coat.is_holdout)
+        self.assertFalse(body.is_holdout)
+        self.assertFalse(hat.is_holdout)
+        self.assertTrue(originally_hidden.is_holdout)
+        self.assertTrue(originally_hidden.hide_render)
+
+    def test_generic_component_holdout_metadata_preserves_alignment(self) -> None:
+        primary = {
+            "directions": ["south", "north"],
+            "sampled_frames": [10, 20],
+            "camera": {"type": "ORTHO", "ortho_scale": 4.0},
+            "cell": [256, 256],
+            "cells": [
+                {
+                    "row": 0,
+                    "direction": "south",
+                    "column": 0,
+                    "frame": 10,
+                    "component_visible_path": "/tmp/row0_col0.png",
+                }
+            ],
+        }
+        component = {"id": "coat_1", "role": "clothing", "attach_to": "spine"}
+
+        metadata = visibility.component_holdout_pass_metadata(primary, component)
+
+        self.assertEqual(metadata["method"], "blender_object_holdout")
+        self.assertEqual(
+            metadata["occlusion"]["mode"], "all_other_visible_meshes"
+        )
+        self.assertEqual(metadata["component"]["id"], "coat_1")
+        self.assertEqual(metadata["camera"], primary["camera"])
+        self.assertEqual(metadata["sampled_frames"], [10, 20])
+        self.assertEqual(
+            metadata["cells"][0]["component_visible_path"],
+            "/tmp/row0_col0.png",
+        )
+        primary["camera"]["ortho_scale"] = 99
+        self.assertEqual(metadata["camera"]["ortho_scale"], 4.0)
+
+    def test_generic_component_holdout_restores_state_after_exception(self) -> None:
+        root = FakeObject(
+            "sprite_component_coat_1",
+            conditioning_component_id="coat_1",
+        )
+        coat = FakeObject("CoatMesh", parent=root)
+        coat.is_holdout = False
+        body = FakeObject("BodyMesh")
+        body.is_holdout = False
+
+        with self.assertRaisesRegex(RuntimeError, "render failed"):
+            with visibility.component_holdout_visibility([body, coat], "coat_1"):
+                self.assertTrue(body.is_holdout)
+                raise RuntimeError("render failed")
+
+        self.assertFalse(body.is_holdout)
+        self.assertFalse(coat.is_holdout)
+
 
 if __name__ == "__main__":
     unittest.main()

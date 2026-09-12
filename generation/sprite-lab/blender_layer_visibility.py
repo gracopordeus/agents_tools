@@ -41,6 +41,20 @@ def weapon_objects(objects: Iterable[Any]) -> list[Any]:
     return [obj for obj in objects if component_role(obj) == "weapon"]
 
 
+def component_objects(
+    objects: Iterable[Any], component_identifier: str
+) -> list[Any]:
+    """Return every render object inherited by one semantic component.
+
+    Unlike :func:`weapon_objects`, this selector is deliberately role agnostic:
+    the same pass is used for a coat, trousers, hair, shield or weapon.
+    """
+    identifier = str(component_identifier).strip()
+    if not identifier:
+        return []
+    return [obj for obj in objects if component_id(obj) == identifier]
+
+
 def character_pass_metadata(
     render_metadata: dict[str, Any],
     effective_profile: dict[str, Any] | None,
@@ -97,6 +111,55 @@ def weapon_pass_metadata(
     }
 
 
+def component_holdout_pass_metadata(
+    render_metadata: dict[str, Any],
+    component: dict[str, Any],
+    occluder_component_ids: Iterable[str] | None = None,
+) -> dict[str, Any]:
+    """Describe a native Blender holdout pass sharing the primary grid."""
+    return {
+        "enabled": True,
+        "method": "blender_object_holdout",
+        "channels": ["component_visible"],
+        "directions": list(render_metadata["directions"]),
+        "sampled_frames": list(render_metadata["sampled_frames"]),
+        "camera": dict(render_metadata["camera"]),
+        "cell": list(render_metadata["cell"]),
+        "component": {
+            field: copy.deepcopy(component.get(field))
+            for field in ("id", "asset_id", "role", "attach_to", "transform", "fit")
+        },
+        "cells": [
+            {
+                field: copy.deepcopy(cell.get(field))
+                for field in (
+                    "row",
+                    "direction",
+                    "column",
+                    "frame",
+                    "component_visible_path",
+                )
+                if field in cell
+            }
+            for cell in render_metadata["cells"]
+        ],
+        "transparent_background": True,
+        "alignment_source": "primary_pass",
+        "occlusion": {
+            "mode": (
+                "all_other_visible_meshes"
+                if occluder_component_ids is None
+                else "character_and_selected_components"
+            ),
+            "component_ids": (
+                None
+                if occluder_component_ids is None
+                else [str(value) for value in occluder_component_ids]
+            ),
+        },
+    }
+
+
 @contextmanager
 def character_only_visibility(objects: Iterable[Any]) -> Iterator[None]:
     """Hide weapon objects for one pass and restore every original flag."""
@@ -137,3 +200,63 @@ def weapon_only_visibility(
     finally:
         for obj, hidden in original:
             obj.hide_render = hidden
+
+
+@contextmanager
+def component_holdout_visibility(
+    objects: Iterable[Any],
+    component_identifier: str,
+    *,
+    occluder_component_ids: Iterable[str] | None = None,
+) -> Iterator[list[Any]]:
+    """Render one component while all requested scene meshes act as Holdouts.
+
+    Blender's native ``Object.is_holdout`` flag preserves each selected
+    component's beauty materials while punching transparent holes only where an
+    occluder is in front of it.  With no explicit occluder list, every other
+    currently-visible mesh participates.  When a list is supplied, unowned
+    character meshes and the listed components participate; other components
+    are hidden from this pass.
+
+    All visibility and holdout flags are restored, including on exceptions.
+    """
+    objects = list(objects)
+    identifier = str(component_identifier).strip()
+    selected = component_objects(objects, identifier)
+    if not selected:
+        raise ValueError(
+            f"component_identifier '{identifier}' não possui meshes renderizáveis"
+        )
+    selected_identities = {id(obj) for obj in selected}
+    explicit_occluders = (
+        {str(value).strip() for value in occluder_component_ids}
+        if occluder_component_ids is not None
+        else None
+    )
+    original = [
+        (
+            obj,
+            bool(obj.hide_render),
+            bool(getattr(obj, "is_holdout", False)),
+        )
+        for obj in objects
+    ]
+    try:
+        for obj, originally_hidden, _ in original:
+            if id(obj) in selected_identities:
+                obj.hide_render = False
+                obj.is_holdout = False
+                continue
+            candidate_id = component_id(obj)
+            participates = (
+                explicit_occluders is None
+                or candidate_id is None
+                or candidate_id in explicit_occluders
+            )
+            obj.hide_render = originally_hidden or not participates
+            obj.is_holdout = participates and not originally_hidden
+        yield selected
+    finally:
+        for obj, hidden, holdout in original:
+            obj.hide_render = hidden
+            obj.is_holdout = holdout

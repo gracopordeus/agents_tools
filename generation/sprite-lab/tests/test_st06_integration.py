@@ -96,17 +96,48 @@ class St06IntegrationTests(unittest.TestCase):
             self.assertEqual(
                 set(publication["manifest"]["hashes"]),
                 {
-                    "character_holdout_spritesheet.png",
-                    "weapon_spritesheet.png",
-                    "holdout_cut_mask.png",
+                    "character_full_spritesheet.png",
+                    "component_visible_spritesheet.png",
+                    "component_visibility_mask.png",
                     "composite_preview.png",
                 },
             )
-            with Image.open(destination / "character_holdout_spritesheet.png") as character:
-                self.assertEqual(character.getpixel((0, 0))[3], 0)
+            self.assertEqual(
+                publication["manifest"]["schema"],
+                "sprite_lab.layered_sprite_bundle/v2",
+            )
+            self.assertEqual(
+                set(publication["outputs"]),
+                {
+                    "character_full",
+                    "component_visible",
+                    "component_visibility_mask",
+                    "preview",
+                },
+            )
+            self.assertEqual(
+                {item["key"] for item in server._published_layered_artifacts(
+                    "job-7", publication["manifest"]
+                )},
+                {
+                    "character_full",
+                    "component_visible",
+                    "component_visibility_mask",
+                    "preview",
+                    "manifest",
+                    "hashes",
+                },
+            )
+            self.assertTrue(result["composition"]["validation"]["validated"])
+            with Image.open(destination / "character_full_spritesheet.png") as character:
+                self.assertEqual(character.getpixel((0, 0))[3], 255)
                 self.assertEqual(character.getpixel((8, 0))[3], 255)
+            with Image.open(destination / "component_visible_spritesheet.png") as component:
+                self.assertEqual(component.getpixel((0, 0))[3], 255)
+                self.assertEqual(component.getpixel((8, 0))[3], 0)
             with Image.open(destination / "composite_preview.png") as preview:
                 self.assertEqual(preview.getpixel((0, 0))[:3], (20, 200, 20))
+                self.assertEqual(preview.getpixel((8, 0))[:3], (200, 20, 20))
             persisted = result["postprocess"]["manifest"]
             self.assertEqual(
                 json.loads(Path(persisted).read_text())["holdout_stage"],
