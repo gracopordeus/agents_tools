@@ -1,0 +1,62 @@
+{
+  "version": 1,
+  "input_sha256": "7c957e932a8ca8acde10f1bc1211f0e74f082c161aedc70ee8f1d1d9ad640f36",
+  "dependency_hashes": {},
+  "note": "Tripo 'medieval knight armor', assembled layout facing -Y: +X is the character's left. Suit = cuirass, pauldrons, tassets and thigh plates in one shell.",
+  "parts": [
+    {
+      "name": "Helmet",
+      "selectors": [
+        {
+          "object": "tripo_node_85e98b80",
+          "component": 4
+        }
+      ]
+    },
+    {
+      "name": "Suit",
+      "selectors": [
+        {
+          "object": "tripo_node_85e98b80",
+          "component": 0
+        }
+      ]
+    },
+    {
+      "name": "Glove_L",
+      "selectors": [
+        {
+          "object": "tripo_node_85e98b80",
+          "component": 5
+        }
+      ]
+    },
+    {
+      "name": "Glove_R",
+      "selectors": [
+        {
+          "object": "tripo_node_85e98b80",
+          "component": 3
+        }
+      ]
+    },
+    {
+      "name": "Boot_L",
+      "selectors": [
+        {
+          "object": "tripo_node_85e98b80",
+          "component": 1
+        }
+      ]
+    },
+    {
+      "name": "Boot_R",
+      "selectors": [
+        {
+          "object": "tripo_node_85e98b80",
+          "component": 2
+        }
+      ]
+    }
+  ]
+}

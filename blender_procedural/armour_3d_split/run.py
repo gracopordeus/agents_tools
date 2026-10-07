@@ -46,7 +46,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--objects", nargs="+", help="Exact mesh names; otherwise all meshes in scene")
     selectors = parser.add_mutually_exclusive_group()
     selectors.add_argument("--plan", type=Path, help="Explicit JSON assignment created after inspection")
-    selectors.add_argument("--preset", choices=("medieval_plate",))
+    selectors.add_argument("--preset", choices=("medieval_plate", "assembled"),
+                           help="assembled: name the pieces of a standing set by where they are")
     parser.add_argument("--blender", default="blender")
     parser.add_argument("--normal-policy", choices=("strict", "backup"), default="strict",
                         help="strict rejects shading drift; backup explicitly delivers a measured limitation with lossless source vectors")

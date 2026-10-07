@@ -1,0 +1,142 @@
+{
+  "name": "plate",
+  "note": "Limits taken from the run the user approved (dedos_050, 2026-10-07) with a small margin; the value of that run is beside each limit. Only the user changes a limit.",
+  "reference_slot": "suit",
+  "gates": {
+    "split_delivered": {
+      "stage": 1
+    },
+    "pairs_mirrored": {
+      "stage": 2
+    },
+    "halves_mirrored_mm": {
+      "stage": 3,
+      "max": 0.01,
+      "approved": 0.0,
+      "remedy": {
+        "kind": "symmetrize"
+      }
+    },
+    "halves_closed": {
+      "stage": 3,
+      "max": 0,
+      "approved": 0
+    },
+    "lid_depth_share": {
+      "stage": 4,
+      "target": 0.5,
+      "tolerance": 0.02,
+      "approved": 0.5
+    },
+    "budget": {
+      "stage": 5
+    },
+    "handedness": {
+      "stage": 6
+    },
+    "length_as_designed_pct": {
+      "stage": 6,
+      "max": 5,
+      "approved": 0,
+      "remedy": {
+        "kind": "length_design"
+      }
+    },
+    "length_beyond_cm": {
+      "stage": 6,
+      "max": 1.5,
+      "approved": 0.8,
+      "remedy": {
+        "kind": "length_fraction",
+        "allowed": [
+          0.3,
+          2.0
+        ],
+        "margin_cm": 0.3
+      }
+    },
+    "length_short_cm": {
+      "stage": 6,
+      "max": 1.0,
+      "approved": 0.0,
+      "remedy": {
+        "kind": "length_fraction",
+        "allowed": [
+          0.3,
+          2.0
+        ],
+        "margin_cm": 0.0
+      }
+    },
+    "mouth_off_centre_cm": {
+      "stage": 6,
+      "max": 0.2,
+      "approved": 0.05,
+      "remedy": {
+        "kind": "centre_rounds",
+        "allowed": [
+          4,
+          12
+        ]
+      }
+    },
+    "collar_gap_cm": {
+      "stage": 6,
+      "min": -1.0,
+      "approved": -0.9,
+      "remedy": {
+        "kind": "collar_gap",
+        "allowed": [
+          0.008,
+          0.03
+        ]
+      }
+    },
+    "collar_sides_differ_cm": {
+      "stage": 6,
+      "max": 0.3,
+      "approved": 0.1
+    },
+    "set_proportion": {
+      "stage": 6,
+      "tolerance": 0.1,
+      "approved": 1.0,
+      "remedy": {
+        "kind": "relative_to"
+      }
+    },
+    "pair_symmetry_mm": {
+      "stage": 6,
+      "max": 0.1,
+      "approved": 0.0
+    },
+    "self_symmetry_p95_mm": {
+      "stage": 6,
+      "max": 2.5,
+      "approved": 1.61
+    },
+    "self_symmetry_max_mm": {
+      "stage": 6,
+      "max": 10.0,
+      "approved": 6.75
+    },
+    "shape_p95_pct": {
+      "stage": 6,
+      "max": {
+        "helmet": 1.0,
+        "suit": 42.0,
+        "glove": 24.0,
+        "boot": 25.0
+      },
+      "approved": {
+        "helmet": 0.0,
+        "suit": 36.9,
+        "glove": 20.8,
+        "boot": 21.7
+      }
+    },
+    "fit_gates": {
+      "stage": 7
+    }
+  }
+}

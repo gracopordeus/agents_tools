@@ -5,20 +5,96 @@
   "rig_frame": "godot",
   "influences_per_vertex": 8,
   "bones": {
-    "hips": "mixamorig_Hips", "spine": "mixamorig_Spine", "spine1": "mixamorig_Spine1", "spine2": "mixamorig_Spine2",
-    "neck": "mixamorig_Neck", "head": "mixamorig_Head",
-    "shoulder.L": "mixamorig_LeftShoulder", "upper_arm.L": "mixamorig_LeftArm", "forearm.L": "mixamorig_LeftForeArm",
-    "hand.L": "mixamorig_LeftHand", "thigh.L": "mixamorig_LeftUpLeg", "shin.L": "mixamorig_LeftLeg",
-    "foot.L": "mixamorig_LeftFoot", "toe.L": "mixamorig_LeftToeBase",
-    "shoulder.R": "mixamorig_RightShoulder", "upper_arm.R": "mixamorig_RightArm", "forearm.R": "mixamorig_RightForeArm",
-    "hand.R": "mixamorig_RightHand", "thigh.R": "mixamorig_RightUpLeg", "shin.R": "mixamorig_RightLeg",
-    "foot.R": "mixamorig_RightFoot", "toe.R": "mixamorig_RightToeBase"
+    "hips": "mixamorig_Hips",
+    "spine": "mixamorig_Spine",
+    "spine1": "mixamorig_Spine1",
+    "spine2": "mixamorig_Spine2",
+    "neck": "mixamorig_Neck",
+    "head": "mixamorig_Head",
+    "shoulder.L": "mixamorig_LeftShoulder",
+    "upper_arm.L": "mixamorig_LeftArm",
+    "forearm.L": "mixamorig_LeftForeArm",
+    "hand.L": "mixamorig_LeftHand",
+    "thigh.L": "mixamorig_LeftUpLeg",
+    "shin.L": "mixamorig_LeftLeg",
+    "foot.L": "mixamorig_LeftFoot",
+    "toe.L": "mixamorig_LeftToeBase",
+    "shoulder.R": "mixamorig_RightShoulder",
+    "upper_arm.R": "mixamorig_RightArm",
+    "forearm.R": "mixamorig_RightForeArm",
+    "hand.R": "mixamorig_RightHand",
+    "thigh.R": "mixamorig_RightUpLeg",
+    "shin.R": "mixamorig_RightLeg",
+    "foot.R": "mixamorig_RightFoot",
+    "toe.R": "mixamorig_RightToeBase",
+    "middle.L": "mixamorig_LeftHandMiddle1",
+    "middle.R": "mixamorig_RightHandMiddle1"
   },
   "bone_groups": {
-    "fingers.L": {"prefix": "mixamorig_LeftHand", "exclude": ["mixamorig_LeftHand"]},
-    "fingers.R": {"prefix": "mixamorig_RightHand", "exclude": ["mixamorig_RightHand"]},
-    "head_all": {"prefix": "mixamorig_Head", "exclude": []},
-    "thumb.L": {"prefix": "mixamorig_LeftHandThumb", "exclude": []},
-    "thumb.R": {"prefix": "mixamorig_RightHandThumb", "exclude": []}
+    "fingers.L": {
+      "prefix": "mixamorig_LeftHand",
+      "exclude": [
+        "mixamorig_LeftHand"
+      ]
+    },
+    "fingers.R": {
+      "prefix": "mixamorig_RightHand",
+      "exclude": [
+        "mixamorig_RightHand"
+      ]
+    },
+    "head_all": {
+      "prefix": "mixamorig_Head",
+      "exclude": []
+    },
+    "thumb.L": {
+      "prefix": "mixamorig_LeftHandThumb",
+      "exclude": []
+    },
+    "thumb.R": {
+      "prefix": "mixamorig_RightHandThumb",
+      "exclude": []
+    },
+    "chain_index.L": {
+      "prefix": "mixamorig_LeftHandIndex",
+      "exclude": []
+    },
+    "chain_middle.L": {
+      "prefix": "mixamorig_LeftHandMiddle",
+      "exclude": []
+    },
+    "chain_ring.L": {
+      "prefix": "mixamorig_LeftHandRing",
+      "exclude": []
+    },
+    "chain_pinky.L": {
+      "prefix": "mixamorig_LeftHandPinky",
+      "exclude": []
+    },
+    "chain_index.R": {
+      "prefix": "mixamorig_RightHandIndex",
+      "exclude": []
+    },
+    "chain_middle.R": {
+      "prefix": "mixamorig_RightHandMiddle",
+      "exclude": []
+    },
+    "chain_ring.R": {
+      "prefix": "mixamorig_RightHandRing",
+      "exclude": []
+    },
+    "chain_pinky.R": {
+      "prefix": "mixamorig_RightHandPinky",
+      "exclude": []
+    }
+  },
+  "mirror": {
+    "axis": "x",
+    "at_m": 0.0,
+    "left": "+",
+    "bone_tokens": {
+      "left": "Left",
+      "right": "Right"
+    }
   }
 }

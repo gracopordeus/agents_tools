@@ -10,7 +10,9 @@ import bpy
 import numpy as np
 from mathutils import Vector
 
-from partition import assignments, medieval_plan
+from partition import assembled_plan, assignments, medieval_plan
+
+PRESETS = {"medieval_plate": medieval_plan, "assembled": assembled_plan}
 
 PREFIX = "_a3s_"
 NORMAL_TOLERANCE = 0.0002  # Blender custom-normal encoding is quantized.
@@ -480,7 +482,7 @@ def execute(request: dict) -> None:
         write(out, "plan.template.json", template)
         verify_inputs(request)
         return
-    plan = medieval_plan(inventory) if request["preset"] else request["plan"]
+    plan = PRESETS[request["preset"]](inventory) if request["preset"] else request["plan"]
     mapping = assignments(plan, inventory)
     source = snapshots(objects)
     # Native separate/join retain layers, flags and user attributes; provenance

@@ -25,8 +25,8 @@ nomes de peças. O arquivo de entrada nunca é salvo nem sobrescrito.
 
 ```bash
 python3 -m armour_3d_split inspect \
-  --input "assets_models/medieval armor 3d model boots.glb" \
-  --out outputs/armour_3d_split/boots_inspect_001
+  --input "assets_models/medieval knight armor 3d model.glb" \
+  --out outputs/armour_3d_split/knight_inspect_001
 ```
 
 Gera dois arquivos na pasta de saída:
@@ -40,14 +40,15 @@ permitem reconhecer qual ilha é qual peça. Exemplo do arquivo acima:
 
 | `index` | Triângulos | Bounding box (x, z) | Peça |
 |---:|---:|---|---|
-| 0 | 33.672 | centro, metade de cima | Chest |
-| 1 | 25.516 | esquerda, metade de baixo | Legs |
-| 2 | 10.512 | esquerda, metade de cima | Helmet |
-| 3 | 7.686 | direita, embaixo | Boot_L |
-| 4 | 7.454 | extrema direita, embaixo | Boot_R |
-| 5 | 4.504 | extrema direita, em cima | Glove_R |
-| 6 | 4.116 | direita, em cima | Glove_L |
-| 7 | 1 | dentro do bbox de Legs | fragmento → Legs |
+| 0 | 56.216 | centro, do joelho ao pescoço | Suit |
+| 1 | 11.500 | x > 0, do chão ao joelho | Boot_L |
+| 2 | 11.142 | x < 0, do chão ao joelho | Boot_R |
+| 3 | 7.288 | x < 0, ao lado do quadril | Glove_R |
+| 4 | 6.983 | centro, no topo | Helmet |
+| 5 | 6.604 | x > 0, ao lado do quadril | Glove_L |
+
+A armadura vem montada, de frente para `-Y`: `+X` é o lado esquerdo do personagem. Ilhas de
+poucos triângulos (fragmentos) vão para a peça cuja bounding box as contém.
 
 Os componentes são ordenados por número de vértices (decrescente). Os índices valem
 só para o arquivo inspecionado.
@@ -62,13 +63,12 @@ Copie `plan.template.json`, dê nomes às peças e agrupe os componentes:
 ```json
 {
   "version": 1,
-  "input_sha256": "ac22c61b…  (copiado do inventory.json)",
+  "input_sha256": "7c957e93…  (copiado do inventory.json)",
   "dependency_hashes": {},
   "note": "texto livre, opcional",
   "parts": [
-    {"name": "Helmet", "selectors": [{"object": "tripo_node_54e3…", "component": 2}]},
-    {"name": "Legs",   "selectors": [{"object": "tripo_node_54e3…", "component": 1},
-                                     {"object": "tripo_node_54e3…", "component": 7}]}
+    {"name": "Helmet", "selectors": [{"object": "tripo_node_85e98b80", "component": 4}]},
+    {"name": "Suit",   "selectors": [{"object": "tripo_node_85e98b80", "component": 0}]}
   ]
 }
 ```
@@ -89,24 +89,27 @@ Regras do plano (qualquer violação recusa o split):
 - nomes de peça: letra inicial, depois letras, dígitos ou `_`, até 63 caracteres, sem repetição;
 - só os campos `version`, `input_sha256`, `dependency_hashes`, `parts` e `note` são aceitos.
 
-Um plano pronto para o arquivo do exemplo está em `examples/medieval_boots.plan.json`.
+Planos prontos em `examples/`: `medieval_knight_dedos.plan.json` (referência atual, com nove
+fragmentos atribuídos ao elmo e ao tronco) e `medieval_knight.plan.json` (o do exemplo acima).
 
 ### 3. Separar
 
 ```bash
 python3 -m armour_3d_split split \
-  --input "assets_models/medieval armor 3d model boots.glb" \
-  --plan armour_3d_split/examples/medieval_boots.plan.json \
+  --input "assets_models/medieval knight armor 3d model.glb" \
+  --plan armour_3d_split/examples/medieval_knight.plan.json \
   --normal-policy backup \
-  --out outputs/armour_3d_split/boots_split_001
+  --out outputs/armour_3d_split/knight_split_001
 ```
 
 Saída no terminal:
 
 ```text
-PASS_WITH_NORMAL_LIMITATION: …/boots_split_001/report.json
-WARNING: tripo_node_…: normals on 368 corners of 101 flat-pocket vertices are undefined in Blender (…)
+PASS_WITH_NORMAL_LIMITATION: …/knight_split_001/report.json
 ```
+
+Quando a malha tem bolsos planos (ver abaixo), sai também uma linha `WARNING:` com a contagem.
+O asset de referência não tem nenhum.
 
 ## Opções
 
@@ -116,6 +119,7 @@ WARNING: tripo_node_…: normals on 368 corners of 101 flat-pocket vertices are 
 | `--out PASTA` | ambos | pasta nova ou vazia (obrigatório); nunca sobrescreve um run |
 | `--plan ARQ` | `split` | plano JSON; exclui `--preset` |
 | `--preset medieval_plate` | `split` | plano embutido, preso a um GLB específico (ver abaixo) |
+| `--preset assembled` | `split` | nomeia as peças de um conjunto montado de pé pela posição (ver abaixo) |
 | `--normal-policy strict\|backup` | `split` | `strict` (padrão) recusa desvio de normais; `backup` entrega com limitação medida |
 | `--objects NOME…` | ambos | restringe às meshes citadas; use para excluir corpo e proxies |
 | `--scene NOME` | ambos | obrigatório em `.blend` com mais de uma cena |
@@ -227,35 +231,45 @@ A decimação posterior elimina os bolsos.
 - **`.blend`:** objetos ou meshes de libraries vinculadas precisam ser tornados locais
   antes. Texturas existentes são empacotadas na saída.
 
+## Preset `assembled`
+
+Para um conjunto montado como figura de pé, de frente para `-Y` (o que a pipeline usa com
+`split.plan: "auto"`). Sem plano escrito à mão:
+
+- componente com pelo menos 2% dos triângulos é peça; têm de ser seis;
+- o maior é o `Suit`; o que cruza o meio do conjunto acima dele é o `Helmet`;
+- dos quatro restantes, os dois mais baixos são as botas e os outros dois as manoplas;
+- esquerda é `+X`; as duas peças de um par têm de estar em lados opostos e ter tamanho parecido;
+- fragmento pequeno vai para a peça cuja caixa contém o centro dele.
+
+Qualquer coisa fora disso (sétima peça, par do mesmo lado, fragmento em nenhuma ou em duas caixas) é
+erro, com a causa na mensagem; aí o plano é escrito à mão depois de `inspect`. Os padrões estão em
+`ASSEMBLED_DEFAULTS` (`partition.py`). Nos dois assets de referência o resultado é igual ao plano
+escrito à mão.
+
 ## Preset `medieval_plate`
 
-```bash
-python3 -m armour_3d_split split \
-  --input "assets_models/medieval plate armor 3d model.glb" \
-  --preset medieval_plate --normal-policy backup \
-  --out outputs/armour_3d_split/medieval_split_001
-```
-
-Vale só para o GLB de SHA-256
-`e422e03e5c4dd798eedd6eb6c7f56b474dda5a3bc6c73a233ce1145c6e258733`: agrupa as sete
-ilhas principais e os três fragmentos, mantendo os 58.800 triângulos.
+Plano embutido que vale só para o GLB de SHA-256
+`e422e03e5c4dd798eedd6eb6c7f56b474dda5a3bc6c73a233ce1145c6e258733`, um asset de teste antigo
+que foi removido de `assets_models/`. O código do preset continua na ferramenta, sem uso.
 
 ## Lateralidade
 
-`_L` e `_R` são só os nomes que o plano dá. Nos dois arquivos de exemplo eles seguem a
-posição das peças no catálogo da fonte, não a anatomia. A ferramenta não espelha nem
-reposiciona nada.
+`_L` e `_R` são só os nomes que o plano dá. No plano de referência eles seguem a anatomia
+(`+X` é a esquerda do personagem). A ferramenta não espelha nem reposiciona nada.
 
 ## Próximo passo: decimação
 
-O `.blend` separado mantém a contagem original de triângulos. Para reduzir aos
-orçamentos por peça, use `armour_3d_decimate`:
+O `.blend` separado mantém a malha como veio. Um GLB não guarda quads, então uma malha de
+quads chega aqui em pares de triângulos; quem junta os pares de volta e, se preciso, reduz aos
+orçamentos por peça é o `armour_3d_decimate`. O split com entrada já em quads (um `.blend`)
+segue as mesmas regras, mas não foi testado.
 
 ```bash
 blender -b --factory-startup --python-exit-code 2 -P armour_3d_decimate/decimate.py -- \
-  --input outputs/armour_3d_split/boots_split_001/armour_split.blend \
-  --budgets armour_3d_decimate/budgets.plate.json \
-  --out outputs/armour_3d_decimate/boots_001
+  --input outputs/armour_3d_split/knight_split_001/armour_split.blend \
+  --budgets armour_3d_decimate/budgets.plate_quads.json \
+  --out outputs/armour_3d_decimate/knight_001
 ```
 
 ## Testes

@@ -1,0 +1,81 @@
+{
+  "budgets": {
+    "Helmet": 8000,
+    "Suit": 60000,
+    "Glove_L": 8000,
+    "Glove_R": 8000,
+    "Boot_L": 13000,
+    "Boot_R": 13000
+  },
+  "reduce": "over_budget",
+  "quads": {
+    "enabled": true,
+    "join_face_angle_deg": 60.0,
+    "join_shape_angle_deg": 60.0,
+    "min_quad_face_share": 0.9
+  },
+  "target_tolerance": 0.01,
+  "weld_over_diagonal": 0.0,
+  "crease_deg": 50.0,
+  "gates": {
+    "budget_tolerance": 0.1,
+    "min_silhouette_iou": 0.95,
+    "max_p99_distance_over_diagonal": 0.005,
+    "max_distance_over_diagonal": 0.02
+  },
+  "mirror_pairs": [
+    {
+      "pieces": [
+        "Glove_L",
+        "Glove_R"
+      ],
+      "keep": "auto",
+      "fingers": 5
+    },
+    {
+      "pieces": [
+        "Boot_L",
+        "Boot_R"
+      ],
+      "keep": "auto"
+    }
+  ],
+  "recess_lids": [
+    {
+      "pieces": [
+        "Boot_L",
+        "Boot_R"
+      ],
+      "out": [
+        0,
+        0,
+        1
+      ]
+    },
+    {
+      "pieces": [
+        "Glove_L",
+        "Glove_R"
+      ],
+      "out": "cuff"
+    },
+    {
+      "pieces": [
+        "Helmet"
+      ],
+      "out": [
+        0,
+        0,
+        -1
+      ]
+    }
+  ],
+  "symmetrize": [
+    {
+      "pieces": [
+        "Suit"
+      ],
+      "keep": "R"
+    }
+  ]
+}

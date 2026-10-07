@@ -241,6 +241,84 @@ def hand_frame(axis, points: np.ndarray, thumb_hint) -> np.ndarray:
     return np.stack([axis, lateral, np.cross(axis, lateral)], axis=1)
 
 
+def cavity_offsets(points: np.ndarray, limb: np.ndarray, along: np.ndarray, low: float, high: float,
+                   stations: int = 8, sectors: int = 16, closed: float = 0.75) -> tuple[np.ndarray, np.ndarray]:
+    """How far off the middle of a limb the cavity of a tube around it is, station by station.
+
+    At each height the tube is read from the middle of the limb outwards: the nearest point of it in each
+    direction is its inner wall there. The middle of that outline is the middle of the cavity; flaps and
+    plates that stand out on one side of the tube do not move it. Only stations where the tube closes around
+    the limb count. Returns the heights (along ``along``) and the offsets, cavity minus limb (K, 3).
+    """
+    along = unit(along)
+    u = unit(np.cross(along, [1.0, 0.0, 0.0] if abs(along[0]) < 0.9 else [0.0, 1.0, 0.0]))
+    v = np.cross(along, u)
+    tube_h, limb_h = points @ along, limb @ along
+    edges = np.linspace(low, high, stations + 1)
+    heights, offsets = [], []
+    for a, b in zip(edges[:-1], edges[1:]):
+        ring, flesh = points[(tube_h >= a) & (tube_h <= b)], limb[(limb_h >= a) & (limb_h <= b)]
+        if len(ring) < sectors or len(flesh) < 6:
+            continue
+        fu, fv = flesh @ u, flesh @ v
+        middle = np.array([(fu.min() + fu.max()) / 2, (fv.min() + fv.max()) / 2])
+        du, dv = ring @ u - middle[0], ring @ v - middle[1]
+        radius = np.hypot(du, dv)
+        sector = np.floor((np.arctan2(dv, du) % (2 * np.pi)) / (2 * np.pi) * sectors).astype(int) % sectors
+        inner = np.full(sectors, np.inf)
+        np.minimum.at(inner, sector, radius)
+        filled = np.isfinite(inner)
+        if filled.mean() < closed:
+            continue
+        # middle of the inner outline: opposite walls in pairs, so that a missing sector does not pull it
+        angles = (np.arange(sectors) + 0.5) / sectors * 2 * np.pi
+        half = sectors // 2
+        pairs = filled[:half] & filled[half:]
+        if pairs.sum() < 3:
+            continue
+        across = (inner[:half] - inner[half:])[pairs] / 2
+        design = np.stack([np.cos(angles[:half][pairs]), np.sin(angles[:half][pairs])], axis=1)
+        centre = np.linalg.lstsq(design, across, rcond=None)[0]
+        heights.append((a + b) / 2)
+        offsets.append(centre[0] * u + centre[1] * v)
+    return np.asarray(heights), np.asarray(offsets).reshape(-1, 3)
+
+
+def long_axis(points: np.ndarray, hint) -> np.ndarray:
+    """Long axis of an elongated piece: its first principal direction, pointing the way of ``hint``."""
+    centred = points - points.mean(axis=0)
+    axis = np.linalg.eigh(centred.T @ centred)[1][:, -1]
+    return axis * (np.sign(axis @ np.asarray(hint, dtype=np.float64)) or 1.0)
+
+
+def centre_line(points: np.ndarray, axis: np.ndarray, low: float, high: float, stations: int = 8,
+                min_points: int = 6) -> tuple[np.ndarray, np.ndarray]:
+    """Line through the middles of the cross-sections of a tube between two heights along ``axis``.
+
+    Returns a point of the line and its direction (pointing the way of ``axis``). The middle of a section is
+    the middle of its extent, not its mean: vertices are never spread evenly around a plate. With fewer than
+    two usable sections the line is ``axis`` through the mean of the points.
+    """
+    axis = unit(axis)
+    u = unit(np.cross(axis, [1.0, 0.0, 0.0] if abs(axis[0]) < 0.9 else [0.0, 1.0, 0.0]))
+    v = np.cross(axis, u)
+    height = points @ axis
+    edges = np.linspace(low, high, stations + 1)
+    centres = []
+    for a, b in zip(edges[:-1], edges[1:]):
+        members = points[(height >= a) & (height <= b)]
+        if len(members) < min_points:
+            continue
+        cu, cv = members @ u, members @ v
+        centres.append((a + b) / 2 * axis + (cu.min() + cu.max()) / 2 * u + (cv.min() + cv.max()) / 2 * v)
+    if len(centres) < 2:
+        return points.mean(axis=0), axis
+    centres = np.asarray(centres)
+    middle = centres.mean(axis=0)
+    direction = np.linalg.svd(centres - middle)[2][0]
+    return middle, direction * (np.sign(direction @ axis) or 1.0)
+
+
 # --------------------------------------------------------------------------- body regions and landmarks
 
 def dominant_bone(bone_ids: np.ndarray, weights: np.ndarray) -> np.ndarray:
@@ -318,6 +396,135 @@ def skin(positions: np.ndarray, ids: np.ndarray, weights: np.ndarray, matrices: 
     for k in range(ids.shape[1]):
         out += weights[:, k:k + 1] * np.einsum("nij,nj->ni", matrices[ids[:, k]], homogeneous)[:, :3]
     return out
+
+
+# --------------------------------------------------------------------------- fingers
+
+def finger_tubes(height: np.ndarray, edges: np.ndarray, min_size: int, floor: float) -> list[tuple[np.ndarray, float]]:
+    """Vertex sets that stand apart as tubes at the far end of a hand: (members, height where the tube joins).
+
+    Vertices enter from the highest down and are joined along mesh edges. A tube is a group that is still on
+    its own when it meets another group of at least ``min_size`` vertices. On a gauntlet whose fingers are
+    fused side by side only the fingertips come out; the caller has to check that the tubes are whole fingers.
+    """
+    count = len(height)
+    neighbours = [[] for _ in range(count)]
+    for a, b in edges:
+        neighbours[a].append(int(b))
+        neighbours[b].append(int(a))
+    parent, members = list(range(count)), {}
+    pure, active, tubes = {}, np.zeros(count, dtype=bool), []
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    for vertex in np.argsort(-height):
+        if height[vertex] < floor:
+            break
+        vertex = int(vertex)
+        active[vertex], members[vertex], pure[vertex] = True, [vertex], True
+        for other in neighbours[vertex]:
+            if not active[other]:
+                continue
+            a, b = find(vertex), find(other)
+            if a == b:
+                continue
+            if len(members[a]) < len(members[b]):
+                a, b = b, a
+            if len(members[b]) >= min_size:
+                for group in (a, b):
+                    if pure[group]:
+                        tubes.append((np.asarray(members[group], dtype=np.int64), float(height[vertex])))
+                pure[a] = False
+            parent[b] = a
+            members[a] += members.pop(b)
+    return tubes
+
+
+def mesh_distance(positions: np.ndarray, edges: np.ndarray, sources: np.ndarray, reach: float) -> np.ndarray:
+    """Distance along mesh edges from ``sources`` to every vertex, followed up to ``reach`` (inf beyond)."""
+    import heapq
+    neighbours = [[] for _ in positions]
+    lengths = np.linalg.norm(positions[edges[:, 0]] - positions[edges[:, 1]], axis=1)
+    for (a, b), length in zip(edges, lengths):
+        neighbours[a].append((int(b), float(length)))
+        neighbours[b].append((int(a), float(length)))
+    distance = np.full(len(positions), np.inf)
+    distance[sources] = 0.0
+    heap = [(0.0, int(v)) for v in sources]
+    heapq.heapify(heap)
+    while heap:
+        d, v = heapq.heappop(heap)
+        if d > distance[v] or d > reach:
+            continue
+        for other, length in neighbours[v]:
+            if d + length < distance[other]:
+                distance[other] = d + length
+                heapq.heappush(heap, (d + length, other))
+    return distance
+
+
+def along_polyline(line: np.ndarray, arc: np.ndarray) -> np.ndarray:
+    """Points at arc lengths ``arc`` of a polyline, continued straight before its first and past its last point."""
+    lengths = np.linalg.norm(np.diff(line, axis=0), axis=1)
+    cumulative = np.concatenate([[0.0], np.cumsum(lengths)])
+    segment = np.clip(np.searchsorted(cumulative, arc, side="right") - 1, 0, len(lengths) - 1)
+    t = (arc - cumulative[segment]) / np.maximum(lengths[segment], 1e-12)
+    return line[segment] + t[:, None] * (line[segment + 1] - line[segment])
+
+
+def _across(normal, tangent: np.ndarray) -> np.ndarray:
+    """``normal`` made perpendicular to ``tangent``; any perpendicular when the two are parallel."""
+    normal = np.asarray(normal, dtype=np.float64)
+    out = normal - (normal @ tangent) * tangent
+    if np.linalg.norm(out) < 1e-6 * max(np.linalg.norm(normal), 1e-12):
+        out = np.cross(tangent, np.eye(3)[np.argmin(np.abs(tangent))])
+    return unit(out)
+
+
+def lay_along_chain(points: np.ndarray, base, tip, chain: np.ndarray, normal, start_arc: float, *,
+                    scale: float = 1.0, samples: int = 12) -> tuple[np.ndarray, np.ndarray]:
+    """Lay a straight tube (a gauntlet finger, from ``base`` to ``tip``) along a bone chain.
+
+    The axis of the tube goes onto ``chain`` from ``start_arc`` to its end; every cross-section is carried
+    over rigidly, turned with the chain by frames transported without twist from ``normal`` (the back of the
+    hand), and widened by ``scale``. Returns the moved points and their arc position on the chain.
+    """
+    base, tip = np.asarray(base, dtype=np.float64), np.asarray(tip, dtype=np.float64)
+    axis, length = unit(tip - base), float(np.linalg.norm(tip - base))
+    t = (points - base) @ axis
+    u = t / max(length, 1e-9)
+    chain_length = float(np.linalg.norm(np.diff(chain, axis=0), axis=1).sum())
+    arc = start_arc + u * (chain_length - start_arc)
+    own_normal = _across(normal, axis)
+    own = np.stack([axis, own_normal, np.cross(axis, own_normal)], axis=1)
+    line = along_polyline(chain, start_arc + np.linspace(0.0, 1.0, samples + 1) * (chain_length - start_arc))
+    tangents = np.gradient(line, axis=0)
+    tangents /= np.maximum(np.linalg.norm(tangents, axis=1, keepdims=True), 1e-12)
+    current = _across(normal, tangents[0])
+    turns = []
+    for k, tangent in enumerate(tangents):
+        if k:
+            current = _across(rotation_between(tangents[k - 1], tangent) @ current, tangent)
+        turns.append(np.stack([tangent, current, np.cross(tangent, current)], axis=1) @ own.T)
+    turns = np.stack(turns)
+    position = np.clip(u, 0.0, 1.0) * samples
+    first = np.clip(np.floor(position).astype(int), 0, samples - 1)
+    fraction = (position - first)[:, None]
+    offset = points - (base + t[:, None] * axis)
+    carried = (1 - fraction) * np.einsum("nij,nj->ni", turns[first], offset) \
+        + fraction * np.einsum("nij,nj->ni", turns[first + 1], offset)
+    return along_polyline(chain, arc) + scale * carried, arc
+
+
+def chain_weights(arc: np.ndarray, joints: list[float], blend: float) -> np.ndarray:
+    """Weights (N, len(joints) + 1) of a point at ``arc`` along a chain: bone k starts at ``joints[k - 1]``."""
+    ramps = [np.clip((arc - joint) / (2 * blend) + 0.5, 0.0, 1.0) for joint in joints]
+    ramps = [ramps[0]] + [np.minimum(ramps[k], ramps[k - 1]) for k in range(1, len(ramps))]
+    columns = [1.0 - ramps[0]] + [ramps[k - 1] - ramps[k] for k in range(1, len(ramps))] + [ramps[-1]]
+    return np.stack(columns, axis=1)
 
 
 # --------------------------------------------------------------------------- body mask
@@ -481,13 +688,12 @@ def section_field(piece_points: np.ndarray, body_points: np.ndarray, origin, axi
             has_body[s] = True
     if not has_body.any():
         return None, {"sections": count, "reason": "the body does not reach the piece"}
-    if rigid:
-        centres = np.tile(np.median(centres[has_body], axis=0), (count, 1))
-    else:
-        centres = _smooth_rows(_fill_nearest(centres, has_body), smooth_passes)
+    centres = _smooth_rows(_fill_nearest(centres, has_body), smooth_passes)
+    body_centres = centres
 
-    def radii(points_h, px, py, section, reducer) -> np.ndarray:
-        dx, dy = px - centres[section, 0], py - centres[section, 1]
+    def radii(points_h, px, py, section, reducer, about=None) -> np.ndarray:
+        about = centres if about is None else about
+        dx, dy = px - about[section, 0], py - about[section, 1]
         sector = np.floor((np.arctan2(dy, dx) % (2 * np.pi)) / (2 * np.pi) * sectors).astype(int) % sectors
         out = np.full((count, sectors), np.nan)
         order = np.lexsort((np.hypot(dx, dy), sector, section))
@@ -499,8 +705,22 @@ def section_field(piece_points: np.ndarray, body_points: np.ndarray, origin, axi
         return out
     body_radius = radii(body_h[inside], bx, by, body_section, lambda r: r[int(0.9 * (len(r) - 1))])
     piece_rel = used - origin
-    piece_radius = radii(piece_h, piece_rel @ u, piece_rel @ v, section_of(piece_h),
-                         lambda r: r[int(0.1 * (len(r) - 1))] if len(r) >= 10 else r[0])
+    inner = lambda r: r[int(0.1 * (len(r) - 1))] if len(r) >= 10 else r[0]
+    piece_section, px, py = section_of(piece_h), piece_rel @ u, piece_rel @ v
+    piece_radius = radii(piece_h, px, py, piece_section, inner)
+    own_offsets = []
+    if rigid:
+        # a ring that closes around the limb is measured about its own middle: the chord through a point
+        # near its wall (a leaning shin inside an upright boot) is much shorter than its width
+        own = body_centres.copy()
+        closed = np.isfinite(piece_radius).mean(axis=1) >= 0.9
+        for k in np.flatnonzero(closed & has_body):
+            members = piece_section == k
+            own[k] = [(px[members].min() + px[members].max()) / 2, (py[members].min() + py[members].max()) / 2]
+        piece_radius = radii(piece_h, px, py, piece_section, inner, own)
+        own_offsets = (own - body_centres)[closed & has_body]
+        # the piece is scaled about one straight line
+        centres = np.tile(np.median(body_centres[has_body], axis=0), (count, 1))
 
     theta = (np.arange(sectors) + 0.5) / sectors * 2 * np.pi
     design = np.stack([np.ones(sectors)] + [f(k * theta) for k in range(1, harmonics + 1) for f in (np.cos, np.sin)], axis=1)
@@ -530,7 +750,8 @@ def section_field(piece_points: np.ndarray, body_points: np.ndarray, origin, axi
                 both = np.isfinite(body_side) & np.isfinite(piece_side)
                 if both.all():
                     ratios.append((sum(body_side) + 2 * gap) / sum(piece_side))
-                    offsets.append((piece_side[0] - piece_side[1]) / 2)
+                    if not closed[s]:
+                        offsets.append((piece_side[0] - piece_side[1]) / 2)
                     at.append(heights[s])
                 elif both.any():                              # open on one side (a pauldron): that side decides
                     k = int(np.argmax(both))
@@ -552,7 +773,10 @@ def section_field(piece_points: np.ndarray, body_points: np.ndarray, origin, axi
                     line[0] = mean - line[1] * middle
                 scale[i, :len(line)] = line
                 used_sections = max(used_sections, len(ratios))
-            if offsets:
+            if len(own_offsets):
+                # middle of the piece's own rings, relative to the line it is scaled about
+                shift[i] = float(np.median(own_offsets[:, i] + (body_centres - centres)[closed & has_body][:, i]))
+            elif offsets:
                 shift[i] = np.median(offsets)
         if not used_sections:
             return None, {"sections": count, "reason": "piece and body share no section"}
@@ -585,3 +809,40 @@ def section_field(piece_points: np.ndarray, body_points: np.ndarray, origin, axi
     return field, {"mode": "flexible", "sections": count, "sections_solved": int(solved.sum()),
                    "mean_offset_m": {"min": float(mean.min()), "median": float(np.median(mean)), "max": float(mean.max())},
                    "body_girth_m": girth}
+
+
+def chain_fraction(length: float, first: float, second: float) -> float:
+    """A length along a limb as a coordinate on its two bones: 0.5 is half the first bone, 1 the joint
+    between them, 1.5 half the second bone."""
+    return length / first if length <= first else 1.0 + (length - first) / second
+
+
+def chain_length(fraction: float, first: float, second: float) -> float:
+    """Inverse of ``chain_fraction``."""
+    return fraction * first if fraction <= 1.0 else first + (fraction - 1.0) * second
+
+
+def design_reach(own: float, other: float | None, snap: float) -> tuple[float, str]:
+    """Where the rim of a piece is to land on a limb, read from where the asset drew it.
+
+    ``own`` is the rim as drawn, in chain coordinates counted from the far end of this piece; ``other`` is
+    the rim of the piece it meets on the same limb, counted from *its* far end towards the same joint
+    (``None`` when the two do not touch in the asset). Both read 1 on the joint between them.
+
+    Drawn within ``snap`` of the joint, a rim belongs on the joint: a plate does not stop a little short of
+    an elbow or run a little past it. Two pieces that meet keep meeting: at the joint when either was drawn
+    near it, otherwise at the point where they were drawn to meet (a sleeve to the middle of the forearm and
+    a short gauntlet), shared out so that nothing is left bare and nothing overlaps.
+    """
+    near = lambda value: abs(value - 1.0) <= snap
+    if other is not None:
+        if near(own) or near(other):
+            return 1.0, "meets its neighbour: on the joint"
+        if (own > 1.0) != (other > 1.0):                     # one runs past the joint, the other stops short of it
+            past, short = max(own, other) - 1.0, min(own, other)
+            total = past + short
+            return (1.0 + past / total, "meets its neighbour past the joint") if own > 1.0 else (short / total, "meets its neighbour short of the joint")
+        return own, "meets its neighbour, both on the same side of the joint: as drawn"
+    if near(own):
+        return 1.0, "drawn near the joint: on the joint"
+    return own, "as drawn"

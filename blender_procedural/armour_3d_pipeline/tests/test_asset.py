@@ -49,7 +49,7 @@ class AssetFile(unittest.TestCase):
             self.load()
 
     def test_rejects_unknown_fields_styles_and_missing_files(self):
-        for change, message in ((lambda a: a.update(extra=1), "exactly the fields"),
+        for change, message in ((lambda a: a.update(extra=1), "needs the fields"),
                                 (lambda a: a["fit"].update(colour="red"), "Unknown fields in fit"),
                                 (lambda a: a["fit"].update(style="robe"), "fit.style"),
                                 (lambda a: a["split"].update(normal_policy="loose"), "normal_policy"),

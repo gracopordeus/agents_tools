@@ -188,10 +188,120 @@ class Proportion(unittest.TestCase):
         ends = field.scale_at(np.array([0.1, 0.5]))
         self.assertLessEqual(np.abs(ends[1] - ends[0]).max(), 0.1 * 0.4 / 0.37 + 1e-6)
 
+    def test_rigid_ring_around_a_leaning_limb_is_sized_by_its_width(self):
+        """A shin leaning inside an upright boot: the limb runs near the wall, the needed scale stays the width ratio."""
+        rng = np.random.default_rng(1)
+        theta, z = rng.uniform(0, 2 * np.pi, 20000), rng.uniform(0, 0.4, 20000)
+        limb = np.stack([0.05 * np.cos(theta) + 0.02 + 0.1 * (z - 0.2), 0.05 * np.sin(theta), z], axis=1)
+        theta, z = rng.uniform(0, 2 * np.pi, 8000), rng.uniform(0.02, 0.38, 8000)
+        ring = np.stack([0.05 * np.cos(theta), 0.05 * np.sin(theta), z], axis=1)
+        field, _ = core.section_field(ring, limb, [0, 0, 0], [0, 0, 1], 0.01, rigid=True, rigid_taper=0.0,
+                                      max_in=0.05, max_out=0.05)
+        scale = field.scale_at(np.array([0.2]))[0]
+        np.testing.assert_allclose(scale, [1.2, 1.2], atol=0.04)       # (5 cm + 1 cm gap) / 5 cm, in both directions
+
     def test_no_field_when_the_body_is_elsewhere(self):
         field, stats = core.section_field(self.piece, self.body + [0, 0, 5.0], [0, 0, 0], [0, 0, 1], 0.01)
         self.assertIsNone(field)
         self.assertIn("reason", stats)
+
+
+class Fingers(unittest.TestCase):
+    def test_tubes_are_the_groups_still_apart_when_they_meet(self):
+        """A comb: three teeth of 20 vertices joined at their roots, on a back of 30 vertices below them."""
+        edges, height = [], []
+        for tooth in range(3):
+            base = tooth * 20
+            edges += [(base + k, base + k + 1) for k in range(19)]
+            height += [1.0 - 0.02 * k - 0.001 * tooth for k in range(20)]
+        back = 60
+        edges += [(back + k, back + k + 1) for k in range(29)]
+        height += [0.5] * 30
+        edges += [(19, 39), (39, 59), (39, back + 15)]
+        tubes = core.finger_tubes(np.asarray(height), np.asarray(edges), min_size=10, floor=0.55)   # above the back
+        self.assertEqual(sorted(len(members) for members, _ in tubes), [20, 20, 20])
+        self.assertEqual(core.finger_tubes(np.asarray(height), np.asarray(edges), min_size=10, floor=0.7), [])
+
+    def test_a_straight_tube_is_laid_along_a_bent_chain_and_keeps_its_section(self):
+        rng = np.random.default_rng(0)
+        x, angle = rng.uniform(0, 0.1, 3000), rng.uniform(0, 2 * np.pi, 3000)
+        tube = np.stack([x, 0.01 * np.cos(angle), 0.01 * np.sin(angle)], axis=1)
+        chain = np.array([[0, 0, 0], [0.05, 0, 0], [0.05, 0, -0.05], [0.05, 0, -0.10]], dtype=float)
+        moved, arc = core.lay_along_chain(tube, [0, 0, 0], [0.1, 0, 0], chain, [0, 0, 1], 0.0)
+        self.assertAlmostEqual(float(arc.max()), 0.15, delta=0.002)            # stretched to the length of the chain
+        radius = np.linalg.norm(moved - core.along_polyline(chain, arc), axis=1)
+        self.assertLess(np.abs(radius - 0.01).max(), 0.004)                    # the section stays round
+        self.assertLess(moved[arc > 0.08][:, 2].max(), 0.012)                  # the far half went down the chain
+        wide, _ = core.lay_along_chain(tube, [0, 0, 0], [0.1, 0, 0], chain, [0, 0, 1], 0.0, scale=1.5)
+        self.assertAlmostEqual(float(np.median(np.linalg.norm(wide - core.along_polyline(chain, arc), axis=1))), 0.015,
+                               delta=0.002)
+        late, arc_late = core.lay_along_chain(tube, [0, 0, 0], [0.1, 0, 0], chain, [0, 0, 1], 0.05)
+        self.assertAlmostEqual(float(arc_late.min()), 0.05, delta=0.002)       # tip on tip: only the end of the chain
+
+    def test_chain_weights_hand_over_at_the_joints(self):
+        weights = core.chain_weights(np.array([-0.02, 0.0, 0.03, 0.05, 0.2]), [0.0, 0.05, 0.10], 0.005)
+        np.testing.assert_allclose(weights.sum(axis=1), 1.0)
+        np.testing.assert_allclose(weights[0], [1, 0, 0, 0])
+        np.testing.assert_allclose(weights[1], [0.5, 0.5, 0, 0])
+        np.testing.assert_allclose(weights[2], [0, 1, 0, 0])
+        np.testing.assert_allclose(weights[4], [0, 0, 0, 1])
+
+    def test_mesh_distance_runs_along_the_edges_and_stops_at_its_reach(self):
+        positions = np.array([[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]], dtype=float)
+        edges = np.array([[0, 1], [1, 2], [2, 3]])
+        np.testing.assert_allclose(core.mesh_distance(positions, edges, np.array([0]), 10.0), [0, 1, 2, 3])
+        self.assertTrue(np.isinf(core.mesh_distance(positions, edges, np.array([0]), 1.5)[3]))
+
+    def test_long_axis_and_centre_line_of_a_tilted_tube_with_a_lump_at_one_end(self):
+        rng = np.random.default_rng(3)
+        true = core.unit(np.array([0.6, 0.1, -0.8]))
+        u = core.unit(np.cross(true, [0.0, 1.0, 0.0])); v = np.cross(true, u)
+        t, angle = rng.uniform(0.0, 0.3, 3000), rng.uniform(0.0, 2 * np.pi, 3000)
+        tube = np.outer(t, true) + 0.05 * (np.outer(np.cos(angle), u) + np.outer(np.sin(angle), v)) + [1.0, 2.0, 3.0]
+        lump = rng.normal(size=(600, 3)) * 0.03 + np.array([1.0, 2.0, 3.0]) + 0.36 * true + 0.08 * u   # a hand, off to one side
+        points = np.concatenate([tube, lump])
+        axis = core.long_axis(points, [0.0, 0.0, -1.0])
+        self.assertGreater(axis @ true, 0.95)
+        height = points @ axis
+        point, direction = core.centre_line(points, axis, height.min(), height.min() + 0.28)
+        self.assertGreater(direction @ true, 0.999)                       # the tube alone gives its own direction
+        offset = (point - np.array([1.0, 2.0, 3.0])) - ((point - np.array([1.0, 2.0, 3.0])) @ true) * true
+        self.assertLess(np.linalg.norm(offset), 0.005)                    # and the line runs through its middle
+
+    def test_cavity_offsets_read_the_inner_wall_and_ignore_a_flap_on_one_side(self):
+        rng = np.random.default_rng(5)
+        z, angle = rng.uniform(0.0, 0.4, 6000), rng.uniform(0.0, 2 * np.pi, 6000)
+        limb = np.stack([0.06 * np.cos(angle), 0.06 * np.sin(angle), z], axis=1)
+        tube = np.stack([0.02 + 0.10 * np.cos(angle), -0.01 + 0.10 * np.sin(angle), z], axis=1)     # 2 cm and -1 cm off
+        flap = np.stack([rng.uniform(0.15, 0.25, 800), rng.uniform(-0.05, 0.05, 800), rng.uniform(0.0, 0.4, 800)], axis=1)
+        heights, offsets = core.cavity_offsets(np.concatenate([tube, flap]), limb, np.array([0.0, 0.0, 1.0]), 0.02, 0.38)
+        self.assertGreaterEqual(len(heights), 6)
+        np.testing.assert_allclose(offsets.mean(axis=0), [0.02, -0.01, 0.0], atol=0.004)
+
+
+class DesignReach(unittest.TestCase):
+    """Where the asset drew a rim, in chain coordinates: 1 is the joint, 1.5 half the bone after it."""
+
+    def test_chain_coordinates_go_through_the_joint_and_back(self):
+        for length in (0.1, 0.287, 0.4):
+            fraction = core.chain_fraction(length, 0.287, 0.292)
+            self.assertAlmostEqual(core.chain_length(fraction, 0.287, 0.292), length)
+        self.assertAlmostEqual(core.chain_fraction(0.287 + 0.146, 0.287, 0.292), 1.5)
+
+    def test_a_rim_drawn_near_a_joint_belongs_on_it(self):
+        self.assertEqual(core.design_reach(1.09, None, 0.15)[0], 1.0)
+        self.assertEqual(core.design_reach(0.92, None, 0.15)[0], 1.0)
+        self.assertEqual(core.design_reach(0.6, None, 0.15)[0], 0.6)          # a short sleeve stays short
+        self.assertEqual(core.design_reach(1.5, None, 0.15)[0], 1.5)          # a long one stays long
+
+    def test_pieces_that_meet_keep_meeting(self):
+        # drawn to meet near the knee: a thigh plate that reads short on this body and a boot that reads past it
+        self.assertEqual(core.design_reach(0.76, 1.12, 0.15)[0], 1.0)
+        self.assertEqual(core.design_reach(1.12, 0.76, 0.15)[0], 1.0)
+        # a sleeve to the middle of the forearm and a short gauntlet: they meet there, with no bare skin and no overlap
+        sleeve, gauntlet = core.design_reach(1.55, 0.5, 0.15)[0], core.design_reach(0.5, 1.55, 0.15)[0]
+        self.assertAlmostEqual((sleeve - 1.0) + gauntlet, 1.0)
+        self.assertAlmostEqual(sleeve, 1.0 + 0.55 / 1.05)
 
 
 if __name__ == "__main__":
