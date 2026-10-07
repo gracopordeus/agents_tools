@@ -5,7 +5,10 @@ import json
 import math
 import os
 import shutil
+import signal
 import subprocess
+import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +18,8 @@ import composition_schema
 import model_cache
 import render_profile
 import asset_manifest
+import parallel_sprite_render
+import layer_channel_assembler
 from orientation_contract import normalize_orientation
 from direction_contract import (
     DIRECTION_CONTRACT,
@@ -46,6 +51,35 @@ DEFAULT_CELL = 256
 DEFAULT_UPSCALE = 2
 SPRITE_WORK = Path(__file__).resolve().parent / "work" / "sprite-renders"
 BLENDER_WORKER = Path(__file__).resolve().with_name("blender_sprite_render.py")
+CONTROLNET_WORKER = Path(__file__).resolve().with_name("controlnet_sprite_channels.py")
+GPU_HEALTH_PATH = Path(__file__).resolve().parent / "state" / "blender_gpu_health.json"
+GPU_RETRY_SECONDS = 24 * 60 * 60
+MESA_EGL_VENDOR = Path("/usr/share/glvnd/egl_vendor.d/50_mesa.json")
+
+
+def character_pass_requested(payload: dict[str, Any]) -> bool:
+    """Keep isolated character rendering explicitly opt-in."""
+    return payload.get("character_pass") is True
+
+
+def weapon_pass_requested(payload: dict[str, Any]) -> bool:
+    """Keep isolated weapon rendering explicitly opt-in."""
+    return payload.get("weapon_pass") is True
+
+
+def weapon_front_mask_requested(payload: dict[str, Any]) -> bool:
+    """Keep the structural front-mask render explicitly opt-in."""
+    return payload.get("weapon_front_mask") is True
+
+
+def component_holdout_requested(payload: dict[str, Any]) -> bool:
+    """Keep the native Blender component holdout pass explicitly opt-in."""
+    return payload.get("component_holdout_pass") is True
+
+
+def layered_outputs_requested(payload: dict[str, Any]) -> bool:
+    """Keep the complete structural atlas export explicitly opt-in."""
+    return payload.get("layered_outputs") is True
 
 
 def write_json_atomic(path: Path, data: Any) -> None:
@@ -59,6 +93,8 @@ def write_json_atomic(path: Path, data: Any) -> None:
 
 def _worker_error(completed: subprocess.CompletedProcess[str], output: Path) -> str:
     """Extract a useful Blender/Python error when the result file is missing."""
+    if completed.returncode < 0:
+        return f"Blender abortou com {signal.Signals(-completed.returncode).name}; consulte o core dump e worker.log"
     chunks = [completed.stdout or "", completed.stderr or ""]
     worker_log = output / "worker.log"
     if worker_log.is_file():
@@ -76,6 +112,272 @@ def _worker_error(completed: subprocess.CompletedProcess[str], output: Path) -> 
         if stripped.startswith(error_prefixes):
             return stripped
     return lines[-1].strip() if lines else "worker encerrou sem produzir metadados"
+
+
+def _blender_worker_env(backend: str) -> dict[str, str]:
+    env = os.environ.copy()
+    env["SPRITE_LAB_RENDER_BACKEND"] = backend
+    if backend == "software":
+        if not MESA_EGL_VENDOR.is_file():
+            raise RuntimeError("Render por software exige o driver EGL Mesa instalado")
+        env["__EGL_VENDOR_LIBRARY_FILENAMES"] = str(MESA_EGL_VENDOR)
+        env["LIBGL_ALWAYS_SOFTWARE"] = "1"
+    else:
+        env.pop("__EGL_VENDOR_LIBRARY_FILENAMES", None)
+        env.pop("LIBGL_ALWAYS_SOFTWARE", None)
+    return env
+
+
+def _gpu_retry_allowed(now: float | None = None) -> bool:
+    if not GPU_HEALTH_PATH.is_file():
+        return True
+    try:
+        health = json.loads(GPU_HEALTH_PATH.read_text(encoding="utf-8"))
+        failed_at = float(health.get("failed_at", 0.0))
+        boot_id = _boot_id()
+        if boot_id and health.get("boot_id") and health["boot_id"] != boot_id:
+            return True
+        if not health.get("boot_id"):
+            # Migrate older circuit-breaker records: a reboot resets the driver.
+            uptime = float(Path("/proc/uptime").read_text().split()[0])
+            if failed_at < time.time() - uptime:
+                return True
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return True
+    return (now if now is not None else time.time()) - failed_at >= GPU_RETRY_SECONDS
+
+
+def _boot_id() -> str | None:
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError:
+        return None
+
+
+def _record_gpu_health(ok: bool, error: str | None = None) -> None:
+    checked_at = time.time()
+    write_json_atomic(
+        GPU_HEALTH_PATH,
+        {
+            "ok": ok,
+            "boot_id": _boot_id(),
+            "checked_at": checked_at,
+            "failed_at": None if ok else checked_at,
+            "error": error,
+        },
+    )
+
+
+def _run_blender_worker(
+    command: list[str],
+    output: Path,
+    result_path: Path,
+    backend: str,
+    timeout: float,
+    *,
+    cancel_event=None,
+    render_threads: int = 0,
+    log_name: str | None = None,
+    environment_extra: dict | None = None,
+) -> subprocess.CompletedProcess[str]:
+    log_path = output / (log_name or ("worker.log" if backend == "software" else "worker.gpu.log"))
+    started = time.monotonic()
+    last_progress = started
+    previous_size = 0
+    stall_limit = max(10.0, float(os.environ.get("SPRITE_LAB_GPU_STALL_SECONDS", "60")))
+    failure = ""
+    # Stream logs to disk so a running job can be inspected. In particular,
+    # driver stalls must not consume the entire one-hour job timeout.
+    environment = _blender_worker_env(backend)
+    environment.update(environment_extra or {})
+    if render_threads:
+        for name in ("LP_NUM_THREADS", "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+            environment[name] = str(render_threads)
+    with log_path.open("w", encoding="utf-8") as log:
+        process = subprocess.Popen(
+            command, env=environment, stdout=log,
+            stderr=subprocess.STDOUT, text=True,
+        )
+        try:
+            while process.poll() is None:
+                now = time.monotonic()
+                size = log_path.stat().st_size
+                if size != previous_size:
+                    previous_size = size
+                    last_progress = now
+                if now - started > timeout:
+                    failure = "Blender excedeu o tempo máximo do job"
+                elif cancel_event is not None and cancel_event.is_set():
+                    failure = "Worker cancelado após falha em outro worker"
+                elif backend == "gpu" and now - last_progress > stall_limit:
+                    failure = f"Blender GPU sem progresso por {stall_limit:g}s"
+                if failure:
+                    process.kill()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        raise RuntimeError(f"Processo {process.pid} preso no driver após SIGKILL; render interrompido")
+                    break
+                time.sleep(0.25)
+            returncode = process.returncode
+        finally:
+            if process.poll() is None:
+                process.kill()
+    contents = log_path.read_text(encoding="utf-8", errors="replace")
+    if failure:
+        with log_path.open("a", encoding="utf-8") as log:
+            log.write(f"\nRuntimeError: {failure}\n")
+    completed = subprocess.CompletedProcess(command, 1 if failure else returncode, contents, failure)
+    if completed.returncode == 0 and not result_path.is_file():
+        completed = subprocess.CompletedProcess(
+            completed.args,
+            1,
+            completed.stdout,
+            (completed.stderr or "") + "\nworker encerrou sem produzir metadados",
+        )
+    return completed
+
+
+def _controlnet_python_executable() -> str:
+    """Use the local CUDA-capable annotator environment when available."""
+    configured = os.environ.get("SPRITE_LAB_PYTHON", "").strip()
+    if configured:
+        return configured
+    pose_python = Path.home() / "pose-venv" / "bin" / "python"
+    if pose_python.is_file():
+        return str(pose_python)
+    local = Path(__file__).resolve().parent / "work" / "teed-venv" / "bin" / "python"
+    return str(local) if local.is_file() else sys.executable
+
+
+def _run_controlnet_channels(
+    output: Path,
+    rows: int,
+    columns: int,
+    size: int,
+    timeout: float,
+) -> dict[str, Any]:
+    """Derive HED softedge/OpenPose channels after Blender emits beauty cells."""
+    report_path = output / "controlnet_channels.json"
+    command = [
+        _controlnet_python_executable(),
+        str(CONTROLNET_WORKER),
+        "--root",
+        str(output),
+        "--rows",
+        str(rows),
+        "--columns",
+        str(columns),
+        "--size",
+        str(size),
+        "--device",
+        "cuda",
+    ]
+    cache_dir = os.environ.get("SPRITE_LAB_CONTROLNET_CACHE", "").strip()
+    if cache_dir:
+        command.extend(("--cache-dir", cache_dir))
+    command.extend((
+        "--channel-workers",
+        os.environ.get("SPRITE_LAB_CONTROLNET_WORKERS", "8"),
+    ))
+    completed = _run_blender_worker(
+        command, output, report_path, "cuda", timeout,
+        log_name="controlnet.log", environment_extra={"HF_HUB_OFFLINE": "1"},
+    )
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip().splitlines()
+        message = detail[-1] if detail else "worker ControlNet encerrou sem relatório"
+        raise RuntimeError(f"inferência ControlNet falhou: {message}")
+    if not report_path.is_file():
+        raise RuntimeError("worker ControlNet encerrou sem produzir controlnet_channels.json")
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError("relatório ControlNet inválido") from error
+    if not isinstance(report, dict):
+        raise RuntimeError("relatório ControlNet deve ser um objeto")
+    if report.get("device") != "cuda":
+        raise RuntimeError("ControlNet deve executar exclusivamente em CUDA")
+    if report.get("schema") != "sprite_lab.controlnet_channels/v1":
+        raise RuntimeError("worker ControlNet retornou um schema desconhecido")
+    if int(report.get("rows", -1)) != rows or int(report.get("columns", -1)) != columns:
+        raise RuntimeError("worker ControlNet retornou uma grade diferente da beauty")
+    expected_cells = {(row, column) for row in range(rows) for column in range(columns)}
+    observed_cells = {
+        (int(item.get("row")), int(item.get("column")))
+        for item in report.get("cells", [])
+        if isinstance(item, dict) and "row" in item and "column" in item
+    }
+    if observed_cells != expected_cells:
+        raise RuntimeError("worker ControlNet não produziu todos os canais da grade")
+    from PIL import Image
+
+    for row, column in sorted(expected_cells):
+        for channel in ("lineart", "bones"):
+            path = output / channel / f"row{row}_col{column}.png"
+            if not path.is_file():
+                raise RuntimeError(f"canal ControlNet ausente: {path.name}")
+            with Image.open(path) as image:
+                if image.size != (size, size):
+                    raise RuntimeError(
+                        f"dimensão inválida em {path.name}: {image.size}; "
+                        f"esperado {(size, size)}"
+                    )
+    return report
+
+
+def _attach_controlnet_metadata(
+    worker_report: dict[str, Any],
+    output: Path,
+    controlnet_report: dict[str, Any],
+) -> None:
+    """Make external guide provenance visible in the normal render metadata."""
+    worker_report["controlnet_channels"] = controlnet_report
+    worker_report["channel_sources"] = {
+        "beauty": "blender",
+        "lineart": "controlnet_aux.hed_softedge",
+        "bones": "controlnet_aux.openpose_body_only",
+    }
+    for cell in worker_report.get("cells") or []:
+        if not isinstance(cell, dict):
+            continue
+        row = int(cell["row"])
+        column = int(cell["column"])
+        cell["lineart_path"] = str(output / "lineart" / f"row{row}_col{column}.png")
+        cell["bones_path"] = str(output / "bones" / f"row{row}_col{column}.png")
+        cell["bones"] = []
+        cell["bones_source"] = "controlnet_openpose"
+        cell["skeleton_format"] = "controlnet_openpose_coco18_body"
+
+
+def _execute_blender_worker(
+    command: list[str],
+    output: Path,
+    result_path: Path,
+    timeout: float,
+    mode: str,
+    runner=None,
+) -> subprocess.CompletedProcess[str]:
+    runner = runner or _run_blender_worker
+    if mode not in {"auto", "gpu", "software"}:
+        raise RuntimeError(f"SPRITE_LAB_BLENDER_MODE inválido: {mode}")
+    completed = None
+    if mode == "gpu" or (mode == "auto" and _gpu_retry_allowed()):
+        completed = runner(command, output, result_path, "gpu", timeout)
+        if completed.returncode == 0:
+            _record_gpu_health(True)
+        else:
+            _record_gpu_health(False, _worker_error(completed, output))
+            if "preso no driver" in (completed.stderr or ""):
+                raise RuntimeError(completed.stderr)
+            if mode == "gpu":
+                return completed
+            result_path.unlink(missing_ok=True)
+    if completed is None or completed.returncode != 0:
+        completed = runner(
+            command, output, result_path, "software", timeout
+        )
+    return completed
 
 
 def render_dimensions(payload: dict[str, Any]) -> tuple[str, int, int]:
@@ -438,7 +740,7 @@ def generate_sprite_render(
                 "resolution": resolution,
                 "rows": rows,
                 "phases": phases,
-                "elevation": float(payload.get("elevation", 35.264)),
+                "elevation": float(payload.get("elevation", 30.0)),
                 "azimuth": float(payload.get("azimuth", 45.0)),
             },
         )
@@ -515,10 +817,36 @@ def generate_sprite_render(
             "root_motion",
         )
     }
+    layered_outputs = layered_outputs_requested(payload)
     request = {
+        "blender_workers": parallel_sprite_render.worker_count(
+            payload.get("blender_workers", os.environ.get("SPRITE_LAB_BLENDER_WORKERS", "4")), rows),
+        "auxiliary_channels": bool(payload.get("auxiliary_channels", False)),
+        "character_pass": layered_outputs or character_pass_requested(payload),
+        "weapon_pass": layered_outputs or weapon_pass_requested(payload),
+        "weapon_component_id": payload.get("weapon_component_id"),
+        "weapon_front_mask": layered_outputs or weapon_front_mask_requested(payload),
+        "weapon_front_mask_dilation": payload.get(
+            "weapon_front_mask_dilation", 0
+        ),
+        # The v2 channel is the actual Blender Holdout result used by modular
+        # consumers.  Legacy full-weapon and segmentation channels remain in
+        # the request so existing post-processing jobs stay reproducible.
+        "component_holdout_pass": (
+            layered_outputs or component_holdout_requested(payload)
+        ),
+        "component_holdout_id": (
+            payload.get("component_holdout_id")
+            or payload.get("weapon_component_id")
+        ),
+        "component_holdout_occluder_ids": payload.get(
+            "component_holdout_occluder_ids"
+        ),
         "character_path": str(character_path),
         "animation_path": str(animation_path),
         "action_name": animation.get("action_name") or animation.get("clip_name"),
+        "bone_mapping": payload.get("bone_mapping"),
+        "in_place": bool(payload.get("in_place", True)),
         "animation_metadata": animation_metadata,
         "orientation": orientation,
         "asset_spec": asset_spec,
@@ -546,7 +874,7 @@ def generate_sprite_render(
             if camera_preset
             else locked_profile["camera_elevation"]
             if locked_profile
-            else float(payload.get("elevation", 35.264))
+            else float(payload.get("elevation", 30.0))
         ),
         "azimuth": (
             camera_preset["azimuth"]
@@ -560,6 +888,15 @@ def generate_sprite_render(
     }
     request_path = output / "request.json"
     write_json_atomic(request_path, request)
+    cuda_report = output / "cuda_preflight.json"
+    checked = _run_blender_worker(
+        [_controlnet_python_executable(), str(CONTROLNET_WORKER),
+         "--check-cuda-report", str(cuda_report)],
+        output, cuda_report, "cuda", min(timeout, 60), log_name="cuda_preflight.log",
+    )
+    if checked.returncode != 0:
+        raise RuntimeError("ControlNet_aux exige GPU operacional: " +
+                           (checked.stderr or checked.stdout[-2000:]))
     blender_command = blender or os.environ.get("SPRITE_LAB_BLENDER", "blender")
     executable = shutil.which(blender_command) or blender_command
     command = [
@@ -572,19 +909,23 @@ def generate_sprite_render(
         "--request",
         str(request_path),
     ]
-    completed = subprocess.run(
-        command,
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-    )
-    (output / "worker.log").write_text(
-        (completed.stdout or "") + "\n" + (completed.stderr or ""), encoding="utf-8"
-    )
+    result_path = Path(str(request_path) + ".result.json")
+    mode = str(os.environ.get("SPRITE_LAB_BLENDER_MODE", "auto")).strip().casefold()
+    if os.environ.get("SPRITE_LAB_BLENDER_SOFTWARE") == "1":
+        mode = "software"
+    # One sheet at a time across server jobs, each with its own bounded pool.
+    # This prevents two queued sheets from spawning four/eight pools at once.
+    import fcntl
+    lock_path = Path(__file__).resolve().parent / "work" / "blender-render.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        completed = _execute_blender_worker(
+            command, output, result_path, timeout, mode,
+            runner=lambda *args: parallel_sprite_render.run_backend(*args, run_worker=_run_blender_worker),
+        )
     if completed.returncode != 0:
         raise RuntimeError(_worker_error(completed, output))
-    result_path = Path(str(request_path) + ".result.json")
     if not result_path.is_file():
         raise RuntimeError(_worker_error(completed, output))
     worker_report = json.loads(result_path.read_text(encoding="utf-8"))
@@ -618,6 +959,30 @@ def generate_sprite_render(
         resolution = int(worker_cell[0])
     if locked_profile:
         _validate_cells_not_clipped(output, rows, phases)
+    if layered_outputs:
+        if rows != 8 or phases != 8:
+            raise RuntimeError("layered_outputs exige grade 8x8")
+        layer_channels = layer_channel_assembler.assemble_layer_channels(
+            output, worker_report
+        )
+        worker_report.update(
+            layer_channel_assembler.layer_channels_metadata(
+                worker_report,
+                weapon_component_id=str(payload.get("weapon_component_id") or ""),
+                channels=layer_channels,
+            )
+        )
+        worker_report["layered_outputs"] = True
+    controlnet_report = _run_controlnet_channels(
+        output,
+        rows,
+        phases,
+        resolution,
+        timeout,
+    )
+    _attach_controlnet_metadata(worker_report, output, controlnet_report)
+    write_json_atomic(output / "render_metadata.json", worker_report)
+    write_json_atomic(result_path, worker_report)
     sheet = _build_sheet(output, rows, phases, resolution)
     direction_rows = tuple(
         AI_DIRECTION_ROWS if render_mode == "ai_base" else DIRECTION_ROWS[:rows]

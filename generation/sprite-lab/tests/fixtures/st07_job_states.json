@@ -1,0 +1,80 @@
+[
+  {
+    "id": "ai_render_character",
+    "status": "generating_character",
+    "progress": {
+      "stage": "generating_character",
+      "percent": 15,
+      "layers": {
+        "character": {"status": "running", "stage": "generating_character", "percent": 15},
+        "weapon": {"status": "queued", "stage": "queued", "percent": 0},
+        "composition": {"status": "queued", "stage": "queued", "percent": 0}
+      }
+    }
+  },
+  {
+    "id": "ai_render_character_validated",
+    "status": "character_complete",
+    "progress": {
+      "stage": "character_complete",
+      "percent": 50,
+      "layers": {
+        "character": {"status": "done", "stage": "character_complete", "percent": 50},
+        "weapon": {"status": "queued", "stage": "queued", "percent": 0},
+        "composition": {"status": "queued", "stage": "queued", "percent": 0}
+      }
+    }
+  },
+  {
+    "id": "ai_render_weapon",
+    "status": "generating_weapon",
+    "progress": {
+      "stage": "generating_weapon",
+      "percent": 65,
+      "layers": {
+        "character": {"status": "done", "stage": "character_complete", "percent": 100},
+        "weapon": {"status": "running", "stage": "generating_weapon", "percent": 65},
+        "composition": {"status": "queued", "stage": "queued", "percent": 0}
+      }
+    }
+  },
+  {
+    "id": "ai_render_holdout",
+    "status": "running",
+    "progress": {
+      "stage": "layered_mask_pass_realesrgan",
+      "percent": 74,
+      "layers": {
+        "character": {"status": "done", "stage": "character_complete", "percent": 100},
+        "weapon": {"status": "done", "stage": "weapon_complete", "percent": 100},
+        "composition": {"status": "running", "stage": "mask_pass_realesrgan", "percent": 74}
+      }
+    }
+  },
+  {
+    "id": "ai_render_failed",
+    "status": "error",
+    "progress": {
+      "stage": "weapon_failed",
+      "percent": 65,
+      "layers": {
+        "character": {"status": "done", "stage": "character_complete", "percent": 100},
+        "weapon": {"status": "error", "stage": "weapon_failed", "percent": 65},
+        "composition": {"status": "queued", "stage": "queued", "percent": 0}
+      }
+    }
+  },
+  {
+    "id": "ai_render_completed",
+    "status": "done",
+    "progress": {
+      "stage": "completed",
+      "percent": 100,
+      "layers": {
+        "character": {"status": "done", "stage": "character_complete", "percent": 100},
+        "weapon": {"status": "done", "stage": "weapon_complete", "percent": 100},
+        "composition": {"status": "done", "stage": "completed", "percent": 100}
+      }
+    }
+  }
+]

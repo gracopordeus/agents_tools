@@ -459,7 +459,7 @@ def build_catalog(config: CatalogConfig) -> dict[str, Any]:
             "cell": config.cell,
             "fps": config.fps,
             "transparent_background": True,
-            "camera": {"type": "ORTHO", "elevation": 35.264, "azimuth": 45.0},
+            "camera": {"type": "ORTHO", "elevation": 30.0, "azimuth": 45.0},
         },
         "jobs": jobs,
         "summary": {"total": len(jobs), "pending": len(jobs), "done": 0, "failed": 0},

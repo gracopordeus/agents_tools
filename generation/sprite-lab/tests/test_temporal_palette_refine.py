@@ -2,9 +2,16 @@ import unittest
 
 import numpy as np
 
-from temporal_palette_refine import bounded_shift, stabilize_rgba
+try:
+    from temporal_palette_refine import bounded_shift, stabilize_rgba
+    HAS_CV2 = True
+except ImportError:
+    bounded_shift = None  # type: ignore[assignment]
+    stabilize_rgba = None  # type: ignore[assignment]
+    HAS_CV2 = False
 
 
+@unittest.skipUnless(HAS_CV2, "requires cv2")
 class TemporalPaletteRefineTest(unittest.TestCase):
     def test_bounded_shift_limits_magnitude(self) -> None:
         shift = bounded_shift(np.array([3.0, 4.0]), 1.5)

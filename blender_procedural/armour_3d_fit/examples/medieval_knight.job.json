@@ -1,0 +1,19 @@
+{
+  "name": "medieval_knight",
+  "armour": "../../outputs/armour_3d_pipeline/knight_004/2_decimate/armour_decimated.blend",
+  "pieces": {
+    "Helmet": "helmet",
+    "Suit": "suit",
+    "Glove_L": "glove.L",
+    "Glove_R": "glove.R",
+    "Boot_L": "boot.L",
+    "Boot_R": "boot.R"
+  },
+  "body": {
+    "rig": "../fixtures/kcc_makehuman_52/host_geometry.json",
+    "poses": "../fixtures/kcc_makehuman_52/host_poses.json"
+  },
+  "body_profile": "../profiles/body.kcc_makehuman_52.json",
+  "slot_profile": "../profiles/slots.plate_assembled.json",
+  "config": {}
+}

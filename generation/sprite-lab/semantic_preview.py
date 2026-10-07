@@ -177,6 +177,8 @@ def generate_preview(
         "character_path": str(character_path),
         "animation_path": str(animation_path) if animation_path else None,
         "action_name": animation.get("action_name") if animation else None,
+        "bone_mapping": payload.get("bone_mapping"),
+        "in_place": bool(payload.get("in_place", True)),
         "weapon_path": str(weapon_path) if weapon_path else None,
         "weapon_hand": payload.get("weapon_hand", "right"),
         "weapon_scale": payload.get("weapon_scale"),

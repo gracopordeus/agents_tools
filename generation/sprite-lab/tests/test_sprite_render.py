@@ -1,7 +1,11 @@
+import json
+import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 import sys
+from unittest import mock
 
 from PIL import Image
 
@@ -14,6 +18,169 @@ import render_profile  # noqa: E402
 
 
 class SpriteRenderTests(unittest.TestCase):
+    def test_character_pass_request_is_explicitly_opt_in(self) -> None:
+        self.assertFalse(sprite_render.character_pass_requested({}))
+        self.assertFalse(
+            sprite_render.character_pass_requested(
+                {"generation_mode": "character_weapon_holdout"}
+            )
+        )
+        self.assertTrue(sprite_render.character_pass_requested({"character_pass": True}))
+
+    def test_weapon_pass_request_is_explicitly_opt_in(self) -> None:
+        self.assertFalse(sprite_render.weapon_pass_requested({}))
+        self.assertFalse(
+            sprite_render.weapon_pass_requested(
+                {"generation_mode": "character_weapon_holdout"}
+            )
+        )
+        self.assertTrue(sprite_render.weapon_pass_requested({"weapon_pass": True}))
+
+    def test_weapon_front_mask_request_is_explicitly_opt_in(self) -> None:
+        self.assertFalse(sprite_render.weapon_front_mask_requested({}))
+        self.assertTrue(
+            sprite_render.weapon_front_mask_requested({"weapon_front_mask": True})
+        )
+
+    def test_component_holdout_request_is_explicitly_opt_in(self) -> None:
+        self.assertFalse(sprite_render.component_holdout_requested({}))
+        self.assertTrue(
+            sprite_render.component_holdout_requested(
+                {"component_holdout_pass": True}
+            )
+        )
+
+    def test_layered_outputs_is_explicitly_opt_in(self) -> None:
+        self.assertFalse(sprite_render.layered_outputs_requested({}))
+        self.assertFalse(
+            sprite_render.layered_outputs_requested(
+                {"generation_mode": "character_weapon_holdout"}
+            )
+        )
+        self.assertTrue(
+            sprite_render.layered_outputs_requested({"layered_outputs": True})
+        )
+
+    def test_gpu_stall_is_stopped_before_job_timeout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            process = mock.MagicMock()
+            process.__enter__.return_value = process
+            process.poll.side_effect = [None, -9]
+            process.returncode = -9
+            with (
+                mock.patch.object(sprite_render.subprocess, "Popen", return_value=process),
+                mock.patch.object(sprite_render.time, "monotonic", side_effect=[0, 61]),
+                mock.patch.dict(os.environ, {"SPRITE_LAB_GPU_STALL_SECONDS": "60"}),
+            ):
+                completed = sprite_render._run_blender_worker(
+                    ["blender"], root, root / "result.json", "gpu", 3600,
+                )
+            process.kill.assert_called_once()
+            self.assertIn("sem progresso", completed.stderr)
+
+    def test_worker_timeout_returns_failure_and_keeps_live_log(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            completed = sprite_render._run_blender_worker(
+                [sys.executable, "-u", "-c",
+                 "import time; print('STAGE render'); time.sleep(30)"],
+                root, root / "result.json", "gpu", 0.1,
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("tempo máximo", completed.stderr)
+            self.assertIn("STAGE render", (root / "worker.gpu.log").read_text())
+
+    def test_worker_success_requires_result_and_preserves_log(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result = root / "result.json"
+            completed = sprite_render._run_blender_worker(
+                [sys.executable, "-c",
+                 "import pathlib,sys; pathlib.Path(sys.argv[1]).write_text('{}'); print('done')",
+                 str(result)], root, result, "gpu", 10,
+            )
+            self.assertEqual(completed.returncode, 0)
+            self.assertIn("done", completed.stdout)
+
+    def test_gpu_circuit_breaker_retries_after_backoff(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            health_path = Path(directory) / "gpu-health.json"
+            health_path.write_text(
+                json.dumps({"failed_at": 1_000.0, "boot_id": sprite_render._boot_id()}), encoding="utf-8"
+            )
+            with mock.patch.object(sprite_render, "GPU_HEALTH_PATH", health_path):
+                self.assertFalse(sprite_render._gpu_retry_allowed(1_001.0))
+                self.assertTrue(
+                    sprite_render._gpu_retry_allowed(
+                        1_000.0 + sprite_render.GPU_RETRY_SECONDS
+                    )
+                )
+
+    def test_worker_environments_isolate_gpu_and_software(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            mesa_vendor = Path(directory) / "50_mesa.json"
+            mesa_vendor.touch()
+            inherited = {
+                "__EGL_VENDOR_LIBRARY_FILENAMES": "stale",
+                "LIBGL_ALWAYS_SOFTWARE": "1",
+            }
+            with (
+                mock.patch.dict(os.environ, inherited, clear=False),
+                mock.patch.object(sprite_render, "MESA_EGL_VENDOR", mesa_vendor),
+            ):
+                gpu = sprite_render._blender_worker_env("gpu")
+                software = sprite_render._blender_worker_env("software")
+            self.assertNotIn("__EGL_VENDOR_LIBRARY_FILENAMES", gpu)
+            self.assertNotIn("LIBGL_ALWAYS_SOFTWARE", gpu)
+            self.assertEqual(gpu["SPRITE_LAB_RENDER_BACKEND"], "gpu")
+            self.assertEqual(
+                software["__EGL_VENDOR_LIBRARY_FILENAMES"], str(mesa_vendor)
+            )
+            self.assertEqual(software["LIBGL_ALWAYS_SOFTWARE"], "1")
+
+    def test_auto_worker_falls_back_to_software_after_gpu_failure(self) -> None:
+        failed = subprocess.CompletedProcess(["blender"], -6, "", "")
+        succeeded = subprocess.CompletedProcess(["blender"], 0, "", "")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result_path = root / "request.json.result.json"
+            result_path.touch()
+            with (
+                mock.patch.object(sprite_render, "_gpu_retry_allowed", return_value=True),
+                mock.patch.object(
+                    sprite_render,
+                    "_run_blender_worker",
+                    side_effect=[failed, succeeded],
+                ) as run,
+                mock.patch.object(sprite_render, "_record_gpu_health") as health,
+            ):
+                completed = sprite_render._execute_blender_worker(
+                    ["blender"], root, result_path, 60.0, "auto"
+                )
+            self.assertEqual(completed.returncode, 0)
+            self.assertEqual(
+                [call.args[3] for call in run.call_args_list], ["gpu", "software"]
+            )
+            health.assert_called_once()
+            self.assertFalse(health.call_args.args[0])
+
+    def test_auto_worker_respects_open_gpu_circuit(self) -> None:
+        succeeded = subprocess.CompletedProcess(["blender"], 0, "", "")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with (
+                mock.patch.object(sprite_render, "_gpu_retry_allowed", return_value=False),
+                mock.patch.object(
+                    sprite_render, "_run_blender_worker", return_value=succeeded
+                ) as run,
+            ):
+                completed = sprite_render._execute_blender_worker(
+                    ["blender"], root, root / "result.json", 60.0, "auto"
+                )
+            self.assertEqual(completed.returncode, 0)
+            self.assertEqual(run.call_args.args[3], "software")
+
     def test_locked_render_profile_contract(self) -> None:
         manifest = render_profile.normalize_manifest(
             {
@@ -22,7 +189,7 @@ class SpriteRenderTests(unittest.TestCase):
                 "cell_size": [256, 256],
                 "ortho_scale": 3.8,
                 "foot_anchor": [128, 220],
-                "camera_elevation": 35.264,
+                "camera_elevation": 30.0,
                 "camera_azimuth": 45,
                 "directions": 8,
                 "phases": 8,
@@ -43,7 +210,7 @@ class SpriteRenderTests(unittest.TestCase):
                 "cell_size": [672, 672],
                 "ortho_scale": 2.5770567,
                 "foot_anchor": [336, 578],
-                "camera_elevation": 35.264,
+                "camera_elevation": 30.0,
                 "camera_azimuth": 45,
                 "directions": 5,
                 "phases": 9,
@@ -54,6 +221,30 @@ class SpriteRenderTests(unittest.TestCase):
         self.assertEqual(manifest["phases"], 9)
         self.assertEqual(sprite_render.render_dimensions({"profile": "5x9"}), ("5x9", 5, 9))
 
+    def test_single_direction_profile_is_valid_for_tiles(self) -> None:
+        manifest = render_profile.normalize_manifest(
+            {
+                "schema": "sprite_lab.render_profile/v1",
+                "id": "tile_reference_v1",
+                "cell_size": [256, 256],
+                "ortho_scale": 2.5,
+                "foot_anchor": [128, 128],
+                "camera_elevation": 30.0,
+                "camera_azimuth": 45,
+                "directions": 1,
+                "phases": 1,
+                "ground_z": 0.0,
+            }
+        )
+        self.assertEqual(manifest["directions"], 1)
+        with self.assertRaises(ValueError):
+            render_profile.normalize_manifest({**manifest, "directions": 3})
+
+    def test_list_profiles_includes_tile_profile(self) -> None:
+        by_id = {item["id"]: item for item in render_profile.list_profiles()}
+        self.assertIn("tile_reference_v1", by_id)
+        self.assertEqual(by_id["tile_reference_v1"]["directions"], 1)
+
     def test_locked_render_profile_rejects_invalid_anchor_and_scale(self) -> None:
         base = {
             "schema": "sprite_lab.render_profile/v1",
@@ -61,7 +252,7 @@ class SpriteRenderTests(unittest.TestCase):
             "cell_size": [256, 256],
             "ortho_scale": 3.8,
             "foot_anchor": [128, 220],
-            "camera_elevation": 35.264,
+            "camera_elevation": 30.0,
             "camera_azimuth": 45,
             "directions": 8,
             "phases": 8,
@@ -230,7 +421,7 @@ class SpriteRenderTests(unittest.TestCase):
             "cell_size": [256, 256],
             "ortho_scale": 3.8,
             "foot_anchor": [128, 220],
-            "camera_elevation": 35.264,
+            "camera_elevation": 30.0,
             "camera_azimuth": 45,
             "directions": 8,
             "phases": 8,
@@ -280,7 +471,7 @@ class SpriteRenderTests(unittest.TestCase):
                     "cell_size": [256, 256],
                     "ortho_scale": 3.8,
                     "foot_anchor": [128, 220],
-                    "camera_elevation": 35.264,
+                    "camera_elevation": 30.0,
                     "camera_azimuth": 45,
                     "directions": 8,
                     "phases": 8,

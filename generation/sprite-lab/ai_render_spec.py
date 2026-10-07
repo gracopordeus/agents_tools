@@ -4,17 +4,33 @@ from __future__ import annotations
 import copy
 import json
 import re
+from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any
 
 from direction_contract import DIRECTION_LABELS, DIRECTION_ROWS, DIRECTION_VECTORS
 
 
 SCHEMA = "sprite_lab.render_spec/v2"
-PROMPT_SCHEMA = "sprite_lab.prompt_contract/v13"
+PROMPT_SCHEMA = "sprite_lab.prompt_contract/v14"
 GRID_ROWS = 8
 GRID_COLUMNS = 8
 OUTPUT_SIZE = 2048
+SUPPORTED_OUTPUT_SIZES = (1024, 2048)
 DEFAULT_BACKGROUND = "transparent"
+GENERATION_MODE_SINGLE_SHEET = "single_sheet"
+GENERATION_MODE_CHARACTER_WEAPON_HOLDOUT = "character_weapon_holdout"
+GENERATION_MODE_CHARACTER_COMPONENT_HOLDOUT = "character_component_holdout"
+GENERATION_MODES = (
+    GENERATION_MODE_SINGLE_SHEET,
+    GENERATION_MODE_CHARACTER_WEAPON_HOLDOUT,
+    GENERATION_MODE_CHARACTER_COMPONENT_HOLDOUT,
+)
+HOLDOUT_GENERATION_ORDER = ("character", "weapon")
+HOLDOUT_COMPOSITION_ORDER = ("weapon", "character_holdout")
+HOLDOUT_LAYERS = (
+    {"id": "weapon", "z": 0},
+    {"id": "character_holdout", "z": 1},
+)
 
 ASSET_MODES = (
     "character_animation",
@@ -53,6 +69,17 @@ REFERENCE_ROLES = {
         ),
         "does_not_control": "pose, animation timing, camera, grid location or cell boundaries",
     },
+    "identity_lineart": {
+        "role": "identity_contour_guide",
+        "controls": (
+            "the contour, silhouette and separation of visible parts from the same identity "
+            "shown in the identity reference"
+        ),
+        "does_not_control": (
+            "colors, materials, shading, texture, pose, animation timing, camera, grid "
+            "location or cell boundaries"
+        ),
+    },
     "beauty": {
         "role": "volume_depth_occlusion",
         "controls": "spatial placement, volume, depth, occlusion and structural reading",
@@ -63,7 +90,7 @@ REFERENCE_ROLES = {
     },
     "lineart": {
         "role": "silhouette_geometry",
-        "controls": "pose envelope, silhouette, geometry, contour, weapon placement and spatial boundaries",
+        "controls": "pose envelope, silhouette, geometry, component contour, component placement and spatial boundaries",
         "does_not_control": "body design, clothing, armor, materials, colors, palette or visual identity",
     },
     "bones": {
@@ -158,6 +185,7 @@ def default_render_spec(
     rows = [_row_defaults(index, mode) for index in range(1, GRID_ROWS + 1)]
     return {
         "version": "2.0",
+        "generation_mode": GENERATION_MODE_SINGLE_SHEET,
         "output": {
             "width": OUTPUT_SIZE,
             "height": OUTPUT_SIZE,
@@ -177,7 +205,7 @@ def default_render_spec(
         "camera": {
             "projection": "orthographic",
             "preset": "isometric",
-            "elevation_deg": 35.264,
+            "elevation_deg": 30.0,
             "azimuth_deg": 45.0,
         },
         "framing": {
@@ -192,7 +220,8 @@ def default_render_spec(
             "include_cells": include_descriptions,
         },
         "references": {
-            key: {"enabled": True, **value} for key, value in REFERENCE_ROLES.items()
+            key: {"enabled": key in {"identity", "beauty"}, **value}
+            for key, value in REFERENCE_ROLES.items()
         },
         "rows": rows,
     }
@@ -222,6 +251,290 @@ def _normalize_cells(value: Any) -> list[dict[str, Any]]:
     return cells
 
 
+def _aliased_value(value: dict[str, Any], snake_case: str, camel_case: str) -> Any:
+    """Read temporary POC aliases while always emitting the canonical name."""
+    return value.get(snake_case, value.get(camel_case))
+
+
+def _relative_artifact_path(value: Any, field: str) -> str:
+    path = _clean_text(value)
+    if path and (
+        PurePosixPath(path).is_absolute() or PureWindowsPath(path).is_absolute()
+    ):
+        raise ValueError(f"{field} deve ser um caminho relativo")
+    return path
+
+
+def _component_inventory(components: list[dict[str, Any]]) -> str:
+    if not components:
+        return "nenhum componente encontrado"
+    return ", ".join(
+        f"id='{_clean_text(component.get('id'), '<sem id>')}', "
+        f"role='{_clean_text(component.get('role'), '<sem role>')}'"
+        for component in components
+    )
+
+
+def select_weapon_component(
+    source_contract: Any,
+    *,
+    weapon_component_id: str | None = None,
+) -> dict[str, Any]:
+    """Return the single visible weapon as a detached, normalized object."""
+    raw_components = (
+        source_contract.get("components")
+        if isinstance(source_contract, dict)
+        else None
+    )
+    components = (
+        [component for component in raw_components if isinstance(component, dict)]
+        if isinstance(raw_components, list)
+        else []
+    )
+    visible_components = [
+        component
+        for component in components
+        if _bool(component.get("visible"), True)
+    ]
+    inventory = _component_inventory(components)
+    requested_id = _clean_text(weapon_component_id)
+
+    if requested_id:
+        selected = next(
+            (
+                component
+                for component in visible_components
+                if _clean_text(component.get("id")) == requested_id
+            ),
+            None,
+        )
+        if selected is None or _clean_text(selected.get("role")).casefold() != "weapon":
+            raise ValueError(
+                f"weapon_component_id '{requested_id}' não identifica uma arma visível; "
+                f"ids e roles encontrados: {inventory}"
+            )
+
+    visible_weapons = [
+        component
+        for component in visible_components
+        if _clean_text(component.get("role")).casefold() == "weapon"
+    ]
+    if not visible_weapons:
+        raise ValueError(
+            "nenhuma arma visível encontrada; "
+            f"ids e roles encontrados: {inventory}"
+        )
+    if len(visible_weapons) != 1:
+        raise ValueError(
+            "a POC suporta uma única arma visível; "
+            f"ids e roles encontrados: {inventory}"
+        )
+
+    selected = visible_weapons[0]
+    selected_id = _clean_text(selected.get("id"))
+    if not selected_id:
+        raise ValueError(
+            "a arma visível deve declarar id; "
+            f"ids e roles encontrados: {inventory}"
+        )
+    return {
+        "id": selected_id,
+        "asset_id": _clean_text(selected.get("asset_id")),
+        "attach_to": _clean_text(selected.get("attach_to")),
+        "hand": _clean_text(selected.get("hand")),
+        "path": _clean_text(selected.get("path")),
+    }
+
+
+def select_layer_components(
+    source_contract: Any,
+    *,
+    component_ids: list[str] | tuple[str, ...] | None = None,
+) -> list[dict[str, Any]]:
+    """Select visible source components in deterministic composition order."""
+    raw_components = (
+        source_contract.get("components")
+        if isinstance(source_contract, dict)
+        else None
+    )
+    components = (
+        [component for component in raw_components if isinstance(component, dict)]
+        if isinstance(raw_components, list)
+        else []
+    )
+    visible = [component for component in components if _bool(component.get("visible"), True)]
+    by_id: dict[str, dict[str, Any]] = {}
+    for component in visible:
+        component_id = _clean_text(component.get("id"))
+        if not component_id:
+            raise ValueError("todo componente visível deve declarar id")
+        if component_id in by_id:
+            raise ValueError(f"id de componente visível duplicado: {component_id}")
+        by_id[component_id] = component
+    requested = list(component_ids) if component_ids is not None else list(by_id)
+    if not requested:
+        raise ValueError("component_ids deve selecionar ao menos um componente visível")
+    if any(not isinstance(item, str) or not item.strip() for item in requested):
+        raise ValueError("component_ids deve conter ids não vazios")
+    if len(set(requested)) != len(requested):
+        raise ValueError("component_ids não pode conter ids duplicados")
+    missing = [component_id for component_id in requested if component_id not in by_id]
+    if missing:
+        raise ValueError(
+            "component_ids não identifica componentes visíveis: " + ", ".join(missing)
+        )
+    return [copy.deepcopy(by_id[component_id]) for component_id in requested]
+
+
+def _normalize_modular_layer_contract(
+    value: Any,
+    source_contract: Any,
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(
+            "layer_contract deve ser um objeto no modo character_component_holdout"
+        )
+    base_id = _clean_text(_aliased_value(value, "base_id", "baseId"), "character_full")
+    raw_component_ids = _aliased_value(value, "component_ids", "componentIds")
+    if not isinstance(raw_component_ids, list):
+        raise ValueError("layer_contract.component_ids deve ser uma lista")
+    component_ids = [_clean_text(item) for item in raw_component_ids]
+    selected = select_layer_components(source_contract, component_ids=component_ids)
+    expected_order = [base_id, *component_ids]
+    generation_order = _aliased_value(value, "generation_order", "generationOrder")
+    composition_order = _aliased_value(value, "composition_order", "compositionOrder")
+    if generation_order != expected_order:
+        raise ValueError(
+            "layer_contract.generation_order deve listar a base seguida dos component_ids"
+        )
+    if composition_order != expected_order:
+        raise ValueError(
+            "layer_contract.composition_order deve listar a base seguida dos component_ids"
+        )
+
+    layers = value.get("layers")
+    if not isinstance(layers, list) or len(layers) != len(expected_order):
+        raise ValueError("layer_contract.layers deve declarar a base e todos os componentes")
+    normalized_layers: list[dict[str, Any]] = []
+    z_values: list[int] = []
+    selected_by_id = {_clean_text(component.get("id")): component for component in selected}
+    for index, expected_id in enumerate(expected_order):
+        layer = layers[index]
+        if not isinstance(layer, dict) or _clean_text(layer.get("id")) != expected_id:
+            raise ValueError("layer_contract.layers deve seguir composition_order")
+        try:
+            z = int(layer.get("z"))
+        except (TypeError, ValueError):
+            raise ValueError(f"layer_contract.layers[{index}].z deve ser inteiro") from None
+        if isinstance(layer.get("z"), bool) or z != layer.get("z"):
+            raise ValueError(f"layer_contract.layers[{index}].z deve ser inteiro")
+        z_values.append(z)
+        normalized_layer: dict[str, Any] = {
+            "id": expected_id,
+            "role": "base" if index == 0 else "component",
+            "z": z,
+        }
+        if index:
+            component = selected_by_id[expected_id]
+            normalized_layer["kind"] = _clean_text(
+                layer.get("kind") or component.get("role"), "component"
+            )
+            normalized_layer["source_component_id"] = expected_id
+        file_name = _relative_artifact_path(
+            layer.get("file"), f"layer_contract.layers[{index}].file"
+        )
+        if file_name:
+            normalized_layer["file"] = file_name
+        normalized_layers.append(normalized_layer)
+    if len(set(z_values)) != len(z_values) or z_values != sorted(z_values):
+        raise ValueError("layer_contract.layers.z deve ser único e crescente")
+
+    preview_value = value.get("preview")
+    if preview_value is not None and not isinstance(preview_value, str):
+        raise ValueError("layer_contract.preview deve ser string ou null")
+    preview = _relative_artifact_path(preview_value, "layer_contract.preview")
+    return {
+        "version": 2,
+        "base_id": base_id,
+        "component_ids": component_ids,
+        "generation_order": expected_order,
+        "composition_order": expected_order,
+        "layers": normalized_layers,
+        "preview": preview or None,
+    }
+
+
+def _normalize_layer_contract(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(
+            "layer_contract deve ser um objeto no modo character_weapon_holdout"
+        )
+
+    weapon_component_id = _clean_text(
+        _aliased_value(value, "weapon_component_id", "weaponComponentId")
+    )
+    if not weapon_component_id:
+        raise ValueError("layer_contract.weapon_component_id deve ser explícito")
+
+    generation_order = _aliased_value(
+        value, "generation_order", "generationOrder"
+    )
+    if generation_order != list(HOLDOUT_GENERATION_ORDER):
+        raise ValueError(
+            "layer_contract.generation_order deve ser ['character', 'weapon']"
+        )
+
+    composition_order = _aliased_value(
+        value, "composition_order", "compositionOrder"
+    )
+    if composition_order != list(HOLDOUT_COMPOSITION_ORDER):
+        raise ValueError(
+            "layer_contract.composition_order deve ser "
+            "['weapon', 'character_holdout']"
+        )
+
+    layers = value.get("layers")
+    if not isinstance(layers, list) or len(layers) != len(HOLDOUT_LAYERS):
+        raise ValueError(
+            "layer_contract.layers deve declarar weapon e character_holdout"
+        )
+    normalized_layers = []
+    for index, expected in enumerate(HOLDOUT_LAYERS):
+        layer = layers[index]
+        if not isinstance(layer, dict) or layer.get("id") != expected["id"]:
+            raise ValueError(
+                "layer_contract.layers deve declarar weapon e character_holdout"
+            )
+        try:
+            z = int(layer.get("z"))
+        except (TypeError, ValueError):
+            raise ValueError(f"layer_contract.layers[{index}].z deve ser inteiro") from None
+        if z != expected["z"]:
+            raise ValueError(
+                f"layer_contract.layers[{index}].z deve ser {expected['z']}"
+            )
+        normalized_layer = {"id": expected["id"], "z": z}
+        file_name = _relative_artifact_path(
+            layer.get("file"), f"layer_contract.layers[{index}].file"
+        )
+        if file_name:
+            normalized_layer["file"] = file_name
+        normalized_layers.append(normalized_layer)
+
+    preview_value = value.get("preview")
+    if preview_value is not None and not isinstance(preview_value, str):
+        raise ValueError("layer_contract.preview deve ser string ou null")
+    preview = _relative_artifact_path(preview_value, "layer_contract.preview")
+
+    return {
+        "weapon_component_id": weapon_component_id,
+        "generation_order": list(HOLDOUT_GENERATION_ORDER),
+        "composition_order": list(HOLDOUT_COMPOSITION_ORDER),
+        "layers": normalized_layers,
+        "preview": preview or None,
+    }
+
+
 def normalize_render_spec(
     value: Any,
     *,
@@ -242,7 +555,48 @@ def normalize_render_spec(
     )
     spec = copy.deepcopy(baseline)
 
+    generation_mode = _clean_text(
+        _aliased_value(incoming, "generation_mode", "generationMode"),
+        GENERATION_MODE_SINGLE_SHEET,
+    )
+    if generation_mode not in GENERATION_MODES:
+        raise ValueError(
+            "generation_mode deve ser single_sheet, character_weapon_holdout "
+            "ou character_component_holdout"
+        )
+    spec["generation_mode"] = generation_mode
+    source_contract = incoming.get("source_contract")
+    if generation_mode == GENERATION_MODE_CHARACTER_WEAPON_HOLDOUT:
+        layer_contract = _aliased_value(incoming, "layer_contract", "layerContract")
+        spec["layer_contract"] = _normalize_layer_contract(layer_contract)
+    elif generation_mode == GENERATION_MODE_CHARACTER_COMPONENT_HOLDOUT:
+        layer_contract = _aliased_value(incoming, "layer_contract", "layerContract")
+        spec["layer_contract"] = _normalize_modular_layer_contract(
+            layer_contract, source_contract
+        )
+
     output = incoming.get("output") if isinstance(incoming.get("output"), dict) else {}
+    requested_width = output.get("width", OUTPUT_SIZE)
+    requested_height = output.get("height", OUTPUT_SIZE)
+    if requested_width is None:
+        requested_width = OUTPUT_SIZE
+    if requested_height is None:
+        requested_height = OUTPUT_SIZE
+    try:
+        width = int(requested_width)
+        height = int(requested_height)
+    except (TypeError, ValueError):
+        raise ValueError(
+            "output.width e output.height devem ser 1024 ou 2048, em formato quadrado"
+        ) from None
+    if (width != requested_width and not isinstance(requested_width, str)) or (
+        height != requested_height and not isinstance(requested_height, str)
+    ) or width != height or width not in SUPPORTED_OUTPUT_SIZES:
+        raise ValueError(
+            "a resolução do output deve ser 1024x1024 ou 2048x2048"
+        )
+    spec["output"]["width"] = width
+    spec["output"]["height"] = height
     spec["output"]["background"] = _clean_text(
         output.get("background") or spec["output"]["background"],
         spec["output"]["background"],
@@ -263,7 +617,7 @@ def normalize_render_spec(
     spec["camera"] = {
         "projection": _clean_text(incoming_camera.get("projection"), "orthographic"),
         "preset": _clean_text(incoming_camera.get("preset"), "isometric"),
-        "elevation_deg": _float(incoming_camera.get("elevation_deg"), 35.264),
+        "elevation_deg": _float(incoming_camera.get("elevation_deg"), 30.0),
         "azimuth_deg": _float(incoming_camera.get("azimuth_deg"), 45.0),
     }
 
@@ -334,9 +688,13 @@ def normalize_render_spec(
             }
 
     spec["version"] = "2.0"
-    source_contract = incoming.get("source_contract")
     if isinstance(source_contract, dict):
         spec["source_contract"] = copy.deepcopy(source_contract)
+    if generation_mode == GENERATION_MODE_CHARACTER_WEAPON_HOLDOUT:
+        select_weapon_component(
+            source_contract,
+            weapon_component_id=spec["layer_contract"]["weapon_component_id"],
+        )
     spec["asset"]["mode"] = selected_mode
     spec["asset"]["name"] = _clean_text(incoming_asset.get("name")) or name
     if selected_mode == "character_animation":
@@ -371,17 +729,36 @@ def build_reference_manifest(
     channels: list[str] | tuple[str, ...],
     *,
     identity_name: str = "identity reference",
+    include_identity_lineart: bool = False,
+    identity_lineart_mode: str = "lineart_standard",
 ) -> list[dict[str, Any]]:
     """Build the ordered image-role contract used by every provider."""
+    identity_label = _clean_text(identity_name, "identity reference")
     manifest = [
         {
             "index": 1,
             "type": "identity",
-            "name": _clean_text(identity_name, "identity reference"),
+            "name": identity_label,
             **REFERENCE_ROLES["identity"],
         }
     ]
-    for index, channel in enumerate(channels, start=2):
+    next_index = 2
+    if include_identity_lineart:
+        guide_label = {
+            "lineart_standard": "lineart standard",
+            "canny_edges": "canny edges",
+        }.get(str(identity_lineart_mode).strip().casefold(), "identity contour guide")
+        manifest.append(
+            {
+                "index": next_index,
+                "type": "identity_lineart",
+                "name": f"{identity_label} · {guide_label}",
+                "guide_mode": str(identity_lineart_mode).strip().casefold(),
+                **REFERENCE_ROLES["identity_lineart"],
+            }
+        )
+        next_index += 1
+    for index, channel in enumerate(channels, start=next_index):
         if channel not in REFERENCE_ROLES or channel == "identity":
             continue
         manifest.append({"index": index, "type": channel, **REFERENCE_ROLES[channel]})
@@ -423,7 +800,7 @@ Every output cell must depict the same asset identity from {image}. Copy its dis
 
 Treat Beauty, Bones and Lineart as anonymous structural proxies. Do not preserve their character identity, face, anatomy design, clothing, armor, palette, materials or decorative details merely because they are visible in those images. Replace those visual attributes with the identity from {image}.
 
-When a structural reference contains a weapon or prop that is absent or partly hidden in {image}, preserve only its required pose, placement and contour, then render its design, materials and colors so they belong coherently to the identity from {image}.
+When a structural reference contains a component that is absent or partly hidden in {image}, preserve only its required pose, placement and contour, then render its design, materials and colors so they belong coherently to the identity from {image}.
 
 When {image} does not show the back or one side of a feature, infer a consistent continuation from the same design language. Never fill missing identity information by copying the structural proxy's appearance.
 
@@ -547,6 +924,7 @@ def _compile_character_prompt(
     image_by_type = {str(item.get("type")): item for item in reference_manifest}
     identity_index = identity["index"]
     beauty = image_by_type.get("beauty")
+    identity_lineart = image_by_type.get("identity_lineart")
     bones = image_by_type.get("bones")
     lineart = image_by_type.get("lineart")
     frame_control_item = image_by_type.get("frame_control")
@@ -554,6 +932,13 @@ def _compile_character_prompt(
         f"Use IMAGE {beauty['index']}, the uploaded 8x8 beauty spritesheet, as the exact composition and layout source."
         if beauty
         else "Use the selected structural spritesheets as the exact composition and layout source."
+    )
+    identity_lineart_line = (
+        f"Use IMAGE {identity_lineart['index']}, "
+        f"the {'Canny edge map' if identity_lineart.get('guide_mode') == 'canny_edges' else 'lineart'} "
+        f"derived from the identity reference, only to reinforce the identity contour, silhouette and separation of visible parts. It is a guide paired with IMAGE {identity_index}; IMAGE {identity_index} remains authoritative for colors, materials, shading, texture and every other visible design choice."
+        if identity_lineart
+        else ""
     )
     bones_line = (
         f"Use IMAGE {bones['index']} bones spritesheet only to preserve the exact pose, joint positions, limb articulation and animation phase of each cell."
@@ -618,7 +1003,12 @@ def _compile_character_prompt(
     for component in components if isinstance(components, list) else []:
         if not isinstance(component, dict):
             continue
-        name = _clean_text(component.get("name") or component.get("role"), "prop")
+        name = _clean_text(
+            component.get("name")
+            or component.get("asset_id")
+            or component.get("id"),
+            "component",
+        )
         attach_to = _clean_text(component.get("attach_to"), "the same attachment point")
         hand = _clean_text(component.get("hand"))
         role = _clean_text(component.get("role"))
@@ -673,7 +1063,7 @@ def _compile_character_prompt(
 }}"""
 
     optional_lines = "\n\n".join(
-        line for line in (bones_line, lineart_line, frame_control) if line
+        line for line in (identity_lineart_line, bones_line, lineart_line, frame_control) if line
     )
     extra = ""
     if additional_instructions:
@@ -700,6 +1090,209 @@ spritesheetContract:
 {spritesheet_contract}
 
 Copy each corresponding structural cell into the same output position. Do not invent, combine, mirror, rotate, reorder or reinterpret poses. Bones and Lineart are guides only and must not appear in the final artwork. Do not crop the character or its components. Preserve every component listed in spritesheetContract in every cell, with its declared attachment and hand.{row_notes}{extra}
+""".strip() + "\n"
+
+
+def _weapon_manifest_item(
+    reference_manifest: list[dict[str, Any]],
+    *reference_types: str,
+) -> dict[str, Any] | None:
+    """Return the first manifest item matching one of the requested roles."""
+    wanted = {str(item).casefold() for item in reference_types}
+    return next(
+        (
+            item
+            for item in reference_manifest
+            if str(item.get("type") or "").casefold() in wanted
+        ),
+        None,
+    )
+
+
+def _weapon_reference_label(item: dict[str, Any] | None, fallback: str) -> str:
+    """Format a physical reference identity without inventing an asset name."""
+    if not item:
+        return fallback
+    index = item.get("index", "?")
+    name = _clean_text(item.get("name"))
+    return f"IMAGE {index}" + (f" ({name})" if name else "")
+
+
+def _weapon_transform_contract(value: Any) -> dict[str, Any] | None:
+    """Copy only stable transform fields in the source contract order."""
+    if not isinstance(value, dict):
+        return None
+    transform: dict[str, Any] = {}
+    for key in ("position", "rotation", "scale", "fit"):
+        if key in value:
+            transform[key] = copy.deepcopy(value[key])
+    return transform or None
+
+
+def _weapon_prompt_component(
+    source_contract: dict[str, Any],
+    selected_id: str,
+) -> dict[str, Any]:
+    """Build the machine-readable weapon contract without display-name guesses."""
+    components = source_contract.get("components")
+    source_component = next(
+        (
+            component
+            for component in components or []
+            if isinstance(component, dict)
+            and _clean_text(component.get("id")) == selected_id
+        ),
+        {},
+    )
+    selected = select_weapon_component(
+        source_contract,
+        weapon_component_id=selected_id,
+    )
+    component: dict[str, Any] = {
+        "id": selected["id"],
+        "role": "weapon",
+    }
+    # asset_id is an opaque source identifier. It is intentionally not emitted
+    # as ``name``: providers must not invent a human-readable weapon identity.
+    if selected["asset_id"]:
+        component["asset_id"] = selected["asset_id"]
+    if selected["attach_to"]:
+        component["attach_to"] = selected["attach_to"]
+    if selected["hand"]:
+        component["hand"] = selected["hand"]
+    transform = _weapon_transform_contract(source_component.get("transform"))
+    if transform is not None:
+        component["transform"] = transform
+    return component
+
+
+def _compile_weapon_prompt(
+    normalized: dict[str, Any],
+    reference_manifest: list[dict[str, Any]],
+    additional_instructions: str,
+) -> str:
+    """Compile the isolated weapon pass while preserving the source grid contract."""
+    output = normalized["output"]
+    camera = normalized["camera"]
+    framing = normalized["framing"]
+    source_contract = (
+        normalized.get("source_contract")
+        if isinstance(normalized.get("source_contract"), dict)
+        else {}
+    )
+    layer_contract = normalized["layer_contract"]
+    selected_id = layer_contract["weapon_component_id"]
+    weapon_component = _weapon_prompt_component(source_contract, selected_id)
+
+    weapon_reference = _weapon_manifest_item(
+        reference_manifest, "weapon_reference", "weapon_identity"
+    )
+    character_reference = _weapon_manifest_item(
+        reference_manifest, "character_full", "character"
+    )
+    weapon_guide = _weapon_manifest_item(
+        reference_manifest,
+        "weapon_guide",
+        "weapon_beauty",
+        "weapon_silhouette",
+        "weapon_lineart",
+    )
+    weapon_image = _weapon_reference_label(
+        weapon_reference, "the uploaded weapon visual reference"
+    )
+    character_image = _weapon_reference_label(
+        character_reference, "the approved character_full layer"
+    )
+    guide_image = _weapon_reference_label(
+        weapon_guide, "the uploaded weapon structural guide"
+    )
+
+    source_camera = source_contract.get("camera")
+    source_camera = source_camera if isinstance(source_camera, dict) else {}
+    camera_projection = _clean_text(source_camera.get("type"), camera["projection"])
+    camera_preset = _clean_text(source_camera.get("preset"), camera["preset"])
+    source_action = source_contract.get("action")
+    source_action = source_action if isinstance(source_action, dict) else {}
+    action_label = _clean_text(
+        source_action.get("clip_name") or source_action.get("name"),
+        "structural animation",
+    )
+    direction_rows = [
+        {
+            "row": int(row.get("index") or index),
+            "id": _clean_text(row.get("id")),
+            "vector": list(row.get("vector") or []),
+        }
+        for index, row in enumerate(normalized["rows"], start=1)
+    ]
+    direction_lines = ",\n".join(
+        "        "
+        + json.dumps(row, ensure_ascii=False, separators=(", ", ": "))
+        for row in direction_rows
+    )
+    background = _clean_text(output.get("background"), "transparent")
+    background_value = (
+        "transparent"
+        if background.casefold() == "transparent"
+        else "#00FF00"
+        if background.casefold() in {"#00ff00", "00ff00", "lemon green", "lemongreen"}
+        else background
+    )
+    if background.casefold() == "transparent":
+        background_instruction = (
+            "Use a fully transparent RGBA background in every pixel outside the weapon."
+        )
+    elif background.casefold() in {"#00ff00", "00ff00", "lemon green", "lemongreen"}:
+        background_instruction = (
+            "Use a perfectly uniform pure lemon-green background (#00FF00) in every "
+            "pixel outside the weapon; do not use transparency, gradients or shadows."
+        )
+    else:
+        background_instruction = (
+            f"Use a perfectly uniform {background} background in every pixel outside the weapon."
+        )
+    spritesheet_contract = f"""{{
+  "content": {{
+    "directions": {{
+      "count": {GRID_ROWS},
+      "rows": [
+{direction_lines}
+      ]
+    }},
+    "camera": {{ "type": {json.dumps(camera_projection)}, "preset": {json.dumps(camera_preset)}, "shadow": false }},
+    "action": {json.dumps(action_label)},
+    "background": {json.dumps(background_value)},
+    "pixel_ratio": {json.dumps(f"{output['width']}x{output['height']}")},
+    "weapon": {json.dumps(weapon_component, ensure_ascii=False, separators=(", ", ": "))}
+  }}
+}}"""
+
+    extra = (
+        f"\n\nAdditional instruction (supplemental only):\n{additional_instructions}"
+        if additional_instructions
+        else ""
+    )
+    return f"""WEAPON LAYER CONTRACT — REQUIRED
+Generate only the isolated weapon layer for this step. The output must contain one complete weapon per cell, including portions that pass behind the character; do not clip the weapon to the character silhouette.
+
+REFERENCE AUTHORITY CONTRACT
+Use {weapon_image} as the authoritative weapon design: preserve its silhouette, materials, colors, markings and recognizable design in every cell. Do not transfer character identity from another reference into the weapon.
+Use {character_image} as positioning and style context only. It establishes the approved character's frame, attachment context, scale and rendering relationship; it is not an authority for drawing the character in this output.
+Use {guide_image} as the authoritative position, orientation, scale and animation phase guide for the weapon in every cell. Follow its attachment and depth envelope without copying guide lines or structural proxy appearance.
+
+EXCLUSION CONTRACT
+Do not draw any character, hand, body part, fingers, armor, clothing, shadow or silhouette. Do not draw any additional prop, shield, accessory, duplicate weapon or detached fragment. The final layer contains only the selected weapon over the requested background.
+
+GRID AND ALIGNMENT CONTRACT
+The final result must be one 8x8 spritesheet with exactly 64 cells. Preserve the original direction of each row, the original animation phase of each column, camera, framing, anchor and cell boundaries. Keep every weapon pixel inside its corresponding cell and never reorder, mirror, rotate or combine cells.
+Attachment, hand, transform and source identity are machine-readable in spritesheetContract below. Treat asset_id as an opaque identifier; never invent or infer a weapon name from it.
+
+IMPORTANT: {background_instruction}
+
+spritesheetContract:
+{spritesheet_contract}
+
+Before producing the PNG, verify that every cell contains exactly the selected weapon aligned to the weapon guide, that no character or hand pixels leaked into the layer, and that the output preserves alpha/background and all 64 positions.{extra}
 """.strip() + "\n"
 
 
@@ -868,6 +1461,178 @@ These instructions may refine the asset or animation, but they cannot override t
     return prompt.strip() + "\n"
 
 
+def compile_layer_prompt(
+    spec: dict[str, Any],
+    reference_manifest: list[dict[str, Any]],
+    *,
+    layer: str,
+    additional_instructions: str = "",
+) -> str:
+    """Compile one isolated layer while retaining the established grid contract."""
+    if layer not in {"character", "weapon"}:
+        raise ValueError("layer deve ser character ou weapon")
+    normalized = normalize_render_spec(spec)
+    if normalized["generation_mode"] != GENERATION_MODE_CHARACTER_WEAPON_HOLDOUT:
+        raise ValueError(
+            "compile_layer_prompt exige generation_mode character_weapon_holdout"
+        )
+
+    if layer == "weapon":
+        extra = _clean_text(additional_instructions)
+        source_contract = normalized.get("source_contract")
+        direction_rows = (
+            source_contract.get("directions")
+            if isinstance(source_contract, dict)
+            else None
+        )
+        conflicts = validate_additional_instructions(
+            extra,
+            mode="character_animation",
+            direction_rows=direction_rows,
+        )
+        if conflicts:
+            raise ValueError(
+                "Instruções adicionais conflitam com o contrato fixo: "
+                + "; ".join(conflicts)
+            )
+        return _compile_weapon_prompt(normalized, reference_manifest, extra)
+
+    character_spec = copy.deepcopy(normalized)
+    source_contract = character_spec.get("source_contract")
+    if isinstance(source_contract, dict):
+        # Structural components belong to later layers. Keeping them here would
+        # make the established prompt require the selected weapon in every cell.
+        source_contract["components"] = []
+    extra = _clean_text(additional_instructions)
+    conflicts = validate_additional_instructions(
+        extra,
+        mode=character_spec["asset"]["mode"],
+        direction_rows=source_contract.get("directions") if isinstance(source_contract, dict) else None,
+    )
+    if conflicts:
+        raise ValueError(
+            "Instruções adicionais conflitam com o contrato fixo: "
+            + "; ".join(conflicts)
+        )
+    shared_prompt = _compile_character_prompt(
+        character_spec, reference_manifest, extra
+    ).replace(
+        "the uploaded 8x8 beauty spritesheet",
+        "the uploaded 8x8 character-only structural reference",
+        1,
+    )
+    layer_contract = """CHARACTER LAYER CONTRACT — REQUIRED
+Generate only the isolated character layer for this step.
+Do not draw any weapon, shield or visible prop in any cell, including detached fragments, silhouettes or shadows from those objects.
+Preserve the exact gripping hand pose, finger placement, wrist angle and spacing established by the structural guides even though the held object is absent.
+Do not compose, position, infer or preview the weapon layer in this step. Composition is outside this prompt.
+Keep every empty pixel outside the character fully transparent RGBA."""
+    return layer_contract + "\n\n" + shared_prompt
+
+
+def compile_modular_layer_prompt(
+    spec: dict[str, Any],
+    reference_manifest: list[dict[str, Any]],
+    *,
+    layer_id: str,
+    additional_instructions: str = "",
+) -> str:
+    """Compile an isolated base or arbitrary equipment layer for the v2 flow."""
+    normalized = normalize_render_spec(spec)
+    if normalized["generation_mode"] != GENERATION_MODE_CHARACTER_COMPONENT_HOLDOUT:
+        raise ValueError(
+            "compile_modular_layer_prompt exige generation_mode character_component_holdout"
+        )
+    contract = normalized["layer_contract"]
+    requested_id = _clean_text(layer_id)
+    known_ids = contract["composition_order"]
+    if requested_id not in known_ids:
+        raise ValueError(
+            f"layer_id desconhecido: {requested_id}; esperado um de {known_ids}"
+        )
+    extra = _clean_text(additional_instructions)
+    source_contract = normalized.get("source_contract")
+    source_contract = source_contract if isinstance(source_contract, dict) else {}
+    conflicts = validate_additional_instructions(
+        extra,
+        mode=normalized["asset"]["mode"],
+        direction_rows=source_contract.get("directions"),
+    )
+    if conflicts:
+        raise ValueError(
+            "Instruções adicionais conflitam com o contrato fixo: " + "; ".join(conflicts)
+        )
+
+    if requested_id == contract["base_id"]:
+        base_spec = copy.deepcopy(normalized)
+        base_source = base_spec.get("source_contract")
+        if isinstance(base_source, dict):
+            base_source["components"] = []
+        shared_prompt = _compile_character_prompt(
+            base_spec, reference_manifest, extra
+        ).replace(
+            "the uploaded 8x8 beauty spritesheet",
+            "the uploaded 8x8 character-only structural reference",
+            1,
+        )
+        excluded = ", ".join(contract["component_ids"])
+        return (
+            "IMMUTABLE BASE LAYER CONTRACT — REQUIRED\n"
+            "Generate only the complete character base. Do not draw any detachable "
+            f"component selected for another layer ({excluded}). Preserve pose, hands, "
+            "camera, frame registration and foot anchor. Empty pixels must be transparent "
+            "RGBA. This base will be reused unchanged with every equipment combination; "
+            "never pre-cut holes for another layer.\n\n"
+            + shared_prompt
+        )
+
+    selected = select_layer_components(
+        source_contract, component_ids=[requested_id]
+    )[0]
+    layer = next(item for item in contract["layers"] if item["id"] == requested_id)
+    output = normalized["output"]
+    grid = output["grid"]
+    references = "\n".join(
+        f"IMAGE {item.get('index', index)} — "
+        f"{_clean_text(item.get('name') or item.get('type'), 'reference')}"
+        for index, item in enumerate(reference_manifest, start=1)
+    ) or "No image references were declared."
+    component_contract = {
+        "id": requested_id,
+        "kind": layer["kind"],
+        "source": selected,
+        "grid": {
+            "rows": grid["rows"],
+            "columns": grid["columns"],
+            "width": output["width"],
+            "height": output["height"],
+        },
+        "composition": {
+            "base_id": contract["base_id"],
+            "z": layer["z"],
+            "visibility": "computed after generation from Blender holdout/depth",
+        },
+    }
+    supplemental = (
+        f"\n\nSUPPLEMENTAL USER INSTRUCTIONS\n{extra}" if extra else ""
+    )
+    return f"""MODULAR COMPONENT LAYER CONTRACT — REQUIRED
+Generate only component {requested_id!r} ({layer['kind']}) on a transparent RGBA background. Do not draw the character, hands, body, another garment, another weapon, shadows, labels, grid lines or detached fragments from another component.
+
+Generate the complete component in its exact animated position, including portions that pass behind the character or another component. Do not cut it to the character silhouette and do not invent visibility. A deterministic Blender holdout/depth pass will create the visible mask after this image is generated.
+
+Preserve exactly {grid['rows']} rows by {grid['columns']} columns ({grid['rows'] * grid['columns']} cells), row directions, animation phase, camera, scale, pivot, foot anchor and cell boundaries. Keep all pixels inside their corresponding cell.
+
+REFERENCE ORDER
+{references}
+
+machineReadableComponentContract:
+{json.dumps(component_contract, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False)}
+
+Before returning the PNG, verify that every cell contains exactly one complete instance of {requested_id!r}, aligned to its structural guide, with no character pixels and no component from another layer.{supplemental}
+""".strip() + "\n"
+
+
 def compile_provider_prompt(
     spec: dict[str, Any],
     reference_manifest: list[dict[str, Any]],
@@ -878,15 +1643,28 @@ def compile_provider_prompt(
     """Compile the exact prompt sent to a provider, including physical input order."""
     provider_name = _clean_text(provider, "openai").casefold()
     normalized = normalize_render_spec(spec)
+    output_size = (
+        normalized["output"]["width"],
+        normalized["output"]["height"],
+    )
     prompt = compile_prompt(normalized, reference_manifest, additional_instructions)
     if normalized["asset"]["mode"] == "character_animation":
         role_descriptions = {
             "identity": "the authoritative character reference",
+            "identity_lineart": "the lineart derived from the authoritative character reference",
             "beauty": "the aligned beauty spritesheet",
             "bones": "the aligned bones guide",
             "lineart": "the aligned lineart guide",
             "frame_control": "the aligned 8x8 frame-control grid",
         }
+        identity_lineart_item = next(
+            (item for item in reference_manifest if item.get("type") == "identity_lineart"),
+            None,
+        )
+        if identity_lineart_item and identity_lineart_item.get("guide_mode") == "canny_edges":
+            role_descriptions["identity_lineart"] = (
+                "the Canny edge guide derived from the authoritative character reference"
+            )
         ordered_inputs = []
         ordinals = ("first", "second", "third", "fourth", "fifth", "sixth")
         for position, item in enumerate(reference_manifest):
@@ -908,7 +1686,8 @@ def compile_provider_prompt(
             + input_contract
             + ". Preserve the 8x8 grid, cell boundaries, camera, pose, direction, "
             "animation phase, scale and foot anchor. Structural guides must not appear "
-            "in the final artwork. Return exactly one 2048x2048 PNG spritesheet with "
+            f"in the final artwork. Return exactly one {output_size[0]}x{output_size[1]} PNG "
+            "spritesheet with "
             "no labels, borders, grid lines or extra panels.\n"
         )
     provider_label = {
@@ -943,6 +1722,21 @@ def compile_provider_prompt(
                 "Do not reproduce its lines in the output.",
             ]
         )
+    identity_lineart_item = next(
+        (item for item in reference_manifest if item.get("type") == "identity_lineart"),
+        None,
+    )
+    if identity_lineart_item:
+        guide_description = (
+            "Canny edge guide"
+            if identity_lineart_item.get("guide_mode") == "canny_edges"
+            else "lineart guide"
+        )
+        lines.extend(
+            [
+                f"IMAGE {identity_lineart_item['index']} is a derived {guide_description} from IMAGE 1. Use it only for the identity contour and silhouette; IMAGE 1 remains authoritative for appearance, colors, materials and style.",
+            ]
+        )
     if provider_name == "openai":
         lines.extend(
             [
@@ -951,7 +1745,7 @@ def compile_provider_prompt(
         )
     lines.extend(
         [
-            "Return exactly one 2048x2048 PNG spritesheet with 8 rows, 8 columns and no labels, borders, grid lines or extra panels.",
+            f"Return exactly one {output_size[0]}x{output_size[1]} PNG spritesheet with 8 rows, 8 columns and no labels, borders, grid lines or extra panels.",
         ]
     )
     return prompt.rstrip() + "\n\n" + "\n".join(lines) + "\n"

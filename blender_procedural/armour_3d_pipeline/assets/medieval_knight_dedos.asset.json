@@ -1,0 +1,34 @@
+{
+  "name": "medieval_knight_dedos",
+  "source": "../../../../3d_assets/medieval knight armor 3d model dedos.glb",
+  "split": {
+    "plan": "auto",
+    "normal_policy": "backup"
+  },
+  "decimate": {
+    "budgets": "../../armour_3d_decimate/budgets.plate_arpg.json"
+  },
+  "fit": {
+    "pieces": {
+      "Helmet": "helmet",
+      "Suit": "suit",
+      "Glove_L": "glove.L",
+      "Glove_R": "glove.R",
+      "Boot_L": "boot.L",
+      "Boot_R": "boot.R"
+    },
+    "body": {
+      "rig": "../../armour_3d_fit/fixtures/kcc_makehuman_52/host_geometry.json",
+      "poses": "../../armour_3d_fit/fixtures/kcc_makehuman_52/host_poses.json"
+    },
+    "body_profile": "../../armour_3d_fit/profiles/body.kcc_makehuman_52.json",
+    "slot_profile": "../../armour_3d_fit/profiles/slots.plate_assembled.json",
+    "style": "plate",
+    "config": {}
+  },
+  "game": {
+    "project": "../../../../Games/OpenKCC-Locomotion",
+    "pieces_dir": "assets/medieval_knight/pieces",
+    "audit": "tests/medieval_knight_armour_audit.gd"
+  }
+}

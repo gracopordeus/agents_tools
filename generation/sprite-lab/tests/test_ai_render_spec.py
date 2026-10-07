@@ -10,16 +10,441 @@ import ai_render_spec  # noqa: E402
 
 
 class AiRenderSpecTests(unittest.TestCase):
+    def _layered_character_spec(self) -> dict:
+        spec = ai_render_spec.default_render_spec(name="hero")
+        spec.update({
+            "generation_mode": "character_weapon_holdout",
+            "layer_contract": {
+                "weapon_component_id": "weapon_1",
+                "generation_order": ["character", "weapon"],
+                "composition_order": ["weapon", "character_holdout"],
+                "layers": [
+                    {"id": "weapon", "z": 0},
+                    {"id": "character_holdout", "z": 1},
+                ],
+            },
+            "source_contract": {
+                "camera": {"type": "orthographic", "preset": "isometric"},
+                "action": {"clip_name": "attack"},
+                "components": [
+                    {"id": "weapon_1", "role": "weapon", "attach_to": "hand_r"}
+                ],
+            },
+        })
+        return spec
+
+    def test_compile_character_layer_prompt_is_isolated_and_aligned(self) -> None:
+        manifest = ai_render_spec.build_reference_manifest(
+            ["beauty", "lineart", "bones", "frame_control"]
+        )
+
+        prompt = ai_render_spec.compile_layer_prompt(
+            self._layered_character_spec(), manifest, layer="character"
+        )
+
+        self.assertIn("character-only structural reference", prompt)
+        self.assertIn("Do not draw any weapon, shield or visible prop", prompt)
+        self.assertIn("Preserve the exact gripping hand pose", prompt)
+        self.assertIn("exactly 64 cells", prompt)
+        self.assertIn("original direction of each row", prompt)
+        self.assertIn("original animation phase of each column", prompt)
+        self.assertIn("fully transparent RGBA background", prompt)
+        self.assertIn('"action": "attack"', prompt)
+        self.assertNotIn('"role": "weapon"', prompt)
+        self.assertNotIn("compose the weapon", prompt.casefold())
+        self.assertEqual(
+            prompt,
+            ai_render_spec.compile_layer_prompt(
+                self._layered_character_spec(), manifest, layer="character"
+            ),
+        )
+
+    def test_compile_layer_prompt_rejects_unknown_layer_and_single_sheet(self) -> None:
+        manifest = ai_render_spec.build_reference_manifest(["beauty"])
+        with self.assertRaisesRegex(ValueError, "layer.*character.*weapon"):
+            ai_render_spec.compile_layer_prompt(
+                self._layered_character_spec(), manifest, layer="armor"
+            )
+        with self.assertRaisesRegex(ValueError, "character_weapon_holdout"):
+            ai_render_spec.compile_layer_prompt(
+                ai_render_spec.default_render_spec(), manifest, layer="character"
+            )
+
+    def test_compile_weapon_layer_prompt_is_isolated_and_spatially_aligned(self) -> None:
+        spec = self._layered_character_spec()
+        component = spec["source_contract"]["components"][0]
+        component.update(
+            {
+                "asset_id": "axe_double_asset",
+                "hand": "right",
+                "transform": {
+                    "position": [1.0, 2.0, 3.0],
+                    "rotation": [0.0, 90.0, 0.0],
+                    "scale": [1.25, 1.25, 1.25],
+                },
+            }
+        )
+        manifest = [
+            {"index": 1, "type": "weapon_reference", "name": "weapon design"},
+            {"index": 2, "type": "character_full", "name": "character_full.png"},
+            {"index": 3, "type": "weapon_guide", "name": "weapon_only.png"},
+        ]
+
+        prompt = ai_render_spec.compile_layer_prompt(spec, manifest, layer="weapon")
+
+        self.assertIn("IMAGE 1", prompt)
+        self.assertIn("authoritative weapon design", prompt)
+        self.assertIn("IMAGE 2", prompt)
+        self.assertIn("character_full", prompt)
+        self.assertIn("positioning and style context only", prompt)
+        self.assertIn("IMAGE 3", prompt)
+        self.assertIn("authoritative position, orientation, scale and animation phase", prompt)
+        self.assertIn("fully transparent RGBA", prompt)
+        self.assertIn("Do not draw any character, hand, body part", prompt)
+        self.assertIn("additional prop", prompt)
+        self.assertIn("exactly 64 cells", prompt)
+        self.assertIn('"asset_id": "axe_double_asset"', prompt)
+        self.assertIn('"attach_to": "hand_r"', prompt)
+        self.assertIn('"hand": "right"', prompt)
+        self.assertIn('"transform": {', prompt)
+        self.assertIn("original direction of each row", prompt)
+        self.assertNotIn('"name": "axe_double_asset"', prompt)
+        self.assertEqual(
+            prompt,
+            ai_render_spec.compile_layer_prompt(spec, manifest, layer="weapon"),
+        )
+
+    def test_select_weapon_component_falls_back_to_single_visible_weapon(self) -> None:
+        component = {
+            "id": "weapon_1",
+            "asset_id": "sword_asset",
+            "role": "weapon",
+            "attach_to": "hand_r",
+            "hand": "right",
+            "path": "assets/sword.glb",
+        }
+
+        selected = ai_render_spec.select_weapon_component(
+            {"components": [component]}
+        )
+
+        self.assertEqual(
+            selected,
+            {
+                "id": "weapon_1",
+                "asset_id": "sword_asset",
+                "attach_to": "hand_r",
+                "hand": "right",
+                "path": "assets/sword.glb",
+            },
+        )
+        component["asset_id"] = "mutated"
+        self.assertEqual(selected["asset_id"], "sword_asset")
+
+    def test_select_weapon_component_prioritizes_explicit_id(self) -> None:
+        selected = ai_render_spec.select_weapon_component(
+            {
+                "components": [
+                    {"id": "prop_1", "role": "prop"},
+                    {"id": "weapon_1", "role": "weapon"},
+                ]
+            },
+            weapon_component_id="weapon_1",
+        )
+
+        self.assertEqual(selected["id"], "weapon_1")
+
+    def test_select_weapon_component_rejects_missing_weapon(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError, "nenhuma arma visível.*prop_1.*prop"
+        ):
+            ai_render_spec.select_weapon_component(
+                {
+                    "components": [
+                        {
+                            "id": "prop_1",
+                            "asset_id": "weapon_named_asset",
+                            "role": "prop",
+                        }
+                    ]
+                }
+            )
+
+    def test_select_weapon_component_rejects_two_visible_weapons(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError, "uma única arma visível.*weapon_1.*weapon_2"
+        ):
+            ai_render_spec.select_weapon_component(
+                {
+                    "components": [
+                        {"id": "weapon_1", "role": "weapon"},
+                        {"id": "weapon_2", "role": "weapon"},
+                    ]
+                }
+            )
+
+    def test_select_weapon_component_ignores_hidden_weapon(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError, "nenhuma arma visível.*hidden_weapon.*weapon"
+        ):
+            ai_render_spec.select_weapon_component(
+                {
+                    "components": [
+                        {
+                            "id": "hidden_weapon",
+                            "role": "weapon",
+                            "visible": False,
+                        }
+                    ]
+                }
+            )
+
+    def test_select_weapon_component_rejects_unknown_explicit_id(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError, "weapon_component_id 'missing'.*weapon_1.*weapon"
+        ):
+            ai_render_spec.select_weapon_component(
+                {"components": [{"id": "weapon_1", "role": "weapon"}]},
+                weapon_component_id="missing",
+            )
+
+    def test_select_weapon_component_rejects_explicit_non_weapon_role(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError, "weapon_component_id 'shield_1'.*shield"
+        ):
+            ai_render_spec.select_weapon_component(
+                {"components": [{"id": "shield_1", "role": "shield"}]},
+                weapon_component_id="shield_1",
+            )
+
+    def test_layered_normalization_rejects_source_contract_without_selected_weapon(self) -> None:
+        spec = ai_render_spec.default_render_spec(name="hero")
+        spec.update(
+            {
+                "generation_mode": "character_weapon_holdout",
+                "layer_contract": {
+                    "weapon_component_id": "sword_main",
+                    "generation_order": ["character", "weapon"],
+                    "composition_order": ["weapon", "character_holdout"],
+                    "layers": [
+                        {"id": "weapon", "z": 0},
+                        {"id": "character_holdout", "z": 1},
+                    ],
+                },
+                "source_contract": {
+                    "components": [{"id": "prop_1", "role": "prop"}]
+                },
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "weapon_component_id 'sword_main'"):
+            ai_render_spec.normalize_render_spec(spec)
+
+    def test_generation_mode_defaults_to_single_sheet_without_layer_contract(self) -> None:
+        spec = ai_render_spec.normalize_render_spec({})
+
+        self.assertEqual(spec["generation_mode"], "single_sheet")
+        self.assertNotIn("layer_contract", spec)
+
+    def test_character_weapon_holdout_normalizes_canonical_layer_contract(self) -> None:
+        spec = ai_render_spec.default_render_spec(name="hero")
+        spec.update(
+            {
+                "generation_mode": "character_weapon_holdout",
+                "layer_contract": {
+                    "weapon_component_id": "sword_main",
+                    "generation_order": ["character", "weapon"],
+                    "composition_order": ["weapon", "character_holdout"],
+                    "layers": [
+                        {"id": "weapon", "z": 0, "file": "layers/weapon.png"},
+                        {
+                            "id": "character_holdout",
+                            "z": 1,
+                            "file": "layers/character_holdout.png",
+                        },
+                    ],
+                    "preview": "composite_preview.png",
+                },
+                "source_contract": {
+                    "components": [
+                        {
+                            "id": "sword_main",
+                            "asset_id": "sword_asset",
+                            "role": "weapon",
+                            "attach_to": "hand_r",
+                            "hand": "right",
+                            "path": "assets/sword.glb",
+                        }
+                    ]
+                },
+            }
+        )
+
+        normalized = ai_render_spec.normalize_render_spec(spec)
+
+        self.assertEqual(normalized["generation_mode"], "character_weapon_holdout")
+        self.assertEqual(normalized["layer_contract"], spec["layer_contract"])
+        self.assertEqual(normalized["output"]["grid"], {"rows": 8, "columns": 8})
+        self.assertEqual(normalized["output"]["width"], normalized["output"]["height"])
+
+    def test_character_weapon_holdout_requires_explicit_weapon_component_id(self) -> None:
+        spec = ai_render_spec.default_render_spec(name="hero")
+        spec.update(
+            {
+                "generation_mode": "character_weapon_holdout",
+                "layer_contract": {
+                    "generation_order": ["character", "weapon"],
+                    "composition_order": ["weapon", "character_holdout"],
+                    "layers": [
+                        {"id": "weapon", "z": 0},
+                        {"id": "character_holdout", "z": 1},
+                    ],
+                },
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "layer_contract.weapon_component_id"):
+            ai_render_spec.normalize_render_spec(spec)
+
+    def test_character_weapon_holdout_rejects_invalid_composition_order(self) -> None:
+        spec = ai_render_spec.default_render_spec(name="hero")
+        spec.update(
+            {
+                "generation_mode": "character_weapon_holdout",
+                "layer_contract": {
+                    "weapon_component_id": "sword_main",
+                    "generation_order": ["character", "weapon"],
+                    "composition_order": ["character_holdout", "weapon"],
+                    "layers": [
+                        {"id": "weapon", "z": 0},
+                        {"id": "character_holdout", "z": 1},
+                    ],
+                },
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "layer_contract.composition_order"):
+            ai_render_spec.normalize_render_spec(spec)
+
+    def test_character_weapon_holdout_rejects_invalid_generation_order(self) -> None:
+        spec = ai_render_spec.default_render_spec(name="hero")
+        spec.update(
+            {
+                "generation_mode": "character_weapon_holdout",
+                "layer_contract": {
+                    "weapon_component_id": "sword_main",
+                    "generation_order": ["weapon", "character"],
+                    "composition_order": ["weapon", "character_holdout"],
+                    "layers": [
+                        {"id": "weapon", "z": 0},
+                        {"id": "character_holdout", "z": 1},
+                    ],
+                },
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "layer_contract.generation_order"):
+            ai_render_spec.normalize_render_spec(spec)
+
+    def test_character_weapon_holdout_rejects_absolute_layer_file_paths(self) -> None:
+        for absolute_path in (
+            "/home/ggnp/secret/weapon.png",
+            r"C:\secret\weapon.png",
+            r"\\server\share\weapon.png",
+        ):
+            spec = ai_render_spec.default_render_spec(name="hero")
+            spec.update(
+                {
+                    "generation_mode": "character_weapon_holdout",
+                    "layer_contract": {
+                        "weapon_component_id": "sword_main",
+                        "generation_order": ["character", "weapon"],
+                        "composition_order": ["weapon", "character_holdout"],
+                        "layers": [
+                            {"id": "weapon", "z": 0, "file": absolute_path},
+                            {"id": "character_holdout", "z": 1},
+                        ],
+                    },
+                }
+            )
+
+            with self.subTest(path=absolute_path), self.assertRaisesRegex(
+                ValueError, r"layer_contract\.layers\[0\]\.file"
+            ):
+                ai_render_spec.normalize_render_spec(spec)
+
+    def test_character_weapon_holdout_rejects_absolute_preview_paths(self) -> None:
+        for absolute_path in (
+            "/etc/passwd",
+            r"D:\private\preview.png",
+            r"\\server\share\preview.png",
+        ):
+            spec = ai_render_spec.default_render_spec(name="hero")
+            spec.update(
+                {
+                    "generation_mode": "character_weapon_holdout",
+                    "layer_contract": {
+                        "weapon_component_id": "sword_main",
+                        "generation_order": ["character", "weapon"],
+                        "composition_order": ["weapon", "character_holdout"],
+                        "layers": [
+                            {"id": "weapon", "z": 0},
+                            {"id": "character_holdout", "z": 1},
+                        ],
+                        "preview": absolute_path,
+                    },
+                }
+            )
+
+            with self.subTest(path=absolute_path), self.assertRaisesRegex(
+                ValueError, "layer_contract.preview"
+            ):
+                ai_render_spec.normalize_render_spec(spec)
+
     def test_default_spec_is_eight_by_eight_and_uses_canonical_directions(self) -> None:
         spec = ai_render_spec.default_render_spec(name="hero")
 
         self.assertEqual(spec["version"], "2.0")
         self.assertEqual(spec["output"]["grid"], {"rows": 8, "columns": 8})
+        self.assertEqual((spec["output"]["width"], spec["output"]["height"]), (2048, 2048))
         self.assertEqual(spec["output"]["background"], "transparent")
         self.assertEqual([row["id"] for row in spec["rows"]], [
             "north", "north_east", "east", "south_east",
             "south", "south_west", "west", "north_west",
         ])
+
+    def test_default_structural_reference_is_beauty_only(self) -> None:
+        spec = ai_render_spec.default_render_spec(name="hero")
+
+        self.assertTrue(spec["references"]["identity"]["enabled"])
+        self.assertTrue(spec["references"]["beauty"]["enabled"])
+        for channel in ("bones", "lineart", "frame_control"):
+            self.assertFalse(spec["references"][channel]["enabled"])
+
+    def test_output_size_accepts_1024_and_is_dynamic_in_provider_prompt(self) -> None:
+        spec = ai_render_spec.default_render_spec(name="hero")
+        spec["output"]["width"] = 1024
+        spec["output"]["height"] = 1024
+
+        normalized = ai_render_spec.normalize_render_spec(spec)
+        self.assertEqual((normalized["output"]["width"], normalized["output"]["height"]), (1024, 1024))
+        prompt = ai_render_spec.compile_provider_prompt(
+            spec,
+            ai_render_spec.build_reference_manifest(["beauty", "bones"]),
+            provider="google",
+        )
+        self.assertIn("1024x1024 PNG spritesheet", prompt)
+        self.assertNotIn("2048x2048 PNG spritesheet", prompt)
+
+    def test_output_size_rejects_non_square_or_unsupported_dimensions(self) -> None:
+        for width, height in ((512, 512), (1024, 2048), (4096, 4096)):
+            spec = ai_render_spec.default_render_spec(name="hero")
+            spec["output"]["width"] = width
+            spec["output"]["height"] = height
+            with self.subTest(width=width, height=height), self.assertRaisesRegex(
+                ValueError, "1024x1024 ou 2048x2048"
+            ):
+                ai_render_spec.normalize_render_spec(spec)
 
     def test_reference_manifest_preserves_provider_input_order(self) -> None:
         manifest = ai_render_spec.build_reference_manifest(
@@ -41,6 +466,53 @@ class AiRenderSpecTests(unittest.TestCase):
         self.assertIn("black guide lines", manifest[3]["does_not_control"])
         self.assertEqual(manifest[0]["name"], "concept.jpeg")
         self.assertEqual(manifest[0]["role"], "authoritative_visual_identity")
+
+    def test_identity_lineart_is_inserted_after_identity_and_is_explicit(self) -> None:
+        spec = ai_render_spec.default_render_spec(name="hero")
+        manifest = ai_render_spec.build_reference_manifest(
+            ["beauty", "bones"],
+            identity_name="concept.png",
+            include_identity_lineart=True,
+        )
+
+        self.assertEqual(
+            [(item["index"], item["type"]) for item in manifest],
+            [
+                (1, "identity"),
+                (2, "identity_lineart"),
+                (3, "beauty"),
+                (4, "bones"),
+            ],
+        )
+        self.assertEqual(manifest[1]["role"], "identity_contour_guide")
+        prompt = ai_render_spec.compile_provider_prompt(
+            spec,
+            manifest,
+            provider="google",
+        )
+        self.assertIn("Use IMAGE 2, the lineart derived from the identity reference", prompt)
+        self.assertIn("IMAGE 1 remains authoritative for colors", prompt)
+        self.assertIn("second is the lineart derived from the authoritative character reference", prompt)
+
+    def test_canny_identity_guide_is_named_in_manifest_and_prompt(self) -> None:
+        spec = ai_render_spec.default_render_spec(name="hero")
+        manifest = ai_render_spec.build_reference_manifest(
+            ["beauty"],
+            identity_name="concept.png",
+            include_identity_lineart=True,
+            identity_lineart_mode="canny_edges",
+        )
+
+        self.assertEqual(manifest[1]["type"], "identity_lineart")
+        self.assertEqual(manifest[1]["guide_mode"], "canny_edges")
+        self.assertIn("canny edges", manifest[1]["name"])
+        prompt = ai_render_spec.compile_provider_prompt(
+            spec,
+            manifest,
+            provider="google",
+        )
+        self.assertIn("second is the Canny edge guide derived from the authoritative character reference", prompt)
+        self.assertIn("the Canny edge map derived from the identity reference", prompt)
 
     def test_compiler_contains_fixed_contract_and_cell_overrides(self) -> None:
         spec = ai_render_spec.default_render_spec(mode="prop_catalog", name="props")
@@ -226,6 +698,27 @@ class AiRenderSpecTests(unittest.TestCase):
         self.assertNotIn("weapon", prompt.casefold())
         self.assertNotIn("axe", prompt.casefold())
 
+    def test_component_contract_does_not_invent_a_prop_name(self) -> None:
+        spec = ai_render_spec.default_render_spec(name="hero")
+        spec["source_contract"] = {
+            "components": [
+                {
+                    "id": "component_7",
+                    "role": "attachment",
+                    "asset_id": "asset_7",
+                    "attach_to": "spine",
+                }
+            ]
+        }
+
+        prompt = ai_render_spec.compile_prompt(
+            spec,
+            ai_render_spec.build_reference_manifest(["beauty", "bones", "lineart"]),
+        )
+
+        self.assertIn('"name": "asset_7"', prompt)
+        self.assertNotIn('"name": "prop"', prompt)
+
     def test_source_contract_order_is_persisted_in_render_spec_rows(self) -> None:
         spec = ai_render_spec.default_render_spec(name="hero")
         spec["source_contract"] = {
@@ -272,6 +765,86 @@ class AiRenderSpecTests(unittest.TestCase):
         self.assertNotIn("ROW 1 — South", prompt)
         self.assertNotIn("Do not include this note.", prompt)
         self.assertIn("C2: Include this note.", prompt)
+
+    def _modular_spec(self) -> dict:
+        spec = ai_render_spec.default_render_spec(name="hero")
+        spec.update({
+            "generation_mode": "character_component_holdout",
+            "layer_contract": {
+                "base_id": "character_full",
+                "component_ids": ["coat", "sword"],
+                "generation_order": ["character_full", "coat", "sword"],
+                "composition_order": ["character_full", "coat", "sword"],
+                "layers": [
+                    {"id": "character_full", "z": 0},
+                    {"id": "coat", "kind": "clothing", "z": 10},
+                    {"id": "sword", "z": 20},
+                ],
+                "preview": "composite_preview.png",
+            },
+            "source_contract": {
+                "components": [
+                    {"id": "coat", "role": "clothing", "asset_id": "coat-red"},
+                    {"id": "sword", "role": "weapon", "attach_to": "hand_r"},
+                ]
+            },
+        })
+        return spec
+
+    def test_normalizes_generic_layer_contract_with_multiple_components(self) -> None:
+        normalized = ai_render_spec.normalize_render_spec(self._modular_spec())
+
+        self.assertEqual(normalized["generation_mode"], "character_component_holdout")
+        contract = normalized["layer_contract"]
+        self.assertEqual(contract["version"], 2)
+        self.assertEqual(contract["component_ids"], ["coat", "sword"])
+        self.assertEqual(
+            [(layer["id"], layer["role"], layer.get("kind"), layer["z"]) for layer in contract["layers"]],
+            [
+                ("character_full", "base", None, 0),
+                ("coat", "component", "clothing", 10),
+                ("sword", "component", "weapon", 20),
+            ],
+        )
+
+    def test_modular_component_prompt_keeps_full_component_for_later_holdout(self) -> None:
+        prompt = ai_render_spec.compile_modular_layer_prompt(
+            self._modular_spec(),
+            [{"index": 1, "type": "component_reference", "name": "red coat"}],
+            layer_id="coat",
+        )
+
+        self.assertIn("MODULAR COMPONENT LAYER CONTRACT", prompt)
+        self.assertIn("complete component", prompt)
+        self.assertIn("Do not cut it to the character silhouette", prompt)
+        self.assertIn("Blender holdout/depth pass", prompt)
+        self.assertIn('"id": "coat"', prompt)
+        self.assertIn('"asset_id": "coat-red"', prompt)
+        self.assertIn("exactly 8 rows by 8 columns", prompt)
+
+    def test_modular_base_prompt_is_immutable_and_excludes_components(self) -> None:
+        prompt = ai_render_spec.compile_modular_layer_prompt(
+            self._modular_spec(),
+            ai_render_spec.build_reference_manifest(["beauty", "bones"]),
+            layer_id="character_full",
+        )
+
+        self.assertIn("IMMUTABLE BASE LAYER CONTRACT", prompt)
+        self.assertIn("never pre-cut holes", prompt)
+        self.assertIn("coat, sword", prompt)
+
+    def test_modular_contract_rejects_hidden_or_reordered_components(self) -> None:
+        spec = self._modular_spec()
+        spec["source_contract"]["components"][0]["visible"] = False
+        with self.assertRaisesRegex(ValueError, "componentes visíveis.*coat"):
+            ai_render_spec.normalize_render_spec(spec)
+
+        reordered = self._modular_spec()
+        reordered["layer_contract"]["composition_order"] = [
+            "character_full", "sword", "coat"
+        ]
+        with self.assertRaisesRegex(ValueError, "composition_order"):
+            ai_render_spec.normalize_render_spec(reordered)
 
 
 if __name__ == "__main__":

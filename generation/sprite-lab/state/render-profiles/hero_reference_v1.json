@@ -11,7 +11,7 @@
   "dynamic_y": true,
   "vertical_margin_px": 2.0,
   "foot_anchor": [128, 220],
-  "camera_elevation": 35.264,
+  "camera_elevation": 30.0,
   "camera_azimuth": 45.0,
   "directions": 8,
   "phases": 8,

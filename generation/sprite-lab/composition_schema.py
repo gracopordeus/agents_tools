@@ -7,7 +7,16 @@ from typing import Any
 
 
 COMPONENT_SCHEMA = "sprite_lab.composition_components/v1"
-COMPONENT_ROLES = {"attachment", "prop", "shield", "weapon"}
+COMPONENT_ROLES = {
+    "accessory",
+    "armor",
+    "attachment",
+    "clothing",
+    "hair",
+    "prop",
+    "shield",
+    "weapon",
+}
 ROOT_PARENTS = {"character", "scene"}
 MAX_COMPONENTS = 64
 TWO_HAND_AXES = {"x", "y", "z", "-x", "-y", "-z"}

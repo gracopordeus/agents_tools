@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sprite-lab.local/schemas/layered_sprite_bundle_v1.json",
+  "title": "Sprite Lab layered sprite bundle",
+  "type": "object",
+  "required": [
+    "schema",
+    "generation_mode",
+    "layout",
+    "layers",
+    "preview",
+    "source",
+    "hashes"
+  ],
+  "properties": {
+    "schema": { "const": "sprite_lab.layered_sprite_bundle/v1" },
+    "generation_mode": { "const": "character_weapon_holdout" },
+    "layout": {
+      "type": "object",
+      "required": ["rows", "columns", "cell_size"],
+      "properties": {
+        "rows": { "const": 8 },
+        "columns": { "const": 8 },
+        "cell_size": {
+          "type": "array",
+          "prefixItems": [
+            { "type": "integer", "minimum": 1 },
+            { "type": "integer", "minimum": 1 }
+          ],
+          "minItems": 2,
+          "maxItems": 2
+        }
+      },
+      "additionalProperties": false
+    },
+    "layers": {
+      "type": "array",
+      "prefixItems": [
+        {
+          "type": "object",
+          "required": ["id", "file", "z"],
+          "properties": {
+            "id": { "const": "weapon" },
+            "file": { "$ref": "#/$defs/relativePath" },
+            "z": { "const": 0 }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["id", "file", "z", "holdout_source"],
+          "properties": {
+            "id": { "const": "character_holdout" },
+            "file": { "$ref": "#/$defs/relativePath" },
+            "z": { "const": 1 },
+            "holdout_source": { "$ref": "#/$defs/relativePath" }
+          },
+          "additionalProperties": false
+        }
+      ],
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "preview": { "$ref": "#/$defs/relativePath" },
+    "source": { "type": "object" },
+    "hashes": {
+      "type": "object",
+      "minProperties": 4,
+      "maxProperties": 4,
+      "propertyNames": { "$ref": "#/$defs/relativePath" },
+      "additionalProperties": {
+        "type": "string",
+        "pattern": "^[a-f0-9]{64}$"
+      }
+    }
+  },
+  "$defs": {
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!\\\\)(?![A-Za-z]:)(?!.*\\\\)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
+    }
+  },
+  "additionalProperties": false
+}

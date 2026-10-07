@@ -26,11 +26,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent / "sprite-lab"))
 import blender_render_catalog as brc  # noqa: E402
 import composite_spec as cspec  # noqa: E402
+from blender_retarget import retarget_action  # noqa: E402
 from direction_contract import DIRECTION_ROWS, DIRECTION_TARGETS, direction_contract_for  # noqa: E402
 
 ROWS = list(DIRECTION_ROWS)
 TARGETS = [DIRECTION_TARGETS[row] for row in DIRECTION_ROWS]
-ELEV = 35.264
+ELEV = 30.0
 AZIM = 45.0
 
 
@@ -147,6 +148,23 @@ def apply_animation(arm: bpy.types.Object, ual_fbx: str, action_name: str) -> No
     action = next((a for a in bpy.data.actions if action_name in a.name), None)
     if action is None:
         raise RuntimeError(f"action '{action_name}' não encontrada na UAL")
+    source_armature = next((obj for obj in imported if obj.type == "ARMATURE"), None)
+    if source_armature is not None:
+        target_signature = sorted(
+            (bone.name, bone.parent.name if bone.parent else "")
+            for bone in arm.data.bones
+        )
+        source_signature = sorted(
+            (bone.name, bone.parent.name if bone.parent else "")
+            for bone in source_armature.data.bones
+        )
+        if source_signature != target_signature:
+            action, _ = retarget_action(
+                arm,
+                source_armature,
+                action,
+                label=str(action_name).split("|")[-1],
+            )
     if arm.animation_data is None:
         arm.animation_data_create()
     arm.animation_data.action = action

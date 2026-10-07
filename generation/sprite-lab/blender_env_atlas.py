@@ -394,7 +394,7 @@ def main() -> int:
 
         camera = make_locked_camera(
             bpy.context.scene,
-            elevation=profile.get("camera_elevation", 35.264),
+            elevation=profile.get("camera_elevation", 30.0),
             azimuth=profile.get("camera_azimuth", 45.0),
             ortho_scale=profile.get("ortho_scale", 2.577),
             foot_anchor=profile.get("foot_anchor", [128, 128]),

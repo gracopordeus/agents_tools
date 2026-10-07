@@ -11,6 +11,13 @@ import torch
 from PIL import Image
 from torchvision import transforms
 from transformers import AutoModelForImageSegmentation
+from postprocess_runtime import (
+    GPULease,
+    add_runtime_arguments,
+    resolve_device,
+    resolve_dtype,
+    validate_parallelism,
+)
 
 
 def _decontaminate(
@@ -34,6 +41,7 @@ def _decontaminate(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    add_runtime_arguments(parser)
     parser.add_argument("source", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--mask-output", type=Path, required=True)
@@ -50,13 +58,17 @@ def main() -> None:
         raise FileNotFoundError(args.source)
     if not 0.0 <= args.threshold <= 1.0:
         raise ValueError("threshold deve estar entre 0 e 1")
+    validate_parallelism(args.batch_size, args.cpu_workers)
 
     torch.set_float32_matmul_precision("high")
+    device = resolve_device(args.device)
+    dtype = resolve_dtype(device, args.precision)
+    gpu_lease = GPULease(device)
     model = AutoModelForImageSegmentation.from_pretrained(
         args.model,
         trust_remote_code=True,
         revision=args.revision,
-    ).to("cpu")
+    ).to(device=device, dtype=dtype)
     model.eval()
     transform = transforms.Compose(
         [
@@ -68,30 +80,73 @@ def main() -> None:
     args.output.mkdir(parents=True, exist_ok=True)
     args.mask_output.mkdir(parents=True, exist_ok=True)
     inputs = sorted(args.source.glob("row*_col*.png"))
+    if not inputs:
+        raise ValueError("Nenhuma célula de entrada")
+    if device == "cuda":
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
     started = time.monotonic()
 
-    for source in inputs:
-        with Image.open(source) as opened:
-            image = opened.convert("RGB")
-        tensor = transform(image).unsqueeze(0).to("cpu", dtype=torch.float32)
-        with torch.inference_mode():
-            prediction = model(tensor)[-1].sigmoid()[0].squeeze().cpu().numpy()
-        soft_mask = Image.fromarray(
-            np.round(prediction * 255).astype(np.uint8), mode="L"
-        ).resize(image.size, Image.Resampling.NEAREST)
-        soft_alpha = np.asarray(soft_mask, dtype=np.float32) / 255.0
-        binary_alpha = soft_alpha >= args.threshold
-        rgb = np.asarray(image, dtype=np.uint8)
-        cleaned_rgb = _decontaminate(rgb, soft_alpha, binary_alpha)
-        rgba = np.dstack(
-            [cleaned_rgb, np.where(binary_alpha, 255, 0).astype(np.uint8)]
-        )
-        Image.fromarray(rgba, mode="RGBA").save(args.output / source.name)
-        Image.fromarray(
-            np.where(binary_alpha, 255, 0).astype(np.uint8), mode="L"
-        ).save(args.mask_output / source.name)
-        image.close()
-        soft_mask.close()
+    fallback_batches = 0
+
+    def predict_batch(batch_tensor: torch.Tensor) -> np.ndarray:
+        nonlocal fallback_batches
+        try:
+            with torch.inference_mode():
+                return (
+                    model(batch_tensor)[-1]
+                    .float()
+                    .sigmoid()
+                    .cpu()
+                    .numpy()
+                )
+        except torch.cuda.OutOfMemoryError:
+            if device != "cuda" or batch_tensor.shape[0] == 1:
+                raise
+            fallback_batches += 1
+            torch.cuda.empty_cache()
+            midpoint = max(1, batch_tensor.shape[0] // 2)
+            first = predict_batch(batch_tensor[:midpoint])
+            second = predict_batch(batch_tensor[midpoint:])
+            return np.concatenate([first, second], axis=0)
+
+    for batch_start in range(0, len(inputs), args.batch_size):
+        batch_sources = inputs[batch_start:batch_start + args.batch_size]
+        images: list[Image.Image] = []
+        try:
+            for source in batch_sources:
+                with Image.open(source) as opened:
+                    images.append(opened.convert("RGB"))
+            batch_tensor = torch.stack(
+                [transform(image) for image in images],
+                dim=0,
+            ).to(device, dtype=dtype)
+            prediction_batch = predict_batch(batch_tensor)
+            for source, image, prediction in zip(
+                batch_sources, images, prediction_batch
+            ):
+                prediction = np.asarray(prediction).squeeze()
+                if not np.isfinite(prediction).all():
+                    raise RuntimeError("BiRefNet produziu máscara não finita")
+                soft_mask = Image.fromarray(
+                    np.round(prediction * 255).astype(np.uint8), mode="L"
+                ).resize(image.size, Image.Resampling.NEAREST)
+                soft_alpha = np.asarray(soft_mask, dtype=np.float32) / 255.0
+                binary_alpha = soft_alpha >= args.threshold
+                rgb = np.asarray(image, dtype=np.uint8)
+                cleaned_rgb = _decontaminate(rgb, soft_alpha, binary_alpha)
+                rgba = np.dstack(
+                    [cleaned_rgb, np.where(binary_alpha, 255, 0).astype(np.uint8)]
+                )
+                Image.fromarray(rgba, mode="RGBA").save(args.output / source.name)
+                Image.fromarray(
+                    np.where(binary_alpha, 255, 0).astype(np.uint8), mode="L"
+                ).save(args.mask_output / source.name)
+                soft_mask.close()
+            del batch_tensor, prediction_batch
+        finally:
+            for image in images:
+                image.close()
 
     print(
         json.dumps(
@@ -99,14 +154,17 @@ def main() -> None:
                 "implementation": "ZhengPeng7/BiRefNet",
                 "model": args.model,
                 "revision": args.revision,
-                "device": "cpu",
-                "precision": "fp32",
+                "device": device,
+                "precision": args.precision,
+                "peak_vram_bytes": torch.cuda.max_memory_allocated() if device == "cuda" else 0,
                 "input_size": [args.input_size, args.input_size],
                 "mask_resize": "nearest-neighbor",
                 "alpha": "binary",
                 "threshold": args.threshold,
                 "color_decontamination": True,
                 "images": len(inputs),
+                "batch_size": args.batch_size,
+                "fallback_batches": fallback_batches,
                 "elapsed_seconds": round(time.monotonic() - started, 3),
             },
             ensure_ascii=False,

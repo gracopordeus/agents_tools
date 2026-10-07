@@ -19,6 +19,7 @@ import bpy
 from mathutils import Euler, Matrix, Quaternion, Vector
 
 from orientation_contract import axis_vector, normalize_orientation
+from blender_retarget import retarget_action, rigs_share_bind
 
 
 BONE_PATH_RE = re.compile(r"pose\.bones\[(?:\"([^\"]+)\"|'([^']+)')\]")
@@ -255,7 +256,13 @@ def find_bone(armature: bpy.types.Object, name: str) -> str:
     normalized_aliases = aliases.get(normalized_name, {normalized_name})
     for bone in armature.pose.bones:
         normalized = _normalized_name(bone.name)
-        if normalized in normalized_aliases:
+        # Mixamo exports commonly prefix the anatomical name with
+        # ``mixamorig:`` (for example ``mixamorig:RightHand``). The web
+        # viewer already resolves these as aliases; Blender export must use
+        # the same suffix matching or compositions fail only at render time.
+        if normalized in normalized_aliases or any(
+            normalized.endswith(alias) for alias in normalized_aliases
+        ):
             return bone.name
     raise RuntimeError(f"rig sem o osso/socket {name}")
 
@@ -458,17 +465,53 @@ def apply_animation(
     armature: bpy.types.Object,
     animation_path: Path | None,
     action_name: str | None,
+    mapping_override: dict[str, str] | None = None,
+    in_place: bool = True,
 ) -> bpy.types.Action | None:
-    action = find_action(action_name)
-    if action is None and animation_path is not None:
+    action = find_action(action_name) if animation_path is None else None
+    if animation_path is not None:
+        actions_before = set(bpy.data.actions)
         imported = import_asset(animation_path)
-        action = find_action(action_name)
-        if action is None:
-            imported_actions = list(bpy.data.actions)
-            if imported_actions:
-                action = max(
-                    imported_actions,
-                    key=lambda item: item.frame_range[1] - item.frame_range[0],
+        source_armature = next(
+            (obj for obj in imported if obj.type == "ARMATURE"),
+            None,
+        )
+        imported_actions = [item for item in bpy.data.actions if item not in actions_before]
+        active_source_action = (
+            source_armature.animation_data.action
+            if source_armature and source_armature.animation_data
+            else None
+        )
+        if imported_actions:
+            exact = next((item for item in imported_actions if item.name == action_name), None)
+            leaf = str(action_name or "").split("|")[-1]
+            action = exact or next(
+                (
+                    item for item in imported_actions
+                    if re.sub(r'\.\d{3}$', '', item.name).split('|')[-1] == leaf
+                ),
+                None,
+            )
+            if action_name and action is None:
+                raise ValueError(f'Action solicitada não encontrada: {action_name}')
+            action = action or active_source_action or max(
+                imported_actions,
+                key=lambda item: item.frame_range[1] - item.frame_range[0],
+            )
+        else:
+            action = active_source_action
+        if source_armature is not None and action is not None:
+            # Same-family exports already share the target's bone names and
+            # rest-axis contract. Keep their Action untouched; retargeting is
+            # only needed when the source hierarchy actually differs.
+            if not rigs_share_bind(source_armature, armature):
+                action, _ = retarget_action(
+                    armature,
+                    source_armature,
+                    action,
+                    label=str(action_name or action.name).split("|")[-1],
+                    mapping_override=mapping_override,
+                    in_place=in_place,
                 )
         for obj in imported:
             bpy.data.objects.remove(obj, do_unlink=True)
@@ -479,7 +522,8 @@ def apply_animation(
         action_slots = getattr(action, "slots", ())
         if action_slots and hasattr(armature.animation_data, "action_slot"):
             armature.animation_data.action_slot = action_slots[0]
-        lock_root_motion(armature, action)
+        if not action.get('retarget_version'):
+            lock_root_motion(armature, action)
     return action
 
 
@@ -523,9 +567,13 @@ def _pose_bone_position(armature: bpy.types.Object, bone_name: str) -> Vector:
 def _palm_center_offset(armature: bpy.types.Object, bone_name: str) -> Vector:
     """Return the grip point in hand-bone local coordinates."""
     hand = armature.data.bones.get(bone_name)
-    if hand is None or _normalized_name(hand.name) not in {
+    hand_aliases = {
         "handr", "handl", "righthand", "lefthand", "handright", "handleft",
-    }:
+    }
+    hand_name = _normalized_name(hand.name) if hand else ""
+    if hand is None or not any(
+        hand_name == alias or hand_name.endswith(alias) for alias in hand_aliases
+    ):
         return Vector((0.0, 0.0, 0.0))
     inverse = hand.matrix_local.inverted()
     thumbs: list[Vector] = []
@@ -663,6 +711,10 @@ def _attach_component(
 
     component_id = str(component.get("id") or "component")
     root = bpy.data.objects.new(f"sprite_component_{component_id}", None)
+    root["conditioning_component_role"] = (
+        str(component.get("role") or "prop").strip().casefold()
+    )
+    root["conditioning_component_id"] = component_id
     bpy.context.scene.collection.objects.link(root)
     parent_name = str(component.get("parent") or "character")
     attach_to = component.get("attach_to")
@@ -735,6 +787,20 @@ def _attach_component(
         local_position = Vector(tuple(position[:3])) + palm_offset
         local_rotation = authored_rotation
         local_scale_values = (base_scale[0], base_scale[1], base_scale[2])
+
+    # The canonical GLB conversion preserves the Mixamo armature's 0.01
+    # object scale. A component root parented to that armature/bone would
+    # inherit the scale after its fit value was already computed in world
+    # units, making a standalone prop almost invisible. Keep the authored
+    # position/rotation in socket space, but cancel the inherited armature
+    # scale for the component root. This applies to both one- and two-hand
+    # attachments (and is a no-op for the usual unit-scale FBX armature).
+    if parent_name == "character":
+        inherited_scale = armature.matrix_world.to_scale()
+        local_scale_values = tuple(
+            value / max(abs(float(inherited_scale[index])), 1e-8)
+            for index, value in enumerate(local_scale_values)
+        )
     local_scale = Matrix.Diagonal(
         (
             scale * local_scale_values[0],
@@ -1028,6 +1094,8 @@ def main() -> int:
             armature,
             Path(request["animation_path"]).expanduser().resolve(),
             request.get("action_name"),
+            mapping_override=request.get("bone_mapping"),
+            in_place=bool(request.get("in_place", True)),
         )
     root_motion_lock = root_motion_lock_metadata(action)
     weapon_meta = None

@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from catalog_sources import build_catalog, init_registry, validate_catalog, write_json_atomic
+from catalog_sources import _category, build_catalog, init_registry, validate_catalog, write_json_atomic
 
 
 def _write_registry(root: Path) -> Path:
@@ -47,6 +47,25 @@ def _write_registry(root: Path) -> Path:
 
 
 class CatalogSourcesTests(unittest.TestCase):
+    def test_inbox_fbx_heuristic_classifies_without_category_map(self) -> None:
+        """Incoming ZIPs declare no category_by_extension: names must decide."""
+        source = {"category_by_extension": {}}
+        cases = {
+            "Knight_Body.fbx": "character",
+            "Maria WProp J J Ong.fbx": "character",
+            "Longsword_Attack.fbx": "animation",
+            "Iron_Shield.fbx": "weapon",
+            "Prop_Barrel.fbx": "prop",
+            "decorative_prop.fbx": "prop",
+            "Idle_Loop.fbx": "animation",
+            "Layer0.fbx": "animation",
+            "Take 001.fbx": "animation",
+            "Brick_Wall.fbx": "model",
+        }
+        for name, expected in cases.items():
+            with self.subTest(name=name):
+                self.assertEqual(_category(source, name, "fbx"), expected)
+
     def test_index_scans_direct_files_and_zip_members_without_traversal(self) -> None:
         with self.subTest("fixture"):
             from tempfile import TemporaryDirectory

@@ -9,6 +9,20 @@ import composition_schema  # noqa: E402
 
 
 class CompositionSchemaTests(unittest.TestCase):
+    def test_accepts_detachable_clothing_for_modular_holdout(self) -> None:
+        component = composition_schema.normalize_component(
+            {
+                "id": "coat_1",
+                "asset_id": "coat_asset",
+                "role": "clothing",
+                "parent": "character",
+            },
+            0,
+        )
+
+        self.assertEqual(component["role"], "clothing")
+        self.assertEqual(component["parent"], "character")
+
     def test_legacy_weapon_becomes_a_component(self) -> None:
         components = composition_schema.normalize_components(
             {

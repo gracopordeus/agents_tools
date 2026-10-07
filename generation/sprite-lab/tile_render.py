@@ -92,7 +92,7 @@ def generate_asset_render(
     profile = locked_profile or {
         "cell_size": [DEFAULT_CELL, DEFAULT_CELL],
         "ortho_scale": 1.0,
-        "camera_elevation": 80.0,
+        "camera_elevation": 30.0,
         "camera_azimuth": 45.0,
         "foot_anchor": [DEFAULT_CELL // 2, DEFAULT_CELL // 2],
     }

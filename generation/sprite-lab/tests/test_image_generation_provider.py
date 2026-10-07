@@ -19,6 +19,7 @@ from image_generation_provider import (  # noqa: E402
     OpenAIImageProvider,
     QwenImageProvider,
     _create_openai_cell_mask,
+    _requested_output_size,
     _qwen_api_base_url,
     create_provider,
 )
@@ -67,6 +68,33 @@ class ImageGenerationProviderTests(unittest.TestCase):
             _qwen_api_base_url("sk-ws-payg-key"),
             "https://dashscope-intl.aliyuncs.com/api/v1",
         )
+
+    def test_requested_output_size_accepts_supported_square_sizes_only(self) -> None:
+        base_request = GenerationRequest(
+            job_id="job-size",
+            prompt="Generate the sprite sheet.",
+            input_images=(),
+            output_path=Path("generated.png"),
+            model="test-model",
+        )
+        self.assertEqual(_requested_output_size(base_request), (2048, 2048))
+        self.assertEqual(
+            _requested_output_size(
+                GenerationRequest(
+                    **{**base_request.__dict__, "metadata": {"output_size": [1024, 1024]}}
+                )
+            ),
+            (1024, 1024),
+        )
+        for output_size in ([512, 512], [1024, 2048], [2048, 2048.5]):
+            with self.subTest(output_size=output_size), self.assertRaisesRegex(
+                ValueError, "1024x1024 ou 2048x2048"
+            ):
+                _requested_output_size(
+                    GenerationRequest(
+                        **{**base_request.__dict__, "metadata": {"output_size": output_size}}
+                    )
+                )
 
     def test_openai_adapter_sends_identity_and_structural_images(self) -> None:
         image_bytes = BytesIO()
