@@ -1,0 +1,75 @@
+{
+  "version": 1,
+  "input_sha256": "ac22c61bb9131a765b711bae2ea1064bcffa5098063ce0ad763307ede7abff8d",
+  "dependency_hashes": {},
+  "note": "Inspected front/back catalog. Components 2=helmet incl gorget, 0=chest incl shoulders and short skirt, 1=legs incl belt/lining, 7=tiny triangle within Legs bounds retained. L/R names follow source catalog columns only, not verified anatomical handedness; no mirror or repositioning.",
+  "parts": [
+    {
+      "name": "Helmet",
+      "selectors": [
+        {
+          "object": "tripo_node_54e3a9e9-0595-49e9-a2fc-480bd48e5d47",
+          "component": 2
+        }
+      ]
+    },
+    {
+      "name": "Chest",
+      "selectors": [
+        {
+          "object": "tripo_node_54e3a9e9-0595-49e9-a2fc-480bd48e5d47",
+          "component": 0
+        }
+      ]
+    },
+    {
+      "name": "Legs",
+      "selectors": [
+        {
+          "object": "tripo_node_54e3a9e9-0595-49e9-a2fc-480bd48e5d47",
+          "component": 1
+        },
+        {
+          "object": "tripo_node_54e3a9e9-0595-49e9-a2fc-480bd48e5d47",
+          "component": 7
+        }
+      ]
+    },
+    {
+      "name": "Glove_L",
+      "selectors": [
+        {
+          "object": "tripo_node_54e3a9e9-0595-49e9-a2fc-480bd48e5d47",
+          "component": 6
+        }
+      ]
+    },
+    {
+      "name": "Glove_R",
+      "selectors": [
+        {
+          "object": "tripo_node_54e3a9e9-0595-49e9-a2fc-480bd48e5d47",
+          "component": 5
+        }
+      ]
+    },
+    {
+      "name": "Boot_L",
+      "selectors": [
+        {
+          "object": "tripo_node_54e3a9e9-0595-49e9-a2fc-480bd48e5d47",
+          "component": 3
+        }
+      ]
+    },
+    {
+      "name": "Boot_R",
+      "selectors": [
+        {
+          "object": "tripo_node_54e3a9e9-0595-49e9-a2fc-480bd48e5d47",
+          "component": 4
+        }
+      ]
+    }
+  ]
+}

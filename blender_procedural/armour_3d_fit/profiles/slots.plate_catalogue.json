@@ -1,0 +1,434 @@
+{
+  "name": "plate_catalogue",
+  "description": "Armadura de placas da Tripo em layout de cat\u00e1logo (pe\u00e7as lado a lado, de p\u00e9, de frente para -Y).",
+  "slots": {
+    "helmet": {
+      "place": {
+        "type": "bbox",
+        "size": {
+          "axis": "x",
+          "region": [
+            "head_all"
+          ],
+          "ratio": 1.35
+        },
+        "x": {
+          "piece": 0.5,
+          "region": [
+            "head_all"
+          ],
+          "body": 0.5
+        },
+        "y": {
+          "piece": 0.5,
+          "region": [
+            "head_all"
+          ],
+          "body": 0.5
+        },
+        "z": {
+          "piece": 0.92,
+          "region": [
+            "head_all"
+          ],
+          "body": 1.0,
+          "offset_m": 0.02
+        }
+      },
+      "target_gap_m": 0.03,
+      "mask_bones": [
+        "head_all"
+      ],
+      "skin_bones": [
+        "head"
+      ],
+      "ignore_bones": [],
+      "proportion": {
+        "axis": "z",
+        "body": [
+          "head_all",
+          "neck"
+        ],
+        "gap_m": 0.012,
+        "max_in_m": 0.0,
+        "max_out_m": 0.04
+      }
+    },
+    "chest": {
+      "place": {
+        "type": "bbox",
+        "size": {
+          "axis": "z",
+          "between": [
+            "neck",
+            "hips"
+          ],
+          "ratio": 1.1
+        },
+        "x": {
+          "piece": 0.5,
+          "region": [
+            "spine2"
+          ],
+          "body": 0.5
+        },
+        "y": {
+          "piece": 0.5,
+          "region": [
+            "spine1",
+            "spine2"
+          ],
+          "body": 0.5
+        },
+        "z": {
+          "piece": 1.0,
+          "bone": "neck",
+          "offset_m": 0.05
+        }
+      },
+      "parts": [
+        {
+          "name": "sleeve.L",
+          "pivot_bone": "upper_arm.L",
+          "toward_bone": "forearm.L",
+          "bones": [
+            "upper_arm.L",
+            "forearm.L"
+          ],
+          "max_rotation_deg": 50,
+          "max_scale": 0.1,
+          "proportion": {
+            "axis": {
+              "bones": [
+                "upper_arm.L",
+                "forearm.L"
+              ]
+            },
+            "body": [
+              "upper_arm.L",
+              "forearm.L"
+            ],
+            "gap_m": 0.012,
+            "max_in_m": 0.06,
+            "max_out_m": 0.08
+          }
+        },
+        {
+          "name": "sleeve.R",
+          "pivot_bone": "upper_arm.R",
+          "toward_bone": "forearm.R",
+          "bones": [
+            "upper_arm.R",
+            "forearm.R"
+          ],
+          "max_rotation_deg": 50,
+          "max_scale": 0.1,
+          "proportion": {
+            "axis": {
+              "bones": [
+                "upper_arm.R",
+                "forearm.R"
+              ]
+            },
+            "body": [
+              "upper_arm.R",
+              "forearm.R"
+            ],
+            "gap_m": 0.012,
+            "max_in_m": 0.06,
+            "max_out_m": 0.08
+          }
+        }
+      ],
+      "target_gap_m": 0.025,
+      "mask_bones": [],
+      "skin_bones": [
+        "spine",
+        "spine1",
+        "spine2",
+        "neck",
+        "shoulder.L",
+        "shoulder.R",
+        "upper_arm.L",
+        "upper_arm.R"
+      ],
+      "ignore_bones": [],
+      "proportion": {
+        "axis": "z",
+        "body": [
+          "spine",
+          "spine1",
+          "spine2",
+          "shoulder.L",
+          "shoulder.R"
+        ],
+        "gap_m": 0.012,
+        "max_in_m": 0.08,
+        "max_out_m": 0.1
+      }
+    },
+    "skirt": {
+      "place": {
+        "type": "bbox",
+        "size": {
+          "axis": "z",
+          "between": [
+            "spine",
+            "shin.L"
+          ],
+          "ratio": 0.8
+        },
+        "x": {
+          "piece": 0.5,
+          "region": [
+            "hips"
+          ],
+          "body": 0.5
+        },
+        "y": {
+          "piece": 0.5,
+          "region": [
+            "hips"
+          ],
+          "body": 0.5
+        },
+        "z": {
+          "piece": 1.0,
+          "bone": "spine",
+          "offset_m": 0.04
+        }
+      },
+      "target_gap_m": 0.025,
+      "mask_bones": [],
+      "skin_bones": [
+        "hips",
+        "spine",
+        "thigh.L",
+        "thigh.R"
+      ],
+      "ignore_bones": [],
+      "proportion": {
+        "axis": "z",
+        "body": [
+          "hips",
+          "spine",
+          "thigh.L",
+          "thigh.R"
+        ],
+        "gap_m": 0.015,
+        "max_in_m": 0.06,
+        "max_out_m": 0.1
+      }
+    },
+    "glove.L": {
+      "place": {
+        "type": "axis",
+        "piece_axis": [
+          0,
+          0,
+          -1
+        ],
+        "bones": [
+          "forearm.L",
+          "hand.L"
+        ],
+        "size": {
+          "ratio": 1.8
+        },
+        "piece_fraction": 0.58,
+        "at_bone": "hand.L",
+        "palm": {
+          "hand": [
+            "hand.L",
+            "fingers.L"
+          ],
+          "thumb": [
+            "thumb.L"
+          ],
+          "handedness": "left",
+          "piece_back": [
+            0,
+            -1,
+            0
+          ]
+        }
+      },
+      "target_gap_m": 0.02,
+      "mask_bones": [
+        "hand.L",
+        "fingers.L"
+      ],
+      "skin_bones": [
+        "hand.L",
+        "forearm.L"
+      ],
+      "ignore_bones": []
+    },
+    "glove.R": {
+      "place": {
+        "type": "axis",
+        "piece_axis": [
+          0,
+          0,
+          -1
+        ],
+        "bones": [
+          "forearm.R",
+          "hand.R"
+        ],
+        "size": {
+          "ratio": 1.8
+        },
+        "piece_fraction": 0.58,
+        "at_bone": "hand.R",
+        "palm": {
+          "hand": [
+            "hand.R",
+            "fingers.R"
+          ],
+          "thumb": [
+            "thumb.R"
+          ],
+          "handedness": "right",
+          "piece_back": [
+            0,
+            -1,
+            0
+          ]
+        }
+      },
+      "target_gap_m": 0.02,
+      "mask_bones": [
+        "hand.R",
+        "fingers.R"
+      ],
+      "skin_bones": [
+        "hand.R",
+        "forearm.R"
+      ],
+      "ignore_bones": []
+    },
+    "boot.L": {
+      "place": {
+        "type": "bbox",
+        "size": {
+          "axis": "z",
+          "region": [
+            "shin.L",
+            "foot.L",
+            "toe.L"
+          ],
+          "ratio": 1.0
+        },
+        "x": {
+          "piece": 0.5,
+          "region": [
+            "foot.L",
+            "toe.L"
+          ],
+          "body": 0.5
+        },
+        "y": {
+          "piece": 0.5,
+          "region": [
+            "foot.L",
+            "toe.L"
+          ],
+          "body": 0.5
+        },
+        "z": {
+          "piece": 0.0,
+          "region": [
+            "foot.L",
+            "toe.L"
+          ],
+          "body": 0.0,
+          "offset_m": -0.01
+        }
+      },
+      "target_gap_m": 0.02,
+      "mask_bones": [
+        "foot.L",
+        "toe.L"
+      ],
+      "skin_bones": [
+        "shin.L",
+        "foot.L",
+        "toe.L"
+      ],
+      "ignore_bones": [],
+      "proportion": {
+        "axis": "z",
+        "body": [
+          "shin.L",
+          "foot.L",
+          "toe.L"
+        ],
+        "gap_m": 0.01,
+        "max_in_m": 0.05,
+        "max_out_m": 0.06
+      }
+    },
+    "boot.R": {
+      "place": {
+        "type": "bbox",
+        "size": {
+          "axis": "z",
+          "region": [
+            "shin.R",
+            "foot.R",
+            "toe.R"
+          ],
+          "ratio": 1.0
+        },
+        "x": {
+          "piece": 0.5,
+          "region": [
+            "foot.R",
+            "toe.R"
+          ],
+          "body": 0.5
+        },
+        "y": {
+          "piece": 0.5,
+          "region": [
+            "foot.R",
+            "toe.R"
+          ],
+          "body": 0.5
+        },
+        "z": {
+          "piece": 0.0,
+          "region": [
+            "foot.R",
+            "toe.R"
+          ],
+          "body": 0.0,
+          "offset_m": -0.01
+        }
+      },
+      "target_gap_m": 0.02,
+      "mask_bones": [
+        "foot.R",
+        "toe.R"
+      ],
+      "skin_bones": [
+        "shin.R",
+        "foot.R",
+        "toe.R"
+      ],
+      "ignore_bones": [],
+      "proportion": {
+        "axis": "z",
+        "body": [
+          "shin.R",
+          "foot.R",
+          "toe.R"
+        ],
+        "gap_m": 0.01,
+        "max_in_m": 0.05,
+        "max_out_m": 0.06
+      }
+    }
+  }
+}

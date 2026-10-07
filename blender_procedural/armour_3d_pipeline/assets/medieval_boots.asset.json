@@ -1,0 +1,15 @@
+{
+  "name": "medieval_boots",
+  "source": "../../assets_models/medieval armor 3d model boots.glb",
+  "split": {"plan": "../../armour_3d_split/examples/medieval_boots.plan.json", "normal_policy": "backup"},
+  "decimate": {"budgets": "../../armour_3d_decimate/budgets.plate.json"},
+  "fit": {
+    "pieces": {"Helmet": "helmet", "Chest": "chest", "Legs": "skirt", "Glove_L": "glove.L", "Glove_R": "glove.R",
+               "Boot_L": "boot.L", "Boot_R": "boot.R"},
+    "body": {"rig": "/home/ggnp/tools/blender_procedural/armour_tripo_fit/tests/fixtures/medieval_plate_001/input/host_geometry.json", "poses": "/home/ggnp/tools/blender_procedural/armour_tripo_fit/tests/fixtures/medieval_plate_001/input/host_poses.json"},
+    "body_profile": "../../armour_3d_fit/profiles/body.kcc_makehuman_52.json",
+    "slot_profile": "../../armour_3d_fit/profiles/slots.plate_catalogue.json",
+    "style": "plate",
+    "config": {}
+  }
+}

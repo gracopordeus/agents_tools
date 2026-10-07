@@ -1,0 +1,12 @@
+{
+  "budgets": {"Helmet": 6000, "Chest": 10000, "Legs": 8000, "Glove_L": 2500, "Glove_R": 2500, "Boot_L": 2500, "Boot_R": 2500},
+  "target_tolerance": 0.01,
+  "weld_over_diagonal": 0.0,
+  "crease_deg": 50.0,
+  "gates": {
+    "budget_tolerance": 0.10,
+    "min_silhouette_iou": 0.95,
+    "max_p99_distance_over_diagonal": 0.005,
+    "max_distance_over_diagonal": 0.02
+  }
+}
