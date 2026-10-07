@@ -1,0 +1,749 @@
+{
+  "name": "plate_assembled",
+  "description": "Armadura de placas da Tripo j\u00e1 montada (de p\u00e9, bra\u00e7os ca\u00eddos, de frente para -Y), com peitoral, ombreiras e coxas numa pe\u00e7a s\u00f3.",
+  "slots": {
+    "helmet": {
+      "place": {
+        "type": "bbox",
+        "size": {
+          "set_height_ratio": 1.03
+        },
+        "x": {
+          "piece": 0.5,
+          "region": [
+            "head_all"
+          ],
+          "body": 0.5
+        },
+        "y": {
+          "piece": 0.5,
+          "region": [
+            "head_all"
+          ],
+          "body": 0.5
+        },
+        "z": {
+          "piece": 0.92,
+          "region": [
+            "head_all"
+          ],
+          "body": 1.0,
+          "offset_m": 0.02
+        }
+      },
+      "target_gap_m": 0.03,
+      "mask_bones": [
+        "head_all"
+      ],
+      "skin_bones": [
+        "head"
+      ],
+      "ignore_bones": [],
+      "proportion": {
+        "axis": "z",
+        "body": [
+          "head_all"
+        ],
+        "gap_m": 0.012,
+        "max_in_m": 0.0,
+        "max_out_m": 0.04,
+        "pivot": {
+          "bone": "neck"
+        },
+        "relative_to": {
+          "slot": "suit",
+          "width": 0.28736,
+          "height": 0.2951
+        }
+      },
+      "seat": {
+        "rotation_deg": 0.0,
+        "midline": true
+      }
+    },
+    "suit": {
+      "place": {
+        "type": "bbox",
+        "size": {
+          "axis": "z",
+          "between": [
+            "neck",
+            "shin.L"
+          ],
+          "ratio": 1.0
+        },
+        "x": {
+          "piece": 0.5,
+          "region": [
+            "spine2"
+          ],
+          "body": 0.5
+        },
+        "y": {
+          "piece": 0.5,
+          "region": [
+            "spine1",
+            "spine2"
+          ],
+          "body": 0.5
+        },
+        "z": {
+          "piece": 1.0,
+          "bone": "neck",
+          "offset_m": 0.05
+        }
+      },
+      "parts": [
+        {
+          "name": "sleeve.L",
+          "pivot_bone": "upper_arm.L",
+          "toward_bone": "forearm.L",
+          "bones": [
+            "upper_arm.L",
+            "forearm.L"
+          ],
+          "max_rotation_deg": 50,
+          "max_scale": 0.1,
+          "proportion": {
+            "axis": {
+              "bones": [
+                "upper_arm.L",
+                "forearm.L"
+              ]
+            },
+            "body": [
+              "upper_arm.L",
+              "forearm.L"
+            ],
+            "gap_m": 0.012,
+            "max_in_m": 0.06,
+            "max_out_m": 0.08,
+            "shape": "flexible",
+            "lengthen": {
+              "fraction": "design",
+              "beyond_bone": "hand.L",
+              "meets": {
+                "slot": "glove.L"
+              }
+            }
+          }
+        },
+        {
+          "name": "sleeve.R",
+          "pivot_bone": "upper_arm.R",
+          "toward_bone": "forearm.R",
+          "bones": [
+            "upper_arm.R",
+            "forearm.R"
+          ],
+          "max_rotation_deg": 50,
+          "max_scale": 0.1,
+          "proportion": {
+            "axis": {
+              "bones": [
+                "upper_arm.R",
+                "forearm.R"
+              ]
+            },
+            "body": [
+              "upper_arm.R",
+              "forearm.R"
+            ],
+            "gap_m": 0.012,
+            "max_in_m": 0.06,
+            "max_out_m": 0.08,
+            "shape": "flexible",
+            "lengthen": {
+              "fraction": "design",
+              "beyond_bone": "hand.R",
+              "meets": {
+                "slot": "glove.R"
+              }
+            }
+          }
+        },
+        {
+          "name": "leg.L",
+          "pivot_bone": "thigh.L",
+          "toward_bone": "shin.L",
+          "bones": [
+            "thigh.L",
+            "shin.L"
+          ],
+          "max_rotation_deg": 20,
+          "max_scale": 0.1,
+          "proportion": {
+            "axis": {
+              "bones": [
+                "thigh.L",
+                "shin.L"
+              ]
+            },
+            "body": [
+              "thigh.L",
+              "shin.L"
+            ],
+            "gap_m": 0.012,
+            "max_in_m": 0.0,
+            "max_out_m": 0.08,
+            "shape": "flexible",
+            "lengthen": {
+              "fraction": "design",
+              "beyond_bone": "foot.L",
+              "meets": {
+                "slot": "boot.L"
+              }
+            }
+          },
+          "centre": true
+        },
+        {
+          "name": "leg.R",
+          "pivot_bone": "thigh.R",
+          "toward_bone": "shin.R",
+          "bones": [
+            "thigh.R",
+            "shin.R"
+          ],
+          "max_rotation_deg": 20,
+          "max_scale": 0.1,
+          "proportion": {
+            "axis": {
+              "bones": [
+                "thigh.R",
+                "shin.R"
+              ]
+            },
+            "body": [
+              "thigh.R",
+              "shin.R"
+            ],
+            "gap_m": 0.012,
+            "max_in_m": 0.0,
+            "max_out_m": 0.08,
+            "shape": "flexible",
+            "lengthen": {
+              "fraction": "design",
+              "beyond_bone": "foot.R",
+              "meets": {
+                "slot": "boot.R"
+              }
+            }
+          },
+          "centre": true
+        }
+      ],
+      "target_gap_m": 0.025,
+      "mask_bones": [],
+      "skin_bones": [
+        "hips",
+        "spine",
+        "spine1",
+        "spine2",
+        "neck",
+        "shoulder.L",
+        "shoulder.R",
+        "upper_arm.L",
+        "upper_arm.R",
+        "forearm.L",
+        "forearm.R",
+        "thigh.L",
+        "thigh.R"
+      ],
+      "ignore_bones": [],
+      "proportion": {
+        "axis": "z",
+        "body": [
+          "hips",
+          "spine",
+          "spine1",
+          "spine2",
+          "shoulder.L",
+          "shoulder.R"
+        ],
+        "gap_m": 0.012,
+        "max_in_m": 0.08,
+        "max_out_m": 0.1,
+        "pivot": {
+          "bone": "neck"
+        },
+        "shape": "flexible",
+        "lengthen": true
+      },
+      "collar": {
+        "bone": "neck",
+        "toward": "head",
+        "body": [
+          "neck",
+          "head"
+        ],
+        "gap_m": 0.012,
+        "reach_m": 0.2,
+        "max_in": 0.35
+      },
+      "seat": {
+        "midline": true
+      }
+    },
+    "glove.L": {
+      "place": {
+        "type": "axis",
+        "piece_axis": [
+          0,
+          0,
+          -1
+        ],
+        "bones": [
+          "forearm.L",
+          "hand.L"
+        ],
+        "size": {
+          "set_height_ratio": 1.03
+        },
+        "piece_fraction": {
+          "from_finger_roots": true,
+          "fallback": 0.72
+        },
+        "at_bone": "hand.L",
+        "palm": {
+          "hand": [
+            "hand.L",
+            "fingers.L"
+          ],
+          "thumb": [
+            "thumb.L"
+          ],
+          "handedness": "left",
+          "piece_back": [
+            0,
+            -1,
+            0
+          ],
+          "handedness_from": "layout"
+        },
+        "piece_axis_from": "mesh"
+      },
+      "target_gap_m": 0.02,
+      "mask_bones": [
+        "hand.L",
+        "fingers.L"
+      ],
+      "skin_bones": [
+        "hand.L",
+        "forearm.L",
+        "fingers.L"
+      ],
+      "ignore_bones": [],
+      "parts": [
+        {
+          "name": "hand.L",
+          "pivot_bone": "hand.L",
+          "toward_bone": "middle.L",
+          "from_bones": [
+            "forearm.L",
+            "hand.L"
+          ],
+          "bones": [
+            "hand.L",
+            "fingers.L",
+            "thumb.L"
+          ],
+          "max_rotation_deg": 60,
+          "max_scale": 0.0,
+          "fit": false
+        },
+        {
+          "name": "cuff.L",
+          "pivot_bone": "hand.L",
+          "toward_bone": "forearm.L",
+          "from_bones": [
+            "hand.L",
+            "forearm.L"
+          ],
+          "bones": [
+            "forearm.L"
+          ],
+          "max_rotation_deg": 15,
+          "max_scale": 0.0,
+          "fit": false,
+          "centre": true,
+          "proportion": {
+            "axis": {
+              "bones": [
+                "hand.L",
+                "forearm.L"
+              ]
+            },
+            "body": [
+              "forearm.L"
+            ],
+            "gap_m": 0.012,
+            "max_in_m": 0.0,
+            "max_out_m": 0.04,
+            "shape": "flexible"
+          }
+        }
+      ],
+      "proportion": {
+        "axis": {
+          "bones": [
+            "forearm.L",
+            "hand.L"
+          ]
+        },
+        "body": [
+          "forearm.L"
+        ],
+        "gap_m": 0.008,
+        "max_in_m": 0.0,
+        "max_out_m": 0.03,
+        "pivot": {
+          "bone": "hand.L"
+        },
+        "isotropic_max": 0.0
+      },
+      "fingers": {
+        "wrist": "hand.L",
+        "toward": "middle.L",
+        "chains": {
+          "thumb": "thumb.L",
+          "index": "chain_index.L",
+          "middle": "chain_middle.L",
+          "ring": "chain_ring.L",
+          "pinky": "chain_pinky.L"
+        }
+      },
+      "fit_length": {
+        "from_bone": "hand.L",
+        "to_bone": "forearm.L",
+        "fraction": "design",
+        "beyond_bone": "upper_arm.L",
+        "meets": {
+          "slot": "suit",
+          "part": "sleeve.L"
+        }
+      },
+      "asset": "Gloves",
+      "seat": {
+        "translation_m": 0.0,
+        "rotation_deg": 0.0
+      }
+    },
+    "boot.L": {
+      "place": {
+        "type": "bbox",
+        "size": {
+          "set_height_ratio": 1.03
+        },
+        "x": {
+          "piece": 0.5,
+          "region": [
+            "foot.L",
+            "toe.L"
+          ],
+          "body": 0.5
+        },
+        "y": {
+          "piece": 0.5,
+          "region": [
+            "foot.L",
+            "toe.L"
+          ],
+          "body": 0.5,
+          "offset_m": 0.03
+        },
+        "z": {
+          "piece": 0.0,
+          "region": [
+            "foot.L",
+            "toe.L"
+          ],
+          "body": 0.0,
+          "offset_m": -0.01
+        },
+        "yaw_to": {
+          "bones": [
+            "foot.L",
+            "toe.L"
+          ],
+          "piece_below": 0.2
+        }
+      },
+      "target_gap_m": 0.02,
+      "mask_bones": [
+        "foot.L",
+        "toe.L"
+      ],
+      "skin_bones": [
+        "shin.L",
+        "foot.L",
+        "toe.L"
+      ],
+      "ignore_bones": [],
+      "proportion": {
+        "axis": "z",
+        "body": [
+          "shin.L"
+        ],
+        "gap_m": 0.015,
+        "max_in_m": 0.05,
+        "max_out_m": 0.05,
+        "shape": "flexible",
+        "pivot": "bottom"
+      },
+      "lean": {
+        "bones": [
+          "shin.L",
+          "foot.L"
+        ]
+      },
+      "seat": {
+        "translation_m": 0.04,
+        "rotation_deg": 0.0,
+        "lock_z": true
+      },
+      "asset": "Boots",
+      "fit_length": {
+        "from_bone": "foot.L",
+        "to_bone": "shin.L",
+        "fraction": "design",
+        "always": true,
+        "beyond_bone": "thigh.L",
+        "meets": {
+          "slot": "suit",
+          "part": "leg.L"
+        }
+      }
+    },
+    "glove.R": {
+      "place": {
+        "type": "axis",
+        "piece_axis": [
+          0,
+          0,
+          -1
+        ],
+        "bones": [
+          "forearm.R",
+          "hand.R"
+        ],
+        "size": {
+          "set_height_ratio": 1.03
+        },
+        "piece_fraction": {
+          "from_finger_roots": true,
+          "fallback": 0.72
+        },
+        "at_bone": "hand.R",
+        "palm": {
+          "hand": [
+            "hand.R",
+            "fingers.R"
+          ],
+          "thumb": [
+            "thumb.R"
+          ],
+          "handedness": "right",
+          "piece_back": [
+            0,
+            -1,
+            0
+          ],
+          "handedness_from": "layout"
+        },
+        "piece_axis_from": "mesh"
+      },
+      "target_gap_m": 0.02,
+      "mask_bones": [
+        "hand.R",
+        "fingers.R"
+      ],
+      "skin_bones": [
+        "hand.R",
+        "forearm.R",
+        "fingers.R"
+      ],
+      "ignore_bones": [],
+      "parts": [
+        {
+          "name": "hand.R",
+          "pivot_bone": "hand.R",
+          "toward_bone": "middle.R",
+          "from_bones": [
+            "forearm.R",
+            "hand.R"
+          ],
+          "bones": [
+            "hand.R",
+            "fingers.R",
+            "thumb.R"
+          ],
+          "max_rotation_deg": 60,
+          "max_scale": 0.0,
+          "fit": false
+        },
+        {
+          "name": "cuff.R",
+          "pivot_bone": "hand.R",
+          "toward_bone": "forearm.R",
+          "from_bones": [
+            "hand.R",
+            "forearm.R"
+          ],
+          "bones": [
+            "forearm.R"
+          ],
+          "max_rotation_deg": 15,
+          "max_scale": 0.0,
+          "fit": false,
+          "centre": true,
+          "proportion": {
+            "axis": {
+              "bones": [
+                "hand.R",
+                "forearm.R"
+              ]
+            },
+            "body": [
+              "forearm.R"
+            ],
+            "gap_m": 0.012,
+            "max_in_m": 0.0,
+            "max_out_m": 0.04,
+            "shape": "flexible"
+          }
+        }
+      ],
+      "proportion": {
+        "axis": {
+          "bones": [
+            "forearm.R",
+            "hand.R"
+          ]
+        },
+        "body": [
+          "forearm.R"
+        ],
+        "gap_m": 0.008,
+        "max_in_m": 0.0,
+        "max_out_m": 0.03,
+        "pivot": {
+          "bone": "hand.R"
+        },
+        "isotropic_max": 0.0
+      },
+      "fingers": {
+        "wrist": "hand.R",
+        "toward": "middle.R",
+        "chains": {
+          "thumb": "thumb.R",
+          "index": "chain_index.R",
+          "middle": "chain_middle.R",
+          "ring": "chain_ring.R",
+          "pinky": "chain_pinky.R"
+        }
+      },
+      "fit_length": {
+        "from_bone": "hand.R",
+        "to_bone": "forearm.R",
+        "fraction": "design",
+        "beyond_bone": "upper_arm.R",
+        "meets": {
+          "slot": "suit",
+          "part": "sleeve.R"
+        }
+      },
+      "asset": "Gloves",
+      "seat": {
+        "translation_m": 0.0,
+        "rotation_deg": 0.0
+      }
+    },
+    "boot.R": {
+      "place": {
+        "type": "bbox",
+        "size": {
+          "set_height_ratio": 1.03
+        },
+        "x": {
+          "piece": 0.5,
+          "region": [
+            "foot.R",
+            "toe.R"
+          ],
+          "body": 0.5
+        },
+        "y": {
+          "piece": 0.5,
+          "region": [
+            "foot.R",
+            "toe.R"
+          ],
+          "body": 0.5,
+          "offset_m": 0.03
+        },
+        "z": {
+          "piece": 0.0,
+          "region": [
+            "foot.R",
+            "toe.R"
+          ],
+          "body": 0.0,
+          "offset_m": -0.01
+        },
+        "yaw_to": {
+          "bones": [
+            "foot.R",
+            "toe.R"
+          ],
+          "piece_below": 0.2
+        }
+      },
+      "target_gap_m": 0.02,
+      "mask_bones": [
+        "foot.R",
+        "toe.R"
+      ],
+      "skin_bones": [
+        "shin.R",
+        "foot.R",
+        "toe.R"
+      ],
+      "ignore_bones": [],
+      "proportion": {
+        "axis": "z",
+        "body": [
+          "shin.R"
+        ],
+        "gap_m": 0.015,
+        "max_in_m": 0.05,
+        "max_out_m": 0.05,
+        "shape": "flexible",
+        "pivot": "bottom"
+      },
+      "lean": {
+        "bones": [
+          "shin.R",
+          "foot.R"
+        ]
+      },
+      "seat": {
+        "translation_m": 0.04,
+        "rotation_deg": 0.0,
+        "lock_z": true
+      },
+      "asset": "Boots",
+      "fit_length": {
+        "from_bone": "foot.R",
+        "to_bone": "shin.R",
+        "fraction": "design",
+        "always": true,
+        "beyond_bone": "thigh.R",
+        "meets": {
+          "slot": "suit",
+          "part": "leg.R"
+        }
+      }
+    }
+  }
+}
